@@ -1,0 +1,10 @@
+C:\Users\jason\Documents\DATA6700\data6700_project2\lidar_point_cloud_classifier\target\debug\deps\jxl_oxide-44a334e29eb898d6.d: C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\lib.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\exif.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\jbrd.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\fb.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\integration.rs
+
+C:\Users\jason\Documents\DATA6700\data6700_project2\lidar_point_cloud_classifier\target\debug\deps\libjxl_oxide-44a334e29eb898d6.rmeta: C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\lib.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\exif.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\jbrd.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\fb.rs C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\integration.rs
+
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\lib.rs:
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box.rs:
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\exif.rs:
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\aux_box\jbrd.rs:
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\fb.rs:
+C:\Users\jason\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\jxl-oxide-0.12.6\src\integration.rs:

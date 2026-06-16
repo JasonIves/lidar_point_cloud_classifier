@@ -1,0 +1,52 @@
+[package]
+name = "lidar_point_cloud_classifier"
+version = "0.1.0"
+edition = "2021"
+description = "Whitebox Next Gen LiDAR point-cloud classifier — Stage 01: spatial preprocessing pipeline"
+
+[[bin]]
+name = "wb_lidar_classify"
+path = "src/main.rs"
+
+[dependencies]
+# Whitebox Next Gen path dependencies (read-only; never modify these crates)
+wblidar  = { path = "../whitebox_next_gen/crates/wblidar",  features = ["parallel"] }
+wbcore   = { path = "../whitebox_next_gen/crates/wbcore" }
+wbraster = { path = "../whitebox_next_gen/crates/wbraster" }
+
+# Parallelism
+rayon = "1"
+
+# Spatial indexing
+kdtree = "0.8.0"
+
+# Linear algebra for eigenvalue decomposition
+nalgebra = "0.34.1"
+
+# Error handling
+thiserror = "1"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Zero-copy byte casting for .feat file writes
+bytemuck = { version = "1", features = ["derive"] }
+
+# Seeded point sampling
+rand = "0.10.0"
+
+# N-D array library for PointNet forward pass matrix operations
+ndarray = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
