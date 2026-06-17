@@ -102,7 +102,12 @@ impl BlockPartitioner {
         let row = ((pt.y - self.y_min) / self.block_size).floor() as i32;
         let key = (col, row);
         self.cells.entry(key).or_default().push(pt);
-        self.buffered_bytes += PT_BYTES;
+        // Use the actual in-memory size of PointRecord for accounting, not the
+        // smaller on-disk spill-record size (PT_BYTES = 31).  PointRecord carries
+        // GPS time, RGB, scan flags, and extra bytes that are not serialised to
+        // the spill file, so PT_BYTES would under-count by roughly 2–3×, causing
+        // the spill threshold to represent far more heap than intended.
+        self.buffered_bytes += std::mem::size_of::<PointRecord>();
 
         if self.buffered_bytes >= SPILL_HIGH_WATER_BYTES {
             self.spill_largest_cells()?;
@@ -179,7 +184,7 @@ impl BlockPartitioner {
                 break;
             }
             if let Some(pts) = self.cells.remove(&key) {
-                let freed = pts.len() * PT_BYTES;
+                let freed = pts.len() * std::mem::size_of::<PointRecord>();
                 let path = self.spill_path_for(key);
                 write_spill_file(&path, &pts)?;
                 self.spill_paths.entry(key).or_default().push(path);
@@ -245,15 +250,19 @@ fn read_spill_file(path: &Path) -> Result<Vec<PointRecord>> {
     let mut buf = [0u8; PT_BYTES];
     for _ in 0..n {
         file.read_exact(&mut buf)?;
+        // Each try_into converts a known-size sub-slice to a fixed-size array.
+        // The slices are statically sized so this can never fail; we propagate
+        // as SpillCorrupt rather than unwrap() to satisfy the no-panics rule.
+        let corrupt = || ClassifierError::SpillCorrupt { path: path.display().to_string() };
         let pt = PointRecord {
-            x: f64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            y: f64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            z: f64::from_le_bytes(buf[16..24].try_into().unwrap()),
-            intensity: u16::from_le_bytes(buf[24..26].try_into().unwrap()),
-            classification: buf[26],
-            return_number: buf[27],
+            x:                 f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
+            y:                 f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
+            z:                 f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
+            intensity:         u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
+            classification:    buf[26],
+            return_number:     buf[27],
             number_of_returns: buf[28],
-            scan_angle: i16::from_le_bytes(buf[29..31].try_into().unwrap()),
+            scan_angle:        i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
             ..PointRecord::default()
         };
         pts.push(pt);

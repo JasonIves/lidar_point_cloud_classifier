@@ -57,10 +57,13 @@ pub fn run(args: &[String]) -> Result<()> {
     eprintln!("[classify] blocks in manifest: {}", manifest.blocks.len());
 
     // ── Feat directory: same directory as blocks.json ─────────────────────
+    // Path::new("blocks.json").parent() returns Some(""), not None, so we
+    // must also guard against the empty-string case.
     let feat_dir = cfg
         .blocks
         .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
 
     // ── Run per-block inference ────────────────────────────────────────────

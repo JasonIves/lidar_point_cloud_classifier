@@ -2,11 +2,19 @@
 name = "lidar_point_cloud_classifier"
 version = "0.1.0"
 edition = "2021"
-description = "Whitebox Next Gen LiDAR point-cloud classifier — Stage 01: spatial preprocessing pipeline"
+description = "Whitebox Next Gen LiDAR point-cloud classifier — Stage 01/02/03"
+
+[features]
+training = ["dep:burn"]
 
 [[bin]]
 name = "wb_lidar_classify"
 path = "src/main.rs"
+
+[[bin]]
+name = "wb_lidar_train"
+path = "src/bin/wb_lidar_train.rs"
+required-features = ["training"]
 
 [dependencies]
 # Whitebox Next Gen path dependencies (read-only; never modify these crates)
@@ -38,6 +46,9 @@ rand = "0.10.0"
 
 # N-D array library for PointNet forward pass matrix operations
 ndarray = "0.16"
+
+# Training framework — optional; only compiled when `--features training`
+burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -17,16 +17,19 @@ use wblidar::PointRecord;
 /// - If `pts.len() >= target`: random sample without replacement.
 /// - If `pts.len() < target`: random oversample with replacement to pad.
 ///
-/// Returns `(sampled_points, oversampled)` where `oversampled` is `true` when
-/// padding with replacement was applied.
+/// Returns `(sampled_points, sampled_indices, oversampled)` where:
+/// - `sampled_points` are the resampled `PointRecord` values,
+/// - `sampled_indices` are the 0-based indices into `pts` for each output point
+///   (padded oversample entries repeat indices from the original range),
+/// - `oversampled` is `true` when padding with replacement was applied.
 #[must_use]
 pub fn resample_block(
     pts: &[PointRecord],
     target: usize,
     seed: u64,
-) -> (Vec<PointRecord>, bool) {
+) -> (Vec<PointRecord>, Vec<usize>, bool) {
     if pts.is_empty() || target == 0 {
-        return (Vec::new(), false);
+        return (Vec::new(), Vec::new(), false);
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
@@ -38,17 +41,20 @@ pub fn resample_block(
             let j = rng.random_range(i..pts.len());
             indices.swap(i, j);
         }
-        let sampled = indices[..target].iter().map(|&i| pts[i]).collect();
-        (sampled, false)
+        let chosen = &indices[..target];
+        let sampled = chosen.iter().map(|&i| pts[i]).collect();
+        (sampled, chosen.to_vec(), false)
     } else {
         // Start with all original points, then pad with replacement.
         let mut sampled: Vec<PointRecord> = pts.to_vec();
+        let mut sampled_indices: Vec<usize> = (0..pts.len()).collect();
         let extra = target - pts.len();
         for _ in 0..extra {
             let idx = rng.random_range(0..pts.len());
             sampled.push(pts[idx]);
+            sampled_indices.push(idx);
         }
-        (sampled, true)
+        (sampled, sampled_indices, true)
     }
 }
 
@@ -251,7 +257,7 @@ mod tests {
     #[test]
     fn test_resample_subsamples_correctly() {
         let pts: Vec<PointRecord> = (0..100).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
-        let (sampled, over) = resample_block(&pts, 50, 42);
+        let (sampled, _indices, over) = resample_block(&pts, 50, 42);
         assert_eq!(sampled.len(), 50);
         assert!(!over);
     }
@@ -259,7 +265,7 @@ mod tests {
     #[test]
     fn test_resample_oversamples_to_target() {
         let pts: Vec<PointRecord> = (0..10).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
-        let (sampled, over) = resample_block(&pts, 50, 42);
+        let (sampled, _indices, over) = resample_block(&pts, 50, 42);
         assert_eq!(sampled.len(), 50);
         assert!(over);
     }
@@ -267,7 +273,7 @@ mod tests {
     #[test]
     fn test_resample_exact_count_no_oversample() {
         let pts: Vec<PointRecord> = (0..1024).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
-        let (sampled, over) = resample_block(&pts, 1024, 0);
+        let (sampled, _indices, over) = resample_block(&pts, 1024, 0);
         assert_eq!(sampled.len(), 1024);
         assert!(!over);
     }
@@ -275,8 +281,8 @@ mod tests {
     #[test]
     fn test_resample_is_reproducible() {
         let pts: Vec<PointRecord> = (0..200).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
-        let (s1, _) = resample_block(&pts, 100, 99);
-        let (s2, _) = resample_block(&pts, 100, 99);
+        let (s1, _, _) = resample_block(&pts, 100, 99);
+        let (s2, _, _) = resample_block(&pts, 100, 99);
         let xs1: Vec<i64> = s1.iter().map(|p| (p.x * 1e6) as i64).collect();
         let xs2: Vec<i64> = s2.iter().map(|p| (p.x * 1e6) as i64).collect();
         assert_eq!(xs1, xs2, "resample must be reproducible given the same seed");

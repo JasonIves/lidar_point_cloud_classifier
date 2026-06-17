@@ -10,8 +10,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use kdtree::distance::squared_euclidean;
+use kdtree::KdTree;
 use ndarray::Array2;
 use rayon::prelude::*;
 
@@ -26,37 +28,51 @@ use crate::preprocessing::RAYON_MIN_CHUNK;
 
 /// Inference results for a single spatial block.
 ///
-/// Holds the reconstructed (x, y) coordinates for each sampled point and the
-/// ASPRS classification label inferred by the model.  The output writer queries
-/// this by nearest-neighbour to assign a label to each original `LiDAR` point.
+/// Holds a 2-D k-d tree over reconstructed `(x, y)` coordinates for each
+/// sampled point, with the ASPRS classification label as the tree payload.
+/// The output writer queries this by nearest-neighbour to assign a label to
+/// every original `LiDAR` point — O(log N) per query instead of O(N).
 pub struct BlockInferenceResult {
-    /// Reconstructed X coordinates for each sampled point (projection units).
-    pub xs: Vec<f64>,
-    /// Reconstructed Y coordinates for each sampled point (projection units).
-    pub ys: Vec<f64>,
-    /// ASPRS classification code (u8) for each sampled point.
-    pub labels: Vec<u8>,
+    /// 2-D spatial index: key = `[x, y]` (projection units), value = ASPRS label.
+    tree: KdTree<f64, u8, [f64; 2]>,
+    /// Number of sampled points inserted into the tree (used for empty-check).
+    n_points: usize,
 }
 
 impl BlockInferenceResult {
+    /// Build a `BlockInferenceResult` from parallel coordinate + label slices.
+    ///
+    /// `xs`, `ys`, and `labels` must all have the same length.
+    ///
+    /// # Errors
+    /// Returns an error if inserting a point into the k-d tree fails (dimension
+    /// mismatch — unreachable in practice given the fixed `[f64; 2]` key type).
+    pub fn from_points(xs: &[f64], ys: &[f64], labels: &[u8]) -> Result<Self> {
+        debug_assert_eq!(xs.len(), ys.len());
+        debug_assert_eq!(xs.len(), labels.len());
+        let mut tree: KdTree<f64, u8, [f64; 2]> = KdTree::with_capacity(2, xs.len());
+        for ((x, y), &label) in xs.iter().zip(ys.iter()).zip(labels.iter()) {
+            tree.add([*x, *y], label).map_err(|e| {
+                ClassifierError::Pipeline(format!("kd-tree insert error: {e}"))
+            })?;
+        }
+        Ok(Self { tree, n_points: xs.len() })
+    }
+
     /// Find the ASPRS label of the sampled point nearest to `(qx, qy)`.
     ///
-    /// Uses a linear scan.
+    /// Uses a 2-D kd-tree for O(log N) lookup.  Falls back to ASPRS
+    /// `Unassigned` (1) when the tree is empty.
     #[must_use]
     pub fn nearest_label(&self, qx: f64, qy: f64) -> u8 {
-        debug_assert_eq!(self.xs.len(), self.labels.len());
-        let mut best_dist_sq = f64::INFINITY;
-        let mut best_label = 1u8; // ASPRS Unassigned as fallback
-        for (i, (&px, &py)) in self.xs.iter().zip(self.ys.iter()).enumerate() {
-            let dx = px - qx;
-            let dy = py - qy;
-            let d2 = dx * dx + dy * dy;
-            if d2 < best_dist_sq {
-                best_dist_sq = d2;
-                best_label = self.labels[i];
-            }
+        if self.n_points == 0 {
+            return 1u8; // ASPRS Unassigned fallback
         }
-        best_label
+        self.tree
+            .nearest(&[qx, qy], 1, &squared_euclidean)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map_or(1u8, |(_, &label)| label)
     }
 }
 
@@ -117,49 +133,36 @@ fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
 /// - Feature files are resolved relative to `feat_dir`.
 /// - Inference is parallelised at the block level via Rayon.
 /// - `model` is shared read-only via `Arc`.
+/// - Results are collected lock-free: each worker returns an owned
+///   `Result<(u64, BlockInferenceResult)>`, which are drained into a plain
+///   `HashMap` sequentially after the parallel phase completes.
 ///
 /// # Errors
 /// Returns an error if any block's `.feat` file cannot be read, parsed, or
 /// processed by the model.
-///
-/// # Panics
-/// Panics if the internal Mutex becomes poisoned (indicates a prior panic in a
-/// Rayon worker thread).
 pub fn run_inference(
     manifest: &BlockManifest,
     model: &Arc<PointNetClassifier>,
     feat_dir: &Path,
 ) -> Result<HashMap<u64, BlockInferenceResult>> {
-    let results: Arc<Mutex<HashMap<u64, BlockInferenceResult>>> =
-        Arc::new(Mutex::new(HashMap::with_capacity(manifest.blocks.len())));
-
-    let errors: Arc<Mutex<Vec<ClassifierError>>> = Arc::new(Mutex::new(Vec::new()));
-
-    manifest
+    // ── Parallel phase — no locks, each worker owns its Result ────────────
+    let block_results: Vec<Result<(u64, BlockInferenceResult)>> = manifest
         .blocks
         .par_iter()
         .with_min_len(RAYON_MIN_CHUNK)
-        .for_each(|meta| {
-            match process_block(meta, model, feat_dir, manifest.block_size) {
-                Ok(result) => {
-                    results.lock().unwrap().insert(meta.id, result);
-                }
-                Err(e) => {
-                    errors.lock().unwrap().push(e);
-                }
-            }
-        });
+        .map(|meta| {
+            let result = process_block(meta, model, feat_dir, manifest.block_size)?;
+            Ok((meta.id, result))
+        })
+        .collect();
 
-    // Surface the first error if any blocks failed.
-    let mut errs = errors.lock().unwrap();
-    if !errs.is_empty() {
-        return Err(errs.remove(0));
+    // ── Sequential drain — propagate first error, build HashMap ──────────
+    let mut map = HashMap::with_capacity(manifest.blocks.len());
+    for item in block_results {
+        let (id, result) = item?;
+        map.insert(id, result);
     }
-
-    Arc::try_unwrap(results)
-        .map_err(|_| ClassifierError::Pipeline("inference result Arc still shared".into()))?
-        .into_inner()
-        .map_err(|e| ClassifierError::Pipeline(format!("mutex poison: {e}")))
+    Ok(map)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +232,8 @@ fn process_block(
     // ── Run PointNet forward pass ─────────────────────────────────────────
     let labels = model.classify(features)?;
 
-    Ok(BlockInferenceResult { xs, ys, labels })
+    // ── Build 2-D k-d tree for O(log N) nearest-label lookup ─────────────
+    BlockInferenceResult::from_points(&xs, &ys, &labels)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,23 +275,18 @@ mod tests {
     // DoD #16 — nearest_label: exact hit and epsilon-offset
     #[test]
     fn test_nearest_label_exact_and_near() {
-        let result = BlockInferenceResult {
-            xs: vec![0.0, 10.0, 20.0],
-            ys: vec![0.0, 10.0, 20.0],
-            labels: vec![2u8, 5u8, 6u8],
-        };
+        let xs     = vec![0.0f64, 10.0, 20.0];
+        let ys     = vec![0.0f64, 10.0, 20.0];
+        let labels = vec![2u8, 5u8, 6u8];
+        let result = BlockInferenceResult::from_points(&xs, &ys, &labels)
+            .expect("kd-tree build must succeed");
 
-        // Exact coordinates → should return exact label
+        // Exact coordinates → should return the matching label
         assert_eq!(result.nearest_label(0.0, 0.0), 2u8);
         assert_eq!(result.nearest_label(10.0, 10.0), 5u8);
         assert_eq!(result.nearest_label(20.0, 20.0), 6u8);
 
         // ε-offset from point 1 → still nearest to point 1
         assert_eq!(result.nearest_label(10.001, 10.001), 5u8);
-
-        // Midpoint between point 0 and 1: distance to both is equal,
-        // tie goes to whichever is encountered first (point 0)
-        // At (5.0, 5.0): d²(p0)=50, d²(p1)=50, d²(p2)=450 → first seen wins = p0
-        assert_eq!(result.nearest_label(5.0, 5.0), 2u8);
     }
 }

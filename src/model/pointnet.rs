@@ -68,6 +68,7 @@ impl PointNetConfig {
 ///
 /// Constructed by `model::weights::load_model`; this struct holds all weight
 /// tensors and runs the forward pass at inference time.
+#[derive(Debug, Clone)]
 pub struct PointNetClassifier {
     pub config: PointNetConfig,
 

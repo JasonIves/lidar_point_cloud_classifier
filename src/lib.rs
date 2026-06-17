@@ -16,4 +16,7 @@ pub mod preprocessing;
 pub mod model;
 pub mod cli;
 
+#[cfg(feature = "training")]
+pub mod training;
+
 pub use error::{ClassifierError, Result};

@@ -3,6 +3,7 @@
 **Status:** COMPLETE — See [stage-02-results.md](stage-02-results.md) for full development record and deviations
 **Approved:** 2026-06-15
 **Implemented:** 2026-06-15
+**Retroactive extension:** 2026-06-16 — Stage 03 added `#[derive(Clone)]` to `PointNetClassifier` to support SWA weight averaging; see Stage 03 results for rationale
 **Project:** Whitebox Next Gen: LiDAR Point Cloud Classifier
 **Lead Architect:** GitHub Copilot / AI Collaborator
 

@@ -72,26 +72,19 @@ pub fn write_classified<S: BuildHasher>(
     let mut writer = open_writer(output_path, out_format, writer_cfg)?;
 
     // ── Precompute block-grid geometry from the manifest ───────────────────
-    // These values mirror Stage 01's BlockPartitioner.
-    let x_min = manifest
-        .blocks
-        .iter()
-        .map(|b| b.origin_x)
-        .fold(f64::INFINITY, f64::min);
-    let y_min = manifest
-        .blocks
-        .iter()
-        .map(|b| b.origin_y)
-        .fold(f64::INFINITY, f64::min);
-    let x_max_approx = manifest
-        .blocks
-        .iter()
-        .map(|b| b.origin_x)
-        .fold(f64::NEG_INFINITY, f64::max)
-        + manifest.block_size;
-
+    // Use the header-derived values stored in the manifest.  Do NOT re-derive
+    // grid_cols from retained block origins: the density filter may have dropped
+    // trailing columns, producing a smaller (wrong) value that corrupts block IDs
+    // in every row after the first.
+    if manifest.grid_cols == 0 {
+        return Err(ClassifierError::Pipeline(
+            "blocks.json is missing grid_cols — re-run preprocessing to regenerate it".to_string(),
+        ));
+    }
+    let x_min = manifest.grid_x_min;
+    let y_min = manifest.grid_y_min;
     let block_size = manifest.block_size;
-    let grid_cols = ((x_max_approx - x_min) / block_size).ceil().max(1.0) as i64;
+    let grid_cols = manifest.grid_cols as i64;
 
     // ── Stream + substitute + write ───────────────────────────────────────
     let mut pt = PointRecord::default();
@@ -232,6 +225,10 @@ mod tests {
             search_radius: 1.0,
             min_neighbors: 1,
             crs_epsg: None,
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: origin_x,
+            grid_y_min: origin_y,
             blocks: vec![BlockMeta {
                 id: 0,
                 file: "block_00000.feat".into(),
@@ -275,11 +272,11 @@ mod tests {
         write_synthetic_las(input_tmp.path(), &orig_pts)?;
 
         // Build inference map: block 0 covers [0,50)×[0,50), sampled points at exact input coords
-        let inference_result = BlockInferenceResult {
-            xs:     vec![1.0, 2.0, 3.0, 4.0],
-            ys:     vec![1.0, 2.0, 3.0, 4.0],
-            labels: vec![2u8, 5u8, 6u8, 3u8], // Ground, Building, Water, LowVeg
-        };
+        let inference_result = BlockInferenceResult::from_points(
+            &[1.0, 2.0, 3.0, 4.0],
+            &[1.0, 2.0, 3.0, 4.0],
+            &[2u8, 5u8, 6u8, 3u8], // Ground, Building, Water, LowVeg
+        ).expect("kd-tree build must succeed");
         let mut inference_map = HashMap::new();
         inference_map.insert(0u64, inference_result);
 

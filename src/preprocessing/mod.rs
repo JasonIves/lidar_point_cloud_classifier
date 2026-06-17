@@ -2,11 +2,12 @@
 
 pub mod block_partitioner;
 pub mod feature_extractor;
+pub mod labeled_pipeline;
 pub mod normalizer;
 pub mod pipeline;
 pub mod spatial_index;
 
-pub use pipeline::{BlockManifest, BlockMeta, PreprocessingPipeline};
+pub use pipeline::{BlockManifest, BlockMeta, BlockProcessResult, PreprocessingPipeline};
 
 /// Minimum Rayon chunk size before spawning parallel tasks pays off.
 /// Mirrors the convention used in `wbtools_oss`.

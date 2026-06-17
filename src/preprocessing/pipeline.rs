@@ -13,6 +13,8 @@
 //!    - Optionally emit debug `.csv`.
 //! 5. Write `blocks.json` manifest.
 
+#![allow(clippy::doc_markdown, clippy::missing_errors_doc)]
+
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -42,6 +44,21 @@ pub struct BlockManifest {
     pub search_radius: f64,
     pub min_neighbors: usize,
     pub crs_epsg: Option<u32>,
+    /// Number of grid columns derived from the LiDAR header bounding box.
+    /// This is the authoritative value for block-ID arithmetic (`row * grid_cols + col`).
+    /// Never re-derive from retained block origins — the density filter may have
+    /// removed trailing columns, which would produce a smaller (wrong) value.
+    #[serde(default)]
+    pub grid_cols: u32,
+    /// Number of grid rows derived from the LiDAR header bounding box.
+    #[serde(default)]
+    pub grid_rows: u32,
+    /// Header-derived south-west X origin — the same value passed to `BlockPartitioner`.
+    #[serde(default)]
+    pub grid_x_min: f64,
+    /// Header-derived south-west Y origin — the same value passed to `BlockPartitioner`.
+    #[serde(default)]
+    pub grid_y_min: f64,
     pub blocks: Vec<BlockMeta>,
 }
 
@@ -57,6 +74,19 @@ pub struct BlockMeta {
     pub oversampled: bool,
 }
 
+/// Internal per-block processing result that also carries the sampling indices.
+///
+/// Used by the labeled-preprocessing pipeline to retrieve the `classification`
+/// byte for each sampled point without a second LiDAR pass (Option A from spec).
+#[derive(Debug)]
+pub struct BlockProcessResult {
+    /// Public metadata (serialised to `blocks.json`).
+    pub meta: BlockMeta,
+    /// 0-based indices into the raw per-block `Vec<PointRecord>` for each
+    /// sampled output point row.  Length equals `meta.sampled_point_count`.
+    pub sampled_indices: Vec<usize>,
+}
+
 /// The main preprocessing pipeline.
 pub struct PreprocessingPipeline;
 
@@ -68,8 +98,29 @@ impl PreprocessingPipeline {
     ///
     /// # Errors
     /// Returns `ClassifierError` on any I/O, `LiDAR` parse, or serialisation failure.
-    #[allow(clippy::too_many_lines)]
     pub fn run(config: &PreprocessConfig) -> Result<BlockManifest> {
+        let (manifest, _) = Self::run_internal(config, false)?;
+        Ok(manifest)
+    }
+
+    /// Run the pipeline and also return per-block `sampled_indices`.
+    ///
+    /// Used by the labeled-preprocessing pipeline (Stage 03) to retrieve the
+    /// `classification` byte for each sampled point without a second LiDAR pass.
+    ///
+    /// # Errors
+    /// Same as [`run`].
+    pub fn run_with_indices(
+        config: &PreprocessConfig,
+    ) -> Result<(BlockManifest, Vec<BlockProcessResult>)> {
+        Self::run_internal(config, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_internal(
+        config: &PreprocessConfig,
+        capture_indices: bool,
+    ) -> Result<(BlockManifest, Vec<BlockProcessResult>)> {
         // ── 0. Set up Rayon thread pool ────────────────────────────────────
         if let Some(threads) = config.threads {
             rayon::ThreadPoolBuilder::new()
@@ -86,6 +137,15 @@ impl PreprocessingPipeline {
         let (x_min, y_min, x_max, y_max, total_points, crs_epsg) =
             inspect_lidar_header(input_path)?;
 
+        // Compute grid geometry from the header bounding box.  These values
+        // are the authoritative source for block-ID arithmetic throughout the
+        // entire pipeline — store them in the manifest so no consumer ever
+        // needs to re-derive them from retained block origins.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let grid_cols = (((x_max - x_min) / config.block_size).ceil() as u32).max(1);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let grid_rows = (((y_max - y_min) / config.block_size).ceil() as u32).max(1);
+
         eprintln!(
             "[preprocessing] input:  {}",
             input_path.display()
@@ -93,6 +153,7 @@ impl PreprocessingPipeline {
         eprintln!(
             "[preprocessing] extent: ({x_min:.2}, {y_min:.2}) → ({x_max:.2}, {y_max:.2})"
         );
+        eprintln!("[preprocessing] grid: {grid_cols} cols × {grid_rows} rows");
         eprintln!("[preprocessing] points: {total_points}");
 
         // ── 3. Stream all points into the block partitioner ───────────────
@@ -143,7 +204,7 @@ impl PreprocessingPipeline {
             .transpose()?;
 
         // ── 7. Per-block parallel processing ─────────────────────────────
-        let block_results: Vec<Result<BlockMeta>> = retained
+        let block_results: Vec<Result<BlockProcessResult>> = retained
             .into_par_iter()
             .with_min_len(RAYON_MIN_CHUNK)
             .map(|block| {
@@ -152,8 +213,8 @@ impl PreprocessingPipeline {
                 // (a) Build k-d tree from full unsampled block
                 let index = BlockSpatialIndex::build(&block.points);
 
-                // (b) Density-gated sampling
-                let (sampled, oversampled) =
+                // (b) Density-gated sampling — now returns indices too
+                let (sampled, sampled_indices, oversampled) =
                     resample_block(&block.points, config.target_points, block.id);
 
                 let raw_count = block.points.len();
@@ -190,7 +251,7 @@ impl PreprocessingPipeline {
                     write_debug_csv(&csv_path, &features)?;
                 }
 
-                Ok(BlockMeta {
+                let meta = BlockMeta {
                     id: block.id,
                     file: feat_filename,
                     origin_x: block.origin_x,
@@ -198,16 +259,23 @@ impl PreprocessingPipeline {
                     raw_point_count: raw_count,
                     sampled_point_count: sampled_count,
                     oversampled,
-                })
+                };
+
+                // Only allocate the indices vec when caller wants them.
+                let indices = if capture_indices { sampled_indices } else { Vec::new() };
+
+                Ok(BlockProcessResult { meta, sampled_indices: indices })
             })
             .collect();
 
         // Collect results, propagating the first error.
-        let mut block_metas = Vec::with_capacity(block_results.len());
+        let mut process_results = Vec::with_capacity(block_results.len());
         for r in block_results {
-            block_metas.push(r?);
+            process_results.push(r?);
         }
-        block_metas.sort_by_key(|m| m.id);
+        process_results.sort_by_key(|r| r.meta.id);
+
+        let block_metas: Vec<BlockMeta> = process_results.iter().map(|r| r.meta.clone()).collect();
 
         eprintln!("[preprocessing] wrote {} .feat files", block_metas.len());
 
@@ -220,6 +288,10 @@ impl PreprocessingPipeline {
             search_radius: config.search_radius,
             min_neighbors: config.min_neighbors,
             crs_epsg,
+            grid_cols,
+            grid_rows,
+            grid_x_min: x_min,
+            grid_y_min: y_min,
             blocks: block_metas,
         };
 
@@ -228,7 +300,7 @@ impl PreprocessingPipeline {
         serde_json::to_writer_pretty(BufWriter::new(manifest_file), &manifest)?;
         eprintln!("[preprocessing] wrote {}", manifest_path.display());
 
-        Ok(manifest)
+        Ok((manifest, process_results))
     }
 }
 

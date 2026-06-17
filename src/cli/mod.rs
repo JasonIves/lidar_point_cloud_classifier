@@ -3,6 +3,11 @@
 pub mod classify_cmd;
 pub mod preprocess_cmd;
 
+#[cfg(feature = "training")]
+pub mod preprocess_labeled_cmd;
+#[cfg(feature = "training")]
+pub mod train_cmd;
+
 use crate::error::Result;
 
 /// Top-level CLI entry point called from `main`.

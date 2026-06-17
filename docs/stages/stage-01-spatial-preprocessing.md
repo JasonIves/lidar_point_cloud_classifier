@@ -3,6 +3,7 @@
 **Status:** COMPLETE — See [stage-01-results.md](stage-01-results.md) for full development record and deviations  
 **Approved:** 2026-06-13  
 **Implemented:** 2026-06-15  
+**Retroactive extension:** 2026-06-16 — Stage 03 added `sampled_indices` to `resample_block` return and `BlockProcessResult` / `run_with_indices` to `pipeline.rs`; see Stage 03 results for rationale  
 **Project:** Whitebox Next Gen: LiDAR Point Cloud Classifier
 
 ---
@@ -253,8 +254,8 @@ Serialize `blocks.json` to the output directory. Delete all `.spill` temp files.
 | `block_partitioner` | 2D grid bucketing, high-water spill, post-stream merge | `BlockPartitioner::new(cfg)`, `::add_point(pt)`, `::finalize() -> Vec<Block>` |
 | `spatial_index` | k-d tree construction + adaptive radius search | `BlockSpatialIndex::build(pts)`, `::adaptive_radius_search(pt, base_r, min_n, max_r) -> Vec<[f64;3]>` |
 | `feature_extractor` | Covariance matrix, eigendecomposition, HAG, feature assembly | `extract_features(pts, index, hag_fn, cfg) -> Vec<[f32;12]>` |
-| `normalizer` | Coordinate/intensity normalization, density-gated sampling | `resample_block(pts, target_n, seed) -> Vec<PointRecord>`, `normalize_coords(pts, cfg) -> Vec<[f32;6]>` |
-| `pipeline` | Streaming orchestrator tying all modules together | `PreprocessingPipeline::run(config) -> Result<BlockManifest>` |
+| `normalizer` | Coordinate/intensity normalization, density-gated sampling | `resample_block(pts, target_n, seed) -> (Vec<PointRecord>, Vec<usize>, bool)`, `normalize_coords(pts, cfg) -> Vec<[f32;6]>` |
+| `pipeline` | Streaming orchestrator tying all modules together | `PreprocessingPipeline::run(config) -> Result<BlockManifest>`, `::run_with_indices(config) -> Result<(BlockManifest, Vec<BlockProcessResult>)>` |
 | `cli/preprocess_cmd` | CLI argument parsing + `Pipeline::run()` invocation | `run_preprocess_cmd(matches) -> Result<()>` |
 
 ---
