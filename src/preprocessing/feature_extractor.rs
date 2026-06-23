@@ -1,31 +1,39 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-//! Per-point feature extraction: assembles the full 12-element feature vector
+//! Per-point feature extraction: assembles the feature vector
 //! by combining scalar attributes (from `normalizer`) with eigenvalue-derived
-//! structural features.
+//! structural features at one or more search radii.
 //!
-//! ## Feature index layout
-//! | Idx | Name            | Source           |
-//! |-----|-----------------|------------------|
-//! |  0  | `x_norm`        | normalizer       |
-//! |  1  | `y_norm`        | normalizer       |
-//! |  2  | `z_norm`        | normalizer       |
-//! |  3  | `intensity_norm`| normalizer       |
-//! |  4  | `return_ratio`  | normalizer       |
-//! |  5  | `scan_angle_norm`| normalizer      |
-//! |  6  | `hag`           | normalizer       |
-//! |  7  | `linearity`     | eigenvalue       |
-//! |  8  | `planarity`     | eigenvalue       |
-//! |  9  | `sphericity`    | eigenvalue       |
-//! | 10  | `omnivariance`  | eigenvalue       |
-//! | 11  | `curvature`     | eigenvalue       |
+//! ## Feature index layout (N search radii)
+//! | Idx range | Name group      | Source                  |
+//! |-----------|-----------------|-------------------------|
+//! | 0–6       | scalar          | normalizer               |
+//! | 7–11      | eigenvalue @ r₀ | covariance @ radius 0    |
+//! | 12–16     | eigenvalue @ r₁ | covariance @ radius 1    |
+//! | …         | …               | …                        |
+//!
+//! Each 5-element eigenvalue block: linearity, planarity, sphericity,
+//! omnivariance, curvature.
+//!
+//! **Single-scale mode** (`search_radii.len() == 1`) uses adaptive radius
+//! expansion (up to `radius × 4`) to handle sparse blocks robustly — identical
+//! to the Stage 01 behaviour.
+//!
+//! **Multi-scale mode** (`search_radii.len() > 1`) uses a fixed radius per
+//! scale.  Adaptive expansion is disabled so each scale remains faithful to
+//! its intended neighbourhood size.  Degenerate cases (fewer than 3 neighbours)
+//! fall back to `[0.0; 5]`.
 
 use nalgebra::{Matrix3, linalg::SymmetricEigen};
 use wblidar::PointRecord;
 
-use crate::preprocessing::{spatial_index::BlockSpatialIndex, N_FEATURES};
+use crate::preprocessing::spatial_index::BlockSpatialIndex;
 use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, DtmView};
 
-/// Extract the full `[f32; N_FEATURES]` vector for every point in `pts`.
+/// Extract the full feature vector for every point in `pts`.
+///
+/// Returns one `Vec<f32>` per sampled point.  The length of each row is
+/// `7 + 5 × search_radii.len()`.  When `search_radii` has a single entry,
+/// the output is identical to the Stage 01 12-feature baseline.
 ///
 /// # Parameters
 /// - `pts`          — sampled point records for this block
@@ -34,8 +42,8 @@ use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, D
 /// - `dtm`          — optional DTM view for HAG; `None` → block-min-z proxy
 /// - `origin_x/y`   — block south-west corner
 /// - `block_size`   — cell edge length
-/// - `search_radius`— base neighbourhood radius
-/// - `min_neighbors`— adaptive expansion threshold
+/// - `search_radii` — sorted ascending list of eigenvalue search radii
+/// - `min_neighbors`— adaptive expansion threshold (single-scale mode only)
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn extract_features(
@@ -46,33 +54,43 @@ pub fn extract_features(
     origin_x: f64,
     origin_y: f64,
     block_size: f64,
-    search_radius: f64,
+    search_radii: &[f64],
     min_neighbors: usize,
-) -> Vec<[f32; N_FEATURES]> {
+) -> Vec<Vec<f32>> {
+    let multi_scale = search_radii.len() > 1;
+
     // Step 1: HAG
     let hag_values = compute_hag(pts, dtm);
 
     // Step 2: Scalar features (indices 0–6)
     let scalar = normalise_scalar_features(pts, origin_x, origin_y, block_size, &hag_values);
 
-    // Step 3: Eigenvalue features (indices 7–11) — one neighbourhood query per point
-    let eigen: Vec<[f32; 5]> = pts
-        .iter()
-        .map(|pt| {
-            let center = [pt.x, pt.y, pt.z];
-            let neighbor_indices =
-                index.adaptive_radius_search(center, search_radius, min_neighbors);
-            eigenvalue_features(all_pts, &neighbor_indices)
-        })
-        .collect();
+    // Step 3: Eigenvalue features per radius.
+    // Single-scale: adaptive radius expansion (Stage 01 behaviour preserved).
+    // Multi-scale:  fixed radius per scale to keep scales distinct.
+    let n_radii = search_radii.len().max(1);
+    let row_len = 7 + 5 * n_radii;
 
-    // Step 4: Assemble into full feature rows
     scalar
         .into_iter()
-        .zip(eigen)
-        .map(|(s, e)| {
-            [s[0], s[1], s[2], s[3], s[4], s[5], s[6],
-             e[0], e[1], e[2], e[3], e[4]]
+        .zip(pts.iter())
+        .map(|(s, pt)| {
+            let center = [pt.x, pt.y, pt.z];
+            let mut row = Vec::with_capacity(row_len);
+            row.extend_from_slice(&s);  // indices 0–6
+
+            for &radius in search_radii {
+                let indices = if multi_scale {
+                    // Fixed radius: preserve scale fidelity.
+                    index.radius_search(center, radius)
+                } else {
+                    // Adaptive expansion: robustness on sparse blocks.
+                    index.adaptive_radius_search(center, radius, min_neighbors)
+                };
+                let eig = eigenvalue_features(all_pts, &indices);
+                row.extend_from_slice(&eig);
+            }
+            row
         })
         .collect()
 }
@@ -89,6 +107,8 @@ fn eigenvalue_features(all_pts: &[PointRecord], indices: &[usize]) -> [f32; 5] {
     }
 
     // Build 3×3 covariance matrix from neighbour coordinates.
+    // usize→f64: lossless for any plausible neighbourhood size (< 2^53).
+    #[allow(clippy::cast_precision_loss)]
     let n = indices.len() as f64;
     let mut sum_x = 0.0_f64;
     let mut sum_y = 0.0_f64;
@@ -150,11 +170,18 @@ fn eigenvalue_features(all_pts: &[PointRecord], indices: &[usize]) -> [f32; 5] {
         return [0.0; 5];
     }
 
+    // f64→f32 precision loss is intentional: all values are clamped to [0,1]
+    // or are the cube-root of a product of small eigenvalues.
+    #[allow(clippy::cast_precision_loss)]
     let linearity   = ((l1 - l2) / l1).clamp(0.0, 1.0) as f32;
+    #[allow(clippy::cast_precision_loss)]
     let planarity   = ((l2 - l3) / l1).clamp(0.0, 1.0) as f32;
+    #[allow(clippy::cast_precision_loss)]
     let sphericity  = (l3 / l1).clamp(0.0, 1.0) as f32;
+    #[allow(clippy::cast_precision_loss)]
     let omnivariance = (l1 * l2 * l3).cbrt() as f32;
     let sum = l1 + l2 + l3;
+    #[allow(clippy::cast_precision_loss)]
     let curvature   = if sum < 1e-12 { 0.0 } else { (l3 / sum).clamp(0.0, 1.0) as f32 };
 
     [linearity, planarity, sphericity, omnivariance, curvature]
@@ -221,8 +248,8 @@ mod tests {
         assert_eq!(feats, [0.0; 5]);
     }
 
-    /// Full pipeline sanity: extract_features produces N_FEATURES values per point,
-    /// all scalar features are within [0, 1].
+    /// Full pipeline sanity: single-scale extract_features produces N_FEATURES
+    /// values per point, all scalar features are within [0, 1].
     #[test]
     fn test_extract_features_output_shape_and_range() {
         let all_pts: Vec<PointRecord> = (0..20)
@@ -243,19 +270,61 @@ mod tests {
             None,
             0.0, 0.0,
             50.0,
-            5.0,
+            &[5.0],   // single radius
             3,
         );
 
         assert_eq!(feats.len(), all_pts.len());
         for row in &feats {
-            assert_eq!(row.len(), N_FEATURES);
-            // Scalar features (0–6) and ratio features (7–9, 11) should be in [0,1]
+            assert_eq!(row.len(), crate::preprocessing::N_FEATURES, "single-radius should produce 12 features");
+            // Scalar features (0–6) should be in [0,1]
             for &v in &row[0..7] {
                 assert!((0.0..=1.0).contains(&v), "scalar feature out of range: {v}");
             }
             // omnivariance (index 10) can be > 1, just check it's non-negative
             assert!(row[10] >= 0.0, "omnivariance must be non-negative: {}", row[10]);
+        }
+    }
+
+    /// Multi-scale: 3 radii → 7 + 5×3 = 22 features per point.
+    #[test]
+    fn test_extract_features_multi_scale_width() {
+        let all_pts: Vec<PointRecord> = (0..30)
+            .map(|i| pt(i as f64 * 1.5, (i % 5) as f64, (i % 3) as f64 * 0.2))
+            .collect();
+
+        let index = BlockSpatialIndex::build(&all_pts);
+        let feats = extract_features(
+            &all_pts,
+            &all_pts,
+            &index,
+            None,
+            0.0, 0.0,
+            50.0,
+            &[1.0, 3.0, 6.0],  // 3 radii
+            3,
+        );
+
+        let expected_n = crate::preprocessing::n_features_for_radii(3); // 22
+        assert_eq!(feats.len(), all_pts.len());
+        for row in &feats {
+            assert_eq!(row.len(), expected_n, "3-radius should produce 22 features");
+        }
+    }
+
+    /// Single-radius extract_features output matches the legacy N_FEATURES baseline.
+    #[test]
+    fn test_extract_features_single_radius_matches_legacy_width() {
+        let all_pts: Vec<PointRecord> = (0..10)
+            .map(|i| pt(i as f64, 0.0, 0.0))
+            .collect();
+        let index = BlockSpatialIndex::build(&all_pts);
+
+        // Single radius in the Vec form
+        let feats_new = extract_features(&all_pts, &all_pts, &index, None, 0.0, 0.0, 50.0, &[2.0], 3);
+        // All rows should be exactly N_FEATURES wide
+        for row in &feats_new {
+            assert_eq!(row.len(), crate::preprocessing::N_FEATURES);
         }
     }
 }

@@ -160,7 +160,11 @@ where
 
     // ── Model + config ────────────────────────────────────────────────────
     let net_cfg = PointNetConfig {
+<<<<<<< HEAD
+        n_features_in: dataset.n_features(),
+=======
         n_features_in: crate::preprocessing::N_FEATURES,
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         encoder_dims: vec![64, 128, 256],
         decoder_dims: vec![256, 128],
         n_classes: config.n_classes,
@@ -244,8 +248,14 @@ where
                 };
 
                 let n = block.features.nrows();
+<<<<<<< HEAD
+                let n_features_block = block.features.ncols();
+                let raw_floats: Vec<f32> = block.features.into_raw_vec_and_offset().0;
+                let feat_tensor = features_to_tensor::<B>(raw_floats, n, n_features_block, device);
+=======
                 let raw_floats: Vec<f32> = block.features.into_raw_vec_and_offset().0;
                 let feat_tensor = features_to_tensor::<B>(raw_floats, n, device);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 let targets = labels_to_tensor::<B>(&block.labels, device);
 
                 // Forward
@@ -293,12 +303,22 @@ where
             train_loss,
             device,
             config.n_classes,
+<<<<<<< HEAD
+            class_weights.as_deref(),
+        )?;
+
+        eprintln!(
+            "[trainer] epoch {}/{} — train_loss={:.4}  val_loss_uw={:.4}  val_loss_w={:.4}  val_mIoU={:.4}",
+            epoch + 1, config.epochs,
+            train_loss, val_metrics.val_loss, val_metrics.val_loss_weighted, val_metrics.miou
+=======
         )?;
 
         eprintln!(
             "[trainer] epoch {}/{} — train_loss={:.4}  val_loss={:.4}  val_mIoU={:.4}",
             epoch + 1, config.epochs,
             train_loss, val_metrics.val_loss, val_metrics.miou
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         );
 
         // Append to metrics CSV.
@@ -385,12 +405,27 @@ fn validate_epoch<B: AutodiffBackend>(
     train_loss: f64,
     device: &B::Device,
     n_classes: usize,
+<<<<<<< HEAD
+    class_weights: Option<&[f32]>,
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 ) -> Result<EpochMetrics>
 where
     B::InnerBackend: burn::tensor::backend::Backend<Device = B::Device>,
 {
+<<<<<<< HEAD
+    // Clone the model so the original's BN running statistics are not
+    // contaminated by validation-batch statistics.
+    // The clone runs in TRAINING mode (batch statistics), which avoids the
+    // BatchNorm distribution-shift problem that occurs when validation blocks
+    // come from spatially disjoint macro-tiles with different feature
+    // distributions.  Running statistics built from training blocks would
+    // normalise validation activations incorrectly, causing logit explosion.
+    let val_model = model.clone();
+=======
     use burn::tensor::TensorData;
     let val_model = model.valid();
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     let mut acc = MetricsAccumulator::new(n_classes);
 
     for &block_id in val_ids {
@@ -400,6 +435,17 @@ where
         };
 
         let n = block.features.nrows();
+<<<<<<< HEAD
+        let n_features_block = block.features.ncols();
+        let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
+
+        // Use autodiff tensors so BN runs with per-batch statistics.
+        // No .backward() is ever called, so no gradient computation occurs.
+        let feat_tensor = features_to_tensor::<B>(flat, n, n_features_block, device);
+        let logits = val_model.forward(feat_tensor);  // [N, n_classes]
+        let nc = logits.dims()[1];
+        let flat_out: Vec<f32> = logits
+=======
         let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
 
         // Validation tensors use InnerBackend (no grad).
@@ -409,6 +455,7 @@ where
         let logits_inner = val_model.forward(feat_inner);  // [N, n_classes]
         let nc = logits_inner.dims()[1];
         let flat_out: Vec<f32> = logits_inner
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             .into_data()
             .to_vec::<f32>()
             .unwrap_or_default();
@@ -417,15 +464,28 @@ where
                 let row = &flat_out[i * nc..(i + 1) * nc];
                 row.iter()
                     .enumerate()
+<<<<<<< HEAD
+=======
                     // Guard against NaN logits (e.g. exploding gradients): treat
                     // NaN as equal so the lower index wins rather than panicking.
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map_or(0, |(j, _)| j as u8)
             })
             .collect();
 
+<<<<<<< HEAD
+        let loss_uw = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
+        acc.add_loss(loss_uw);
+
+        let loss_w = cross_entropy_from_logits_weighted(
+            &flat_out, &block.labels, n, nc, class_weights,
+        );
+        acc.add_loss_weighted(loss_w);
+=======
         let loss_val = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
         acc.add_loss(loss_val);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         acc.accumulate(&preds, &block.labels);
     }
@@ -450,6 +510,40 @@ fn cross_entropy_from_logits(logits: &[f32], labels: &[u8], n: usize, nc: usize)
     if n > 0 { loss / n as f64 } else { 0.0 }
 }
 
+<<<<<<< HEAD
+/// Class-weighted cross-entropy, normalized by the sum of sample weights.
+/// This matches burn's `CrossEntropyLoss` with `with_weights` convention
+/// and is directly comparable to `train_loss`.
+/// When `weights` is `None`, falls back to unweighted (same as above).
+fn cross_entropy_from_logits_weighted(
+    logits: &[f32],
+    labels: &[u8],
+    n: usize,
+    nc: usize,
+    weights: Option<&[f32]>,
+) -> f64 {
+    let Some(w) = weights else {
+        return cross_entropy_from_logits(logits, labels, n, nc);
+    };
+    let mut loss = 0.0f64;
+    let mut w_sum = 0.0f64;
+    for i in 0..n {
+        let row = &logits[i * nc..(i + 1) * nc];
+        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_sum: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
+        let log_sum_exp = max_val + exp_sum.ln();
+        let c = labels[i] as usize;
+        if c < nc {
+            let wi = if c < w.len() { f64::from(w[c]) } else { 1.0 };
+            loss  += wi * f64::from(log_sum_exp - row[c]);
+            w_sum += wi;
+        }
+    }
+    if w_sum > 0.0 { loss / w_sum } else { 0.0 }
+}
+
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 // ─────────────────────────────────────────────────────────────────────────────
 // SWA
 // ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +576,25 @@ fn apply_swa(
     let mut base = models[0].clone();
     let other_models = &models[1..];
 
+<<<<<<< HEAD
+    // ── Helper: accumulate one Linear layer's weight+bias into `base_lin` ──
+    // Defined as a macro so it can be reused without fighting the borrow checker.
+    macro_rules! accum_linear {
+        ($base_lin:expr, $other_lin:expr) => {
+            $base_lin.weight = (&$base_lin.weight + &$other_lin.weight).to_owned();
+            $base_lin.bias   = (&$base_lin.bias   + &$other_lin.bias).to_owned();
+        };
+    }
+    macro_rules! divide_linear {
+        ($lin:expr) => {
+            $lin.weight /= n;
+            $lin.bias   /= n;
+        };
+    }
+    macro_rules! accum_bn {
+        ($base_bn:expr, $other_bn:expr) => {
+            if let (Some(ref mut bb), Some(ref mb)) = ($base_bn, $other_bn) {
+=======
     // Average all parameters using ndarray arithmetic.
     // Encoder layers
     for i in 0..base.encoder_layers.len() {
@@ -489,21 +602,107 @@ fn apply_swa(
             base.encoder_layers[i].0.weight = (&base.encoder_layers[i].0.weight + &m.encoder_layers[i].0.weight).to_owned();
             base.encoder_layers[i].0.bias   = (&base.encoder_layers[i].0.bias   + &m.encoder_layers[i].0.bias).to_owned();
             if let (Some(ref mut bb), Some(ref mb)) = (&mut base.encoder_layers[i].1, &m.encoder_layers[i].1) {
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 bb.gamma = (&bb.gamma + &mb.gamma).to_owned();
                 bb.beta  = (&bb.beta  + &mb.beta).to_owned();
                 bb.mean  = (&bb.mean  + &mb.mean).to_owned();
                 bb.var   = (&bb.var   + &mb.var).to_owned();
             }
+<<<<<<< HEAD
+        };
+    }
+    macro_rules! divide_bn {
+        ($bn:expr) => {
+            if let Some(ref mut bb) = $bn {
+                bb.gamma /= n; bb.beta /= n; bb.mean /= n; bb.var /= n;
+            }
+        };
+    }
+
+    // ── Average all parameters using ndarray arithmetic ────────────────────
+    // Encoder layers
+    for i in 0..base.encoder_layers.len() {
+        for m in other_models {
+            accum_linear!(base.encoder_layers[i].0, m.encoder_layers[i].0);
+            accum_bn!(&mut base.encoder_layers[i].1, &m.encoder_layers[i].1);
+        }
+        divide_linear!(base.encoder_layers[i].0);
+        divide_bn!(base.encoder_layers[i].1);
+=======
         }
         base.encoder_layers[i].0.weight /= n;
         base.encoder_layers[i].0.bias   /= n;
         if let Some(ref mut bb) = base.encoder_layers[i].1 {
             bb.gamma /= n; bb.beta /= n; bb.mean /= n; bb.var /= n;
         }
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     }
     // Decoder layers
     for i in 0..base.decoder_layers.len() {
         for m in other_models {
+<<<<<<< HEAD
+            accum_linear!(base.decoder_layers[i].0, m.decoder_layers[i].0);
+            accum_bn!(&mut base.decoder_layers[i].1, &m.decoder_layers[i].1);
+        }
+        divide_linear!(base.decoder_layers[i].0);
+        divide_bn!(base.decoder_layers[i].1);
+    }
+    // Class projection (no BN)
+    for m in other_models {
+        accum_linear!(base.class_proj, m.class_proj);
+    }
+    divide_linear!(base.class_proj);
+
+    // ── T-Net layers ───────────────────────────────────────────────────────
+    // The T-Net (STN3d / STN64d) is trained jointly with all other layers
+    // under the same gradient signal.  Excluding it from SWA would produce a
+    // composite model where the averaged backbone expects the canonical
+    // representation produced by the averaged T-Net, but receives instead the
+    // representation from a single checkpoint's T-Net — a mismatch.
+    //
+    // Both `input_tnet` and `feature_tnet` are `Option<TNet>`; the averaging
+    // block is gated so models without T-Nets are handled correctly.
+    for m in other_models {
+        if let (Some(ref mut bt), Some(ref mt)) = (&mut base.input_tnet, &m.input_tnet) {
+            accum_linear!(bt.enc0, mt.enc0);
+            accum_linear!(bt.enc1, mt.enc1);
+            accum_linear!(bt.enc2, mt.enc2);
+            accum_bn!(&mut bt.bn_enc0, &mt.bn_enc0);
+            accum_bn!(&mut bt.bn_enc1, &mt.bn_enc1);
+            accum_bn!(&mut bt.bn_enc2, &mt.bn_enc2);
+            accum_linear!(bt.fc0, mt.fc0);
+            accum_linear!(bt.fc1, mt.fc1);
+            accum_linear!(bt.fc2, mt.fc2);
+            accum_bn!(&mut bt.bn_fc0, &mt.bn_fc0);
+            accum_bn!(&mut bt.bn_fc1, &mt.bn_fc1);
+        }
+        if let (Some(ref mut bt), Some(ref mt)) = (&mut base.feature_tnet, &m.feature_tnet) {
+            accum_linear!(bt.enc0, mt.enc0);
+            accum_linear!(bt.enc1, mt.enc1);
+            accum_linear!(bt.enc2, mt.enc2);
+            accum_bn!(&mut bt.bn_enc0, &mt.bn_enc0);
+            accum_bn!(&mut bt.bn_enc1, &mt.bn_enc1);
+            accum_bn!(&mut bt.bn_enc2, &mt.bn_enc2);
+            accum_linear!(bt.fc0, mt.fc0);
+            accum_linear!(bt.fc1, mt.fc1);
+            accum_linear!(bt.fc2, mt.fc2);
+            accum_bn!(&mut bt.bn_fc0, &mt.bn_fc0);
+            accum_bn!(&mut bt.bn_fc1, &mt.bn_fc1);
+        }
+    }
+    if let Some(ref mut bt) = base.input_tnet {
+        divide_linear!(bt.enc0); divide_linear!(bt.enc1); divide_linear!(bt.enc2);
+        divide_bn!(bt.bn_enc0);  divide_bn!(bt.bn_enc1);  divide_bn!(bt.bn_enc2);
+        divide_linear!(bt.fc0);  divide_linear!(bt.fc1);  divide_linear!(bt.fc2);
+        divide_bn!(bt.bn_fc0);   divide_bn!(bt.bn_fc1);
+    }
+    if let Some(ref mut bt) = base.feature_tnet {
+        divide_linear!(bt.enc0); divide_linear!(bt.enc1); divide_linear!(bt.enc2);
+        divide_bn!(bt.bn_enc0);  divide_bn!(bt.bn_enc1);  divide_bn!(bt.bn_enc2);
+        divide_linear!(bt.fc0);  divide_linear!(bt.fc1);  divide_linear!(bt.fc2);
+        divide_bn!(bt.bn_fc0);   divide_bn!(bt.bn_fc1);
+    }
+=======
             base.decoder_layers[i].0.weight = (&base.decoder_layers[i].0.weight + &m.decoder_layers[i].0.weight).to_owned();
             base.decoder_layers[i].0.bias   = (&base.decoder_layers[i].0.bias   + &m.decoder_layers[i].0.bias).to_owned();
             if let (Some(ref mut bb), Some(ref mb)) = (&mut base.decoder_layers[i].1, &m.decoder_layers[i].1) {
@@ -525,6 +724,7 @@ fn apply_swa(
     }
     base.class_proj.weight /= n;
     base.class_proj.bias   /= n;
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
     crate::model::weights::save_model(output_path, &base)
 }
@@ -583,4 +783,79 @@ mod tests {
         let loss = cross_entropy_from_logits(&logits, &labels, 2, 2);
         assert!(loss < 0.001, "expected near-zero loss, got {loss}");
     }
+<<<<<<< HEAD
+
+    /// Verify that `apply_swa` averages T-Net weights, not just encoder/decoder.
+    ///
+    /// Creates two distinct `.wbmodel` files via the burn→ndarray bridge, calls
+    /// `apply_swa`, then checks that the averaged T-Net `enc0` weight equals
+    /// the element-wise mean of the two source weights.
+    #[cfg(feature = "training")]
+    #[test]
+    fn test_swa_averages_tnet_weights() {
+        use burn::backend::{Autodiff, NdArray};
+        use crate::training::burn_model::BurnPointNet;
+        use crate::training::bridge::save_model_from_burn;
+        use crate::model::weights::load_model;
+        use crate::preprocessing::N_FEATURES;
+        use crate::model::pointnet::PointNetConfig;
+
+        type B = Autodiff<NdArray>;
+        let device = Default::default();
+
+        let cfg = PointNetConfig {
+            n_features_in: N_FEATURES,
+            encoder_dims: vec![64, 128, 256],
+            decoder_dims: vec![256, 128],
+            n_classes: 8,
+            use_batch_norm: true,
+            use_input_tnet: true,   // ← T-Net enabled
+            use_feature_tnet: false,
+        };
+        let label_map: Vec<u8> = (0u8..8).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let p1  = dir.path().join("swa_m1.wbmodel");
+        let p2  = dir.path().join("swa_m2.wbmodel");
+        let out = dir.path().join("swa_out.wbmodel");
+
+        // Two randomly-initialised models will have different T-Net weights.
+        let m1 = BurnPointNet::<B>::new(&cfg, &device).unwrap();
+        let m2 = BurnPointNet::<B>::new(&cfg, &device).unwrap();
+        save_model_from_burn(&m1, &cfg, &label_map, &p1).unwrap();
+        save_model_from_burn(&m2, &cfg, &label_map, &p2).unwrap();
+
+        // Collect expected element-wise mean of T-Net enc0 weights before SWA.
+        let mm1 = load_model(&p1).unwrap();
+        let mm2 = load_model(&p2).unwrap();
+        let tnet1_w = mm1.input_tnet.as_ref().unwrap().enc0.weight.clone();
+        let tnet2_w = mm2.input_tnet.as_ref().unwrap().enc0.weight.clone();
+        let expected_avg = (&tnet1_w + &tnet2_w) / 2.0_f32;
+
+        // Build a minimal CheckpointManifest and call apply_swa.
+        let manifest = CheckpointManifest {
+            keep_best_n: 2,
+            checkpoints: vec![
+                CheckpointEntry { epoch: 1, val_miou: 0.7, file: "swa_m1.wbmodel".into() },
+                CheckpointEntry { epoch: 2, val_miou: 0.8, file: "swa_m2.wbmodel".into() },
+            ],
+        };
+        apply_swa(dir.path(), &manifest, &out).unwrap();
+
+        // Load the SWA output and verify T-Net enc0 weight is the mean.
+        let averaged = load_model(&out).unwrap();
+        let avg_tnet_w = &averaged.input_tnet.as_ref()
+            .expect("SWA output must have input_tnet")
+            .enc0.weight;
+
+        assert_eq!(avg_tnet_w.shape(), expected_avg.shape(),
+            "SWA T-Net weight shape mismatch");
+        // Check a representative element is within floating-point tolerance.
+        let diff = (avg_tnet_w - &expected_avg).mapv(f32::abs);
+        let max_err = diff.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max_err < 1e-5,
+            "SWA T-Net weight not correctly averaged; max element error = {max_err}");
+    }
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 }

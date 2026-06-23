@@ -3083,7 +3083,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
- "wbcore",
  "wblidar",
  "wbraster",
 ]
@@ -5448,15 +5447,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "wbcore"
-version = "0.1.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

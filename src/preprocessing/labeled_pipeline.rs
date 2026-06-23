@@ -1,13 +1,22 @@
+<<<<<<< HEAD
+#![allow(clippy::missing_errors_doc, clippy::doc_markdown,
+         clippy::cast_precision_loss, clippy::cast_possible_truncation,
+         clippy::cast_sign_loss, clippy::cast_lossless, clippy::cast_possible_wrap)]
+=======
 //! Labeled preprocessing pipeline — wraps Stage 01 `PreprocessingPipeline`
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 //! and emits per-block `.lbl` files alongside the existing `.feat` files.
 //!
 //! Each `.lbl` file is a raw `u8[n_points]` byte array where each byte is
 //! the remapped model class index for the corresponding sampled point.
 //!
 //! The `preprocess-labeled` CLI sub-command calls [`run_labeled_pipeline`].
+<<<<<<< HEAD
+=======
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_lossless, clippy::missing_errors_doc, clippy::doc_markdown)]
 
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -47,6 +56,13 @@ pub struct LabeledBlockManifest {
     pub target_points: usize,
     pub min_density: f64,
     pub search_radius: f64,
+<<<<<<< HEAD
+    /// Search radii used for multi-scale eigenvalue features.
+    /// Empty means single-scale using `search_radius`.
+    #[serde(default)]
+    pub search_radii: Vec<f64>,
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub min_neighbors: usize,
     pub crs_epsg: Option<u32>,
     /// ASPRS code (string key) → model class index mapping embedded for traceability.
@@ -221,6 +237,10 @@ pub fn run_labeled_pipeline(
         target_points: base_manifest.target_points,
         min_density: base_manifest.min_density,
         search_radius: base_manifest.search_radius,
+<<<<<<< HEAD
+        search_radii: base_manifest.search_radii.clone(),
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         min_neighbors: base_manifest.min_neighbors,
         crs_epsg: base_manifest.crs_epsg,
         label_map: label_map_str,
@@ -397,7 +417,11 @@ fn route_point(
     if col < 0 || row < 0 || col as u64 >= grid_cols || row as u64 >= grid_rows {
         return;
     }
+<<<<<<< HEAD
+    let block_id = crate::preprocessing::block_id(row, col, grid_cols as i64);
+=======
     let block_id = row as u64 * grid_cols + col as u64;
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     if let Some(vec) = result.get_mut(&block_id) {
         vec.push(pt.classification);
     }
@@ -466,6 +490,10 @@ mod tests {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
+<<<<<<< HEAD
+            search_radii: vec![],
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             min_neighbors: 8,
             crs_epsg: Some(32617),
             label_map: {

@@ -80,8 +80,17 @@ impl<B: Backend> Stn3d<B> {
         let h = apply_bn2d(h, &self.bn_enc2);
         let h = h.clamp_min(0.0);
 
+<<<<<<< HEAD
+        // Global max pool: [N, 1024] → [1, 1024] by taking max over dim 0.
+        // burn-ndarray 0.16 gather constraint: indices can only differ from the
+        // source tensor in the LAST dimension.  max_dim(0) on [N, 1024] violates
+        // this.  Workaround: transpose to [1024, N], max over last dim → [1024, 1],
+        // transpose back → [1, 1024].
+        let g = h.transpose().max_dim(1).transpose();   // [1, 1024]
+=======
         // Global max pool: [N, 1024] → [1024] by taking max over dim 0, then unsqueeze
         let g = h.max_dim(0);                           // [1, 1024]
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         let g = self.fc0.forward(g);
         let g = apply_bn2d(g, &self.bn_fc0);
@@ -154,7 +163,11 @@ impl<B: Backend> Stn64d<B> {
         let h = apply_bn2d(h, &self.bn_enc2);
         let h = h.clamp_min(0.0);
 
+<<<<<<< HEAD
+        let g = h.transpose().max_dim(1).transpose();   // [1, 1024]
+=======
         let g = h.max_dim(0);                           // [1, 1024]
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         let g = self.fc0.forward(g);
         let g = apply_bn2d(g, &self.bn_fc0);
@@ -230,7 +243,11 @@ impl<B: Backend> BurnPointNet<B> {
             stn3d: Stn3d::new(device),
             stn64d: if cfg.use_feature_tnet { Some(Stn64d::new(device)) } else { None },
 
+<<<<<<< HEAD
+            enc0: LinearConfig::new(cfg.n_features_in, ed[0]).init(device),
+=======
             enc0: LinearConfig::new(N_FEATURES, ed[0]).init(device),
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             bn_enc0: BatchNormConfig::new(ed[0]).init(device),
             enc1: LinearConfig::new(ed[0], ed[1]).init(device),
             bn_enc1: BatchNormConfig::new(ed[1]).init(device),
@@ -255,12 +272,21 @@ impl<B: Backend> BurnPointNet<B> {
         let n = input.dims()[0];
 
         // ── Input T-Net (STN3d) ────────────────────────────────────────────
+<<<<<<< HEAD
+        let xyz = input.clone().narrow(1, 0, 3);  // [N, 3] — always first 3 features
+=======
         let xyz = input.clone().narrow(1, 0, 3);  // [N, 3]
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         let t1 = self.stn3d.forward(xyz.clone()); // [3, 3]
         // Apply transform: xyz_new = xyz @ T1  → [N, 3]
         let xyz_new = xyz.matmul(t1);             // [N, 3]
         // Build transformed input: replace columns 0..3 with xyz_new
+<<<<<<< HEAD
+        let n_feat = input.dims()[1];             // runtime feature count
+        let rest = input.narrow(1, 3, n_feat - 3);   // [N, n_feat-3]
+=======
         let rest = input.narrow(1, 3, N_FEATURES - 3);    // [N, 9]
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         let input = Tensor::cat(vec![xyz_new, rest], 1);   // [N, 12]
 
         // ── Encoder Layer 0 (save as local_feat) ──────────────────────────
@@ -288,7 +314,15 @@ impl<B: Backend> BurnPointNet<B> {
         let h = h.clamp_min(0.0);
 
         // ── Global Max Pool ────────────────────────────────────────────────
+<<<<<<< HEAD
+        // burn-ndarray 0.16 gather constraint: indices can only differ from the
+        // source tensor in the LAST dimension.  max_dim(0) on [N, C] (C≠N) violates
+        // this.  Workaround: transpose to [C, N], max over last dim (N) → [C, 1],
+        // transpose back → [1, C], then broadcast to [N, C] with repeat_dim.
+        let global = h.transpose().max_dim(1).transpose().repeat_dim(0, n); // [N, 256]
+=======
         let global = h.max_dim(0).repeat_dim(0, n);        // [N, 256]
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         // ── Segmentation Concat ───────────────────────────────────────────
         let combined = Tensor::cat(vec![local_feat, global], 1); // [N, 320]
@@ -332,14 +366,25 @@ impl<B: Backend> BurnPointNet<B> {
 // Helper: convert features array to burn tensor
 // ─────────────────────────────────────────────────────────────────────────────
 
+<<<<<<< HEAD
+/// Convert a flat `Vec<f32>` with shape `[n_points, n_features]` into a
+=======
 /// Convert a flat `Vec<f32>` with shape `[n_points, N_FEATURES]` into a
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 /// burn `Tensor<B, 2>`.
 pub fn features_to_tensor<B: Backend>(
     flat: Vec<f32>,
     n_points: usize,
+<<<<<<< HEAD
+    n_features: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let td = TensorData::new(flat, vec![n_points, n_features]);
+=======
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let td = TensorData::new(flat, vec![n_points, N_FEATURES]);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     Tensor::from_floats(td, device)
 }
 
@@ -405,7 +450,11 @@ mod tests {
 
         let n = 32usize;
         let flat: Vec<f32> = (0..(n * N_FEATURES)).map(|i| (i % 100) as f32 / 100.0).collect();
+<<<<<<< HEAD
+        let input = features_to_tensor::<B>(flat, n, N_FEATURES, &device);
+=======
         let input = features_to_tensor::<B>(flat, n, &device);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         let out = model.forward(input);
         assert_eq!(out.dims(), [n, cfg.n_classes]);
@@ -422,7 +471,11 @@ mod tests {
 
         let n = 16usize;
         let flat: Vec<f32> = vec![0.5f32; n * N_FEATURES];
+<<<<<<< HEAD
+        let input = features_to_tensor::<B>(flat, n, N_FEATURES, &device);
+=======
         let input = features_to_tensor::<B>(flat, n, &device);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         let out = model.forward(input);
         assert_eq!(out.dims(), [n, cfg.n_classes]);

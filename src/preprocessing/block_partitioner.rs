@@ -1,4 +1,4 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_lossless, clippy::cast_precision_loss)]
+#![allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
 //! 2-D grid block partitioner with memory-pressure spill/merge support.
 //!
 //! Points arriving from any number of streaming chunks are routed into a
@@ -39,6 +39,56 @@ pub struct Block {
     pub points: Vec<PointRecord>,
 }
 
+/// Lightweight block descriptor returned by [`BlockPartitioner::finalize_stubs`].
+///
+/// Holds only metadata and on-disk spill-file paths — **no point data in RAM**.
+/// Call [`BlockStub::load`] inside a processing closure to retrieve the full
+/// point set on-demand and drop it as soon as processing is complete.
+///
+/// This is the production path for large files. Peak memory during parallel
+/// processing is bounded to `(Rayon thread count) × (largest single block size)`
+/// rather than the entire dataset.
+#[derive(Debug)]
+pub struct BlockStub {
+    pub col: i32,
+    pub row: i32,
+    pub id: u64,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// Total point count across all spill files (derived from file sizes,
+    /// not by reading data — this is cheap and used for density filtering).
+    pub point_count: usize,
+    spill_paths: Vec<PathBuf>,
+}
+
+impl BlockStub {
+    /// Read all spill files for this block into a [`Block`], deleting each
+    /// file immediately after reading.
+    ///
+    /// This is intended to be called once per block, inside a Rayon parallel
+    /// closure, so the loaded `Vec<PointRecord>` is dropped at the end of the
+    /// closure scope rather than accumulating across all blocks.
+    ///
+    /// # Errors
+    /// Returns [`ClassifierError::SpillCorrupt`] if any spill file is unreadable.
+    pub fn load(self) -> Result<Block> {
+        let mut points = Vec::with_capacity(self.point_count);
+        for path in &self.spill_paths {
+            let spilled = read_spill_file(path)?;
+            points.extend(spilled);
+            let _ = fs::remove_file(path);
+        }
+        Ok(Block {
+            col: self.col,
+            row: self.row,
+            id: self.id,
+            origin_x: self.origin_x,
+            origin_y: self.origin_y,
+            points,
+        })
+    }
+}
+
 /// Accumulates `PointRecord`s into 2-D grid cells with an optional spill path.
 pub struct BlockPartitioner {
     /// In-memory per-cell accumulators.
@@ -77,6 +127,21 @@ impl BlockPartitioner {
         block_size: f64,
         spill_dir: impl AsRef<Path>,
     ) -> Self {
+        // Warn about any stale `.spill` files left by a prior interrupted run.
+        // They are not cleaned up automatically (the user may want to inspect
+        // them), but making them visible prevents silent disk-space accumulation.
+        if let Ok(entries) = std::fs::read_dir(spill_dir.as_ref()) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|e| e == "spill") {
+                    eprintln!(
+                        "[warn] stale spill file found (prior interrupted run?): {}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // f64::ceil can only truncate to a valid i32 for any plausible LiDAR extent.
         let cols = ((x_max - x_min) / block_size).ceil() as i32;
         let cols = cols.max(1);
         Self {
@@ -98,7 +163,12 @@ impl BlockPartitioner {
     /// # Errors
     /// Returns an error if a spill file write fails.
     pub fn add_point(&mut self, pt: PointRecord) -> Result<()> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // floor() to i32: sign-loss is intentional — points outside the
+        // positive grid half-plane are assigned negative col/row and handled
+        // by downstream range checks.
         let col = ((pt.x - self.x_min) / self.block_size).floor() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = ((pt.y - self.y_min) / self.block_size).floor() as i32;
         let key = (col, row);
         self.cells.entry(key).or_default().push(pt);
@@ -147,7 +217,7 @@ impl BlockPartitioner {
                 points.extend(mem_pts);
             }
 
-            let id = row as u64 * self.grid_cols as u64 + col as u64;
+            let id = crate::preprocessing::block_id(row as i64, col as i64, self.grid_cols as i64);
             let origin_x = self.x_min + col as f64 * self.block_size;
             let origin_y = self.y_min + row as f64 * self.block_size;
 
@@ -204,7 +274,72 @@ impl BlockPartitioner {
 
 // ── Spill file I/O ────────────────────────────────────────────────────────────
 
-/// Write a slice of `PointRecord`s to a binary spill file.
+/// Count the number of points in a spill file from its size alone (no data read).
+fn spill_point_count(path: &Path) -> usize {
+    fs::metadata(path)
+        .map_or(0, |m| m.len() as usize / PT_BYTES)
+}
+
+/// Memory-safe finalization for large files.
+///
+/// Flushes **all** remaining in-memory cells to spill files first, so that no
+/// point data remains on the heap when this method returns.  Returns lightweight
+/// [`BlockStub`] descriptors (metadata + spill paths only).
+///
+/// The caller loads each block's data on-demand with [`BlockStub::load`], typically
+/// inside a Rayon parallel closure, so point data is dropped as soon as each block
+/// is processed.  Peak memory is bounded to:
+///
+/// ```text
+/// (Rayon thread count) × (largest single-block size × size_of::<PointRecord>())
+/// ```
+///
+/// rather than the entire dataset — critical for large files.
+///
+/// Use this in place of [`BlockPartitioner::finalize`] in all production pipelines.
+/// The original `finalize` is retained for unit tests that use small point sets.
+///
+/// # Errors
+/// Returns [`ClassifierError`] if any spill file write fails.
+impl BlockPartitioner {
+    /// Memory-safe finalization: flushes in-memory cells to disk, returns stubs.
+    ///
+    /// See module-level doc above for the full description.
+    ///
+    /// # Errors
+    /// Returns [`ClassifierError`] if any spill file write fails.
+    pub fn finalize_stubs(mut self) -> Result<Vec<BlockStub>> {
+        // Flush all remaining in-memory cells to spill files.
+        let remaining: Vec<(i32, i32)> = self.cells.keys().copied().collect();
+        for key in remaining {
+            if let Some(pts) = self.cells.remove(&key) {
+                if !pts.is_empty() {
+                    let path = self.spill_path_for(key);
+                    write_spill_file(&path, &pts)?;
+                    self.spill_paths.entry(key).or_default().push(path);
+                }
+            }
+        }
+        self.buffered_bytes = 0;
+
+        // Build stubs — only reads file sizes, no point data loaded.
+        let mut stubs = Vec::with_capacity(self.spill_paths.len());
+        for ((col, row), paths) in self.spill_paths.drain() {
+            let point_count: usize = paths.iter().map(|p| spill_point_count(p)).sum();
+            let id = crate::preprocessing::block_id(
+                row as i64, col as i64, self.grid_cols as i64,
+            );
+            let origin_x = self.x_min + col as f64 * self.block_size;
+            let origin_y = self.y_min + row as f64 * self.block_size;
+            stubs.push(BlockStub {
+                col, row, id, origin_x, origin_y, point_count,
+                spill_paths: paths,
+            });
+        }
+        Ok(stubs)
+    }
+}
+
 ///
 /// Format: per-point little-endian fields — x(f64) y(f64) z(f64)
 /// `intensity`(u16) `classification`(u8) `return_number`(u8)

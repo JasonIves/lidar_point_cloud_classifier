@@ -1,3 +1,4 @@
+#![allow(clippy::cast_lossless)]
 //! Streaming classified LAS/LAZ writer.
 //!
 //! Streams the original `LiDAR` source file point-by-point, looks up the inferred
@@ -91,10 +92,10 @@ pub fn write_classified<S: BuildHasher>(
     let mut points_written: u64 = 0;
 
     while reader.read_point(&mut pt).map_err(ClassifierError::Lidar)? {
-        // Assign point to block using same formula as BlockPartitioner
+        // Assign point to block using the canonical block_id() formula.
         let col = ((pt.x - x_min) / block_size).floor() as i64;
         let row = ((pt.y - y_min) / block_size).floor() as i64;
-        let block_id = (row * grid_cols + col) as u64;
+        let block_id = crate::preprocessing::block_id(row, col, grid_cols);
 
         if let Some(result) = inference_map.get(&block_id) {
             pt.classification = result.nearest_label(pt.x, pt.y);
@@ -194,9 +195,15 @@ fn open_writer(
                 .map_err(ClassifierError::Lidar)?;
             Ok(Box::new(w))
         }
-        _ => Err(ClassifierError::Pipeline(
-            "output format must be .las or .laz".into(),
-        )),
+        _ => {
+            // COPC write is not supported — the wblidar public API does not
+            // expose a COPC writer.  This is a known deviation from
+            // PROJECT_SPEC.md §"Default to input format", documented in
+            // stage-02-modeling-layer.md §"Known constraints".
+            Err(ClassifierError::Pipeline(
+                "output format must be .las or .laz (COPC write not supported by wblidar)".into(),
+            ))
+        }
     }
 }
 
@@ -229,6 +236,14 @@ mod tests {
             grid_rows: 1,
             grid_x_min: origin_x,
             grid_y_min: origin_y,
+<<<<<<< HEAD
+            search_radii: vec![],
+            outlier_removal: false,
+            outlier_radius: 2.0,
+            outlier_elev_diff: 50.0,
+            outlier_use_median: false,
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             blocks: vec![BlockMeta {
                 id: 0,
                 file: "block_00000.feat".into(),

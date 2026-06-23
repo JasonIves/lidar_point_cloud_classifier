@@ -1,4 +1,4 @@
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 //! Coordinate normalisation and density-gated point sampling.
 //!
 //! **Sampling contract (from spec):**
@@ -94,22 +94,31 @@ pub fn normalise_scalar_features(
     pts.iter()
         .zip(hag_values.iter())
         .map(|(pt, &hag_raw)| {
+            #[allow(clippy::cast_precision_loss)]
+            // f64→f32 precision loss is acceptable: all values are clamped to [0,1].
             let x_norm = ((pt.x - origin_x) / block_size).clamp(0.0, 1.0) as f32;
+            #[allow(clippy::cast_precision_loss)]
             let y_norm = ((pt.y - origin_y) / block_size).clamp(0.0, 1.0) as f32;
+            #[allow(clippy::cast_precision_loss)]
             let z_norm = ((pt.z - z_min) / z_range).clamp(0.0, 1.0) as f32;
 
+            #[allow(clippy::cast_precision_loss)]
             let intensity_norm = (f64::from(pt.intensity) / 65535.0).clamp(0.0, 1.0) as f32;
 
             let return_ratio = if pt.number_of_returns == 0 {
                 0.0_f32
             } else {
-                (f64::from(pt.return_number) / f64::from(pt.number_of_returns))
-                    .clamp(0.0, 1.0) as f32
+                #[allow(clippy::cast_precision_loss)]
+                let v = (f64::from(pt.return_number) / f64::from(pt.number_of_returns))
+                    .clamp(0.0, 1.0) as f32;
+                v
             };
 
+            #[allow(clippy::cast_precision_loss)]
             let scan_angle_norm =
                 (f64::from(pt.scan_angle).abs() / 90.0).clamp(0.0, 1.0) as f32;
 
+            #[allow(clippy::cast_precision_loss)]
             let hag = (hag_raw / h_max).clamp(0.0, 1.0) as f32;
 
             [x_norm, y_norm, z_norm, intensity_norm, return_ratio, scan_angle_norm, hag]
@@ -169,7 +178,10 @@ impl DtmView {
             nodata: r.nodata,
             x_min: r.x_min,
             // `wbraster::Raster` stores y_min (south edge); top = y_min + rows * cell_size_y
-            y_max: r.y_min + r.rows as f64 * r.cell_size_y,
+            // `as f64` cast for raster geometry is lossless for any realistic
+        // row count (usize fits in f64 without precision loss up to 2^53).
+        #[allow(clippy::cast_precision_loss)]
+        y_max: r.y_min + r.rows as f64 * r.cell_size_y,
             cell_size_x: r.cell_size_x,
             cell_size_y: r.cell_size_y,
         }
@@ -185,12 +197,19 @@ impl DtmView {
         let col_f = (x - self.x_min) / self.cell_size_x;
         let row_f = (self.y_max - y) / self.cell_size_y;
 
+        // isize casts: col_f.floor() returns a finite value; the raster is
+        // bounded to realistic extents so truncation to isize is safe.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let col0 = col_f.floor() as isize;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let row0 = row_f.floor() as isize;
         let col1 = col0 + 1;
         let row1 = row0 + 1;
 
+        // `as f64` casts for integer raster indices are lossless.
+        #[allow(clippy::cast_precision_loss)]
         let tx = col_f - col0 as f64;
+        #[allow(clippy::cast_precision_loss)]
         let ty = row_f - row0 as f64;
 
         let v00 = self.get(row0, col0)?;
@@ -211,6 +230,8 @@ impl DtmView {
         if row < 0 || col < 0 || row >= self.rows as isize || col >= self.cols as isize {
             return None;
         }
+        // isize-checked bounds: both indices are verified positive above.
+        #[allow(clippy::cast_sign_loss)]
         let v = self.data[row as usize * self.cols + col as usize];
         if self.is_nodata(v) { None } else { Some(v) }
     }
@@ -232,8 +253,11 @@ fn percentile_99(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
+    // `as usize` is safe: idx is derived from sorted.len()-1 * 0.99, so it
+    // is always < sorted.len() and non-negative.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = ((sorted.len() - 1) as f64 * 0.99) as usize;
-    sorted.select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
     sorted[idx]
 }
 

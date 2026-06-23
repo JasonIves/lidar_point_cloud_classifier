@@ -43,6 +43,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     let mut cfg = PreprocessConfig::default();
     let mut i = 0_usize;
@@ -67,6 +68,15 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             "--search-radius" => {
                 cfg.search_radius = parse_f64(next_value(args, &mut i, "--search-radius")?, "--search-radius")?;
             }
+            "--search-radii" => {
+                let s = next_value(args, &mut i, "--search-radii")?;
+                cfg.search_radii = s.split(',')
+                    .map(|v| {
+                        let v = v.trim();
+                        parse_f64(v, "--search-radii")
+                    })
+                    .collect::<Result<Vec<f64>>>()?;
+            }
             "--min-neighbors" => {
                 cfg.min_neighbors = parse_usize(next_value(args, &mut i, "--min-neighbors")?, "--min-neighbors")?;
             }
@@ -78,6 +88,22 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             }
             "--debug-csv" => {
                 cfg.debug_csv = true;
+            }
+            "--outlier-removal" => {
+                cfg.outlier_removal = true;
+            }
+            "--outlier-radius" => {
+                cfg.outlier_radius =
+                    parse_f64(next_value(args, &mut i, "--outlier-radius")?, "--outlier-radius")?;
+            }
+            "--outlier-elev-diff" => {
+                cfg.outlier_elev_diff = parse_f64(
+                    next_value(args, &mut i, "--outlier-elev-diff")?,
+                    "--outlier-elev-diff",
+                )?;
+            }
+            "--outlier-use-median" => {
+                cfg.outlier_use_median = true;
             }
             unknown => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -97,6 +123,51 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     if cfg.output_dir.as_os_str().is_empty() {
         return Err(ClassifierError::Pipeline(
             "--output is required".to_string(),
+        ));
+    }
+
+    // Range validation: catch pathological values before they cause silent
+    // misbehaviour or confusing panics deep in the pipeline.
+    if cfg.block_size <= 0.0 || !cfg.block_size.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--block-size must be a positive finite number".to_string(),
+        ));
+    }
+    if cfg.target_points == 0 {
+        return Err(ClassifierError::Pipeline(
+            "--target-points must be >= 1".to_string(),
+        ));
+    }
+    if cfg.min_density < 0.0 || !cfg.min_density.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--min-density must be >= 0.0 and finite".to_string(),
+        ));
+    }
+    if cfg.search_radius <= 0.0 || !cfg.search_radius.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--search-radius must be a positive finite number".to_string(),
+        ));
+    }
+    for &r in &cfg.search_radii {
+        if r <= 0.0 || !r.is_finite() {
+            return Err(ClassifierError::Pipeline(
+                "--search-radii: all values must be positive finite numbers".to_string(),
+            ));
+        }
+    }
+    if cfg.min_neighbors == 0 {
+        return Err(ClassifierError::Pipeline(
+            "--min-neighbors must be >= 1".to_string(),
+        ));
+    }
+    if cfg.outlier_radius <= 0.0 || !cfg.outlier_radius.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--outlier-radius must be a positive finite number".to_string(),
+        ));
+    }
+    if cfg.outlier_elev_diff < 0.0 || !cfg.outlier_elev_diff.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--outlier-elev-diff must be a non-negative finite number".to_string(),
         ));
     }
 
@@ -134,10 +205,17 @@ fn print_help() {
            --block-size    <f64>   2-D cell edge length in projection units (default: 50.0)\n\
            --target-points <uint>  Points per block after sampling (default: 1024)\n\
            --min-density   <f64>   Minimum pts/m² to retain a block (default: 1.0)\n\
-           --search-radius <f64>   Base neighbourhood radius for eigenvalue features (default: 1.0)\n\
+           --search-radius <f64>   Base neighbourhood radius for eigenvalue features (default: 1.0)
+           --search-radii  <f64,.> Comma-separated radii for multi-scale features; overrides --search-radius\n\
            --min-neighbors <uint>  Minimum neighbours; radius expands adaptively (default: 8)\n\
            --hag-model     <path>  DTM raster for Height Above Ground (default: block-min-z proxy)\n\
            --threads       <uint>  Rayon thread pool size (default: system cores)\n\
-           --debug-csv             Also emit per-block .csv files alongside .feat files\n"
+           --debug-csv             Also emit per-block .csv files alongside .feat files\n\
+         \n\
+         OUTLIER REMOVAL (disabled by default):\n\
+           --outlier-removal           Enable lidar_remove_outliers pre-pass (whole-file)\n\
+           --outlier-radius  <f64>     Neighbourhood radius for residual calculation (default: 2.0)\n\
+           --outlier-elev-diff <f64>   Residual threshold; points exceeding this are removed (default: 50.0)\n\
+           --outlier-use-median        Use neighbourhood median instead of mean\n"
     );
 }

@@ -1,8 +1,19 @@
 //! Labeled block dataset — loads `.feat` + `.lbl` pairs and manages the
 //! spatially-disjoint train/val split.
 //!
+<<<<<<< HEAD
+//! Supports **multiple input directories** (one per preprocessed LiDAR file).
+//! Block IDs within a single directory are `row * grid_cols + col` and can
+//! collide across directories.  The dataset encodes a per-directory index into
+//! the high 32 bits of each `GlobalBlockId` to guarantee global uniqueness
+//! without changing any on-disk format.  `trainer.rs` consumes `Vec<u64>` and
+//! calls `load_block(id)` unchanged; the composite key is transparent to it.
+//!
+//! See `docs/stages/stage-05-multi-directory-dataset.md` for full design rationale.
+=======
 //! The dataset does **not** own burn tensors.  It returns `(Array2<f32>, Vec<u8>)`
 //! tuples; callers convert to burn tensors for the GPU/CPU backend.
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_lossless, clippy::must_use_candidate, clippy::missing_errors_doc, clippy::doc_markdown)]
 
@@ -15,10 +26,36 @@ use ndarray::Array2;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
+<<<<<<< HEAD
+use crate::preprocessing::{FEAT_MAGIC, FEAT_VERSION, N_FEATURES, n_features_for_radii, N_SCALAR_FEATURES, N_EIGEN_FEATURES_PER_RADIUS};
+
+// ─────────────────────────────────────────────────────────────────────────────// Composite block ID
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// Encode `(dir_index, local_block_id)` into a single `u64`.
+///
+/// Layout: `high 32 bits = dir_index`, `low 32 bits = local_block_id`.
+/// The local ID field supports up to ~4 billion local block IDs per directory;
+/// for a 50 m block size over a 200 km × 200 km area the grid has ~16 M cells,
+/// well within that limit.
+#[inline]
+fn make_global_id(dir_idx: usize, local_id: u64) -> u64 {
+    ((dir_idx as u64) << 32) | (local_id & 0xFFFF_FFFF)
+}
+
+/// Decode a `GlobalBlockId` back into `(dir_index, local_block_id)`.
+#[inline]
+fn decode_global_id(gid: u64) -> (usize, u64) {
+    ((gid >> 32) as usize, gid & 0xFFFF_FFFF)
+}
+
+// ───────────────────────────────────────────────────────────────────────────────// Types
+=======
 use crate::preprocessing::{FEAT_MAGIC, FEAT_VERSION, N_FEATURES};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A loaded block: feature matrix + label vector.
@@ -30,15 +67,52 @@ pub struct LoadedBlock {
     pub block_id: u64,
 }
 
+<<<<<<< HEAD
+/// One preprocessed-LiDAR-file directory: path + parsed manifest.
+struct DirEntry {
+    path: PathBuf,
+    manifest: LabeledBlockManifest,
+}
+
+/// Manages the `.feat` / `.lbl` dataset across one or more preprocessing
+/// directories and provides a spatially-disjoint train/val split.
+///
+/// Block IDs returned in `train_ids` and `val_ids` are **composite
+/// `GlobalBlockId`** values (`dir_index << 32 | local_block_id`).  Pass them
+/// directly to [`load_block`]; do not interpret the raw bits externally.
+pub struct LabeledBlockDataset {
+    dirs: Vec<DirEntry>,
+    /// Validated common class count across all directories.
+    n_classes_inner: usize,
+    /// Feature count derived from manifest `search_radii`.
+    /// 12 for single-radius (backward-compatible), 7+5×N for N radii.
+    n_features_inner: usize,
+=======
 /// Manages the `.feat` / `.lbl` dataset and provides train/val split.
 pub struct LabeledBlockDataset {
     data_dir: PathBuf,
     manifest: LabeledBlockManifest,
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub train_ids: Vec<u64>,
     pub val_ids:   Vec<u64>,
 }
 
 impl LabeledBlockDataset {
+<<<<<<< HEAD
+    /// Load from one or more `preprocess-labeled` output directories.
+    ///
+    /// Each directory must contain a `labeled_blocks.json` manifest.  All
+    /// directories must have been preprocessed with the same label map
+    /// (same `n_classes`); a mismatch is a hard error.
+    ///
+    /// For a single directory this is identical to the previous single-dir API.
+    ///
+    /// # Errors
+    /// Returns an error if any manifest cannot be read, parsed, or if the
+    /// `n_classes` values are inconsistent across directories.
+    pub fn load(
+        data_dirs: &[PathBuf],
+=======
     /// Load from a `labeled_blocks.json` manifest.
     ///
     /// The train/val split is determined by `macro_tile_id`:
@@ -50,10 +124,177 @@ impl LabeledBlockDataset {
     /// Returns an error if the manifest cannot be read or parsed.
     pub fn load(
         data_dir: &Path,
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         val_split: f64,
         val_tile_block_ids: Option<&HashSet<u64>>,
         seed: u64,
     ) -> Result<Self> {
+<<<<<<< HEAD
+        if data_dirs.is_empty() {
+            return Err(ClassifierError::Pipeline(
+                "at least one --data-dir is required".into(),
+            ));
+        }
+
+        // Load all manifests and validate class consistency.
+        let mut dirs = Vec::with_capacity(data_dirs.len());
+        let mut validated_n_classes: Option<usize> = None;
+
+        for (idx, dir) in data_dirs.iter().enumerate() {
+            let manifest_path = dir.join("labeled_blocks.json");
+            let f = File::open(&manifest_path).map_err(|e| {
+                ClassifierError::Pipeline(format!(
+                    "cannot open {}: {e}",
+                    manifest_path.display()
+                ))
+            })?;
+            let manifest: LabeledBlockManifest =
+                serde_json::from_reader(BufReader::new(f)).map_err(|e| {
+                    ClassifierError::Pipeline(format!(
+                        "labeled_blocks.json parse error in {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+
+            let nc = manifest
+                .label_map
+                .values()
+                .copied()
+                .max()
+                .map_or(8, |m| m as usize + 1);
+
+            match validated_n_classes {
+                None => validated_n_classes = Some(nc),
+                Some(expected) if expected != nc => {
+                    return Err(ClassifierError::Pipeline(format!(
+                        "n_classes mismatch: directory 0 has {expected} classes \
+                         but directory {idx} ('{}') has {nc} classes. \
+                         Re-preprocess all directories with the same --label-map.",
+                        dir.display()
+                    )));
+                }
+                _ => {}
+            }
+
+            dirs.push(DirEntry { path: dir.clone(), manifest });
+        }
+
+        let n_classes_inner = validated_n_classes.unwrap_or(8);
+
+        // Derive n_features from the first manifest's search_radii.
+        // Empty search_radii = single-scale = N_FEATURES (12) for backward compat.
+        let n_features_inner = {
+            let radii = &dirs[0].manifest.search_radii;
+            if radii.is_empty() {
+                N_FEATURES
+            } else {
+                n_features_for_radii(radii.len())
+            }
+        };
+
+        // Validate that all directories agree on n_features_inner.
+        for (idx, entry) in dirs.iter().enumerate().skip(1) {
+            let nf = if entry.manifest.search_radii.is_empty() {
+                N_FEATURES
+            } else {
+                n_features_for_radii(entry.manifest.search_radii.len())
+            };
+            if nf != n_features_inner {
+                return Err(ClassifierError::Pipeline(format!(
+                    "n_features mismatch: directory 0 has {n_features_inner} features \
+                     but directory {idx} ('{}') has {nf} features. \
+                     Re-preprocess all directories with the same --search-radii.",
+                    entry.path.display()
+                )));
+            }
+        }
+
+        // Build train/val split.  If an explicit override is supplied, apply it
+        // to all directories; warn if multiple dirs are in use since the raw
+        // block IDs are ambiguous without the dir prefix.
+        let (train_ids, val_ids) = if let Some(explicit) = val_tile_block_ids {
+            if dirs.len() > 1 {
+                eprintln!(
+                    "[dataset] warning: --val-tile-blocks with multiple --data-dir \
+                     entries matches local block IDs against all directories. \
+                     Consider per-run val splits instead."
+                );
+            }
+            // Match explicit IDs against local block IDs in each directory.
+            let mut train = Vec::new();
+            let mut val   = Vec::new();
+            for (dir_idx, entry) in dirs.iter().enumerate() {
+                for b in &entry.manifest.blocks {
+                    let gid = make_global_id(dir_idx, b.meta.id);
+                    if explicit.contains(&b.meta.id) {
+                        val.push(gid);
+                    } else {
+                        train.push(gid);
+                    }
+                }
+            }
+            (train, val)
+        } else {
+            // Independent spatial split per directory; results are concatenated.
+            let mut train = Vec::new();
+            let mut val   = Vec::new();
+            for (dir_idx, entry) in dirs.iter().enumerate() {
+                let (local_train, local_val) =
+                    spatial_split(&entry.manifest, val_split, seed);
+                for id in local_train {
+                    train.push(make_global_id(dir_idx, id));
+                }
+                for id in local_val {
+                    val.push(make_global_id(dir_idx, id));
+                }
+            }
+            (train, val)
+        };
+
+        if dirs.len() == 1 {
+            eprintln!(
+                "[dataset] train blocks: {}, val blocks: {}",
+                train_ids.len(), val_ids.len()
+            );
+        } else {
+            eprintln!(
+                "[dataset] {} directories — train blocks: {}, val blocks: {}",
+                dirs.len(), train_ids.len(), val_ids.len()
+            );
+        }
+
+        Ok(Self { dirs, n_classes_inner, n_features_inner, train_ids, val_ids })
+    }
+
+    /// Return the validated common class count across all loaded directories.
+    pub fn n_classes(&self) -> usize {
+        self.n_classes_inner
+    }
+
+    /// Return the feature count per point (7 + 5 × n_radii).
+    pub fn n_features(&self) -> usize {
+        self.n_features_inner
+    }
+
+    /// Compute per-class point counts from the **training** blocks only.
+    /// Returns a `Vec<u64>` of length `n_classes()`.
+    pub fn class_counts_train(&self) -> Vec<u64> {
+        let n = self.n_classes_inner;
+        let train_set: HashSet<u64> = self.train_ids.iter().copied().collect();
+        let mut counts = vec![0u64; n];
+        for (dir_idx, entry) in self.dirs.iter().enumerate() {
+            for b in &entry.manifest.blocks {
+                let gid = make_global_id(dir_idx, b.meta.id);
+                if !train_set.contains(&gid) {
+                    continue;
+                }
+                for (k, &v) in &b.class_distribution {
+                    if let Ok(idx) = k.parse::<usize>() {
+                        if idx < n {
+                            counts[idx] += v;
+                        }
+                    }
+=======
         let manifest_path = data_dir.join("labeled_blocks.json");
         let f = File::open(&manifest_path).map_err(|e| {
             ClassifierError::Pipeline(format!("cannot open labeled_blocks.json: {e}"))
@@ -109,6 +350,7 @@ impl LabeledBlockDataset {
             for (k, &v) in &b.class_distribution {
                 if let Ok(idx) = k.parse::<usize>() {
                     if idx < n { counts[idx] += v; }
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 }
             }
         }
@@ -117,6 +359,41 @@ impl LabeledBlockDataset {
 
     /// Load a single block (features + labels) from disk.
     ///
+<<<<<<< HEAD
+    /// `block_id` must be a `GlobalBlockId` as returned by `train_ids` or
+    /// `val_ids` — do not pass raw local block IDs here.
+    ///
+    /// # Errors
+    /// Returns an error if the `.feat` or `.lbl` file cannot be read, or if
+    /// the composite ID refers to an out-of-range directory.
+    pub fn load_block(&self, block_id: u64) -> Result<LoadedBlock> {
+        let (dir_idx, local_id) = decode_global_id(block_id);
+
+        let entry = self.dirs.get(dir_idx).ok_or_else(|| {
+            ClassifierError::Pipeline(format!(
+                "load_block: directory index {dir_idx} out of range \
+                 (only {} directories loaded)",
+                self.dirs.len()
+            ))
+        })?;
+
+        let bm = entry
+            .manifest
+            .blocks
+            .iter()
+            .find(|b| b.meta.id == local_id)
+            .ok_or_else(|| {
+                ClassifierError::Pipeline(format!(
+                    "block {local_id} not found in manifest for '{}'",
+                    entry.path.display()
+                ))
+            })?;
+
+        let feat_path = entry.path.join(&bm.meta.file);
+        let features = load_feat_file(&feat_path)?;
+
+        let lbl_path = entry.path.join(&bm.lbl_file);
+=======
     /// # Errors
     /// Returns an error if the `.feat` or `.lbl` file cannot be read.
     pub fn load_block(&self, block_id: u64) -> Result<LoadedBlock> {
@@ -134,6 +411,7 @@ impl LabeledBlockDataset {
 
         // Load .lbl file.
         let lbl_path = self.data_dir.join(&bm.lbl_file);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         let n_points = features.nrows();
         let labels = load_lbl_file(&lbl_path, n_points)?;
 
@@ -224,9 +502,16 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
             "feat: unsupported version {version}"
         )));
     }
+<<<<<<< HEAD
+    // Accept any positive n_features (multi-scale or legacy 12).
+    if n_features == 0 || !matches!(n_features, f if (f - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS == 0) {
+        return Err(ClassifierError::Pipeline(format!(
+            "feat: n_features={n_features} is not a valid value (expected 7 + 5×N)"
+=======
     if n_features != N_FEATURES {
         return Err(ClassifierError::Pipeline(format!(
             "feat: expected {N_FEATURES} features, got {n_features}"
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         )));
     }
 
@@ -264,6 +549,28 @@ mod tests {
     use super::*;
 
     #[test]
+<<<<<<< HEAD
+    fn test_global_id_round_trip() {
+        // Encoding and decoding must be lossless for representative inputs.
+        for (dir, local) in [(0usize, 0u64), (1, 42), (3, 65535), (255, 4_000_000)] {
+            let gid = make_global_id(dir, local);
+            let (d2, l2) = decode_global_id(gid);
+            assert_eq!(d2, dir, "dir mismatch for ({dir}, {local})");
+            assert_eq!(l2, local, "local mismatch for ({dir}, {local})");
+        }
+    }
+
+    #[test]
+    fn test_global_ids_are_distinct_across_dirs() {
+        // Same local ID in two directories must produce different global IDs.
+        let gid0 = make_global_id(0, 42);
+        let gid1 = make_global_id(1, 42);
+        assert_ne!(gid0, gid1);
+    }
+
+    #[test]
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     fn test_explicit_val_tile_override() {
         // If we supply explicit val block IDs, those blocks must be in val set
         // regardless of macro_tile_id.
@@ -337,6 +644,10 @@ mod tests {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
+<<<<<<< HEAD
+            search_radii: vec![],
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             min_neighbors: 8,
             crs_epsg: None,
             label_map: HM::new(),

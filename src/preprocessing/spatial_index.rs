@@ -25,8 +25,17 @@ impl BlockSpatialIndex {
         let mut tree: KdTree<f64, usize, [f64; 3]> = KdTree::with_capacity(3, pts.len());
         for (i, pt) in pts.iter().enumerate() {
             // `add` only errors when the point dimension doesn't match the tree
-            // dimension, which can never happen here.
-            let _ = tree.add([pt.x, pt.y, pt.z], i);
+            // dimension, which can never happen here (fixed [f64; 3] key type).
+            // However, NaN coordinates could theoretically cause a rejection, so
+            // we log a warning instead of silently discarding — this surfaces
+            // bad input during integration testing without panicking.
+            if let Err(e) = tree.add([pt.x, pt.y, pt.z], i) {
+                eprintln!(
+                    "[warn] spatial_index: skipped point {i} \
+                     (x={:.3}, y={:.3}, z={:.3}): {e}",
+                    pt.x, pt.y, pt.z
+                );
+            }
         }
         Self { tree }
     }

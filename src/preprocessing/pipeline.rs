@@ -27,11 +27,11 @@ use wblidar::PointRecord;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::{
-    block_partitioner::BlockPartitioner,
+    block_partitioner::{BlockPartitioner, BlockStub},
     feature_extractor::extract_features,
     normalizer::{resample_block, DtmView},
     spatial_index::BlockSpatialIndex,
-    PreprocessConfig, FEAT_MAGIC, FEAT_VERSION, N_FEATURES, RAYON_MIN_CHUNK,
+    PreprocessConfig, FEAT_MAGIC, FEAT_VERSION, RAYON_MIN_CHUNK,
 };
 
 /// Manifest emitted as `blocks.json` after a successful pipeline run.
@@ -58,8 +58,35 @@ pub struct BlockManifest {
     pub grid_x_min: f64,
     /// Header-derived south-west Y origin — the same value passed to `BlockPartitioner`.
     #[serde(default)]
+<<<<<<< HEAD
+    pub grid_y_min: f64,    /// Search radii used for multi-scale eigenvalue feature extraction.
+    /// Empty list means single-scale using `search_radius`.
+    #[serde(default)]
+    pub search_radii: Vec<f64>,    /// Whether the outlier removal pre-pass was applied before block partitioning.
+    #[serde(default)]
+    pub outlier_removal: bool,
+    /// Neighbourhood radius used for outlier elevation residual calculation.
+    #[serde(default = "default_outlier_radius")]
+    pub outlier_radius: f64,
+    /// Absolute elevation residual threshold used during outlier removal.
+    #[serde(default = "default_outlier_elev_diff")]
+    pub outlier_elev_diff: f64,
+    /// Whether median (true) or mean (false) was used for the neighbourhood baseline.
+    #[serde(default)]
+    pub outlier_use_median: bool,
+=======
     pub grid_y_min: f64,
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub blocks: Vec<BlockMeta>,
+}
+
+// Serde default helpers for outlier fields — used when deserialising older
+// `blocks.json` files that pre-date Stage 04.
+fn default_outlier_radius() -> f64 {
+    2.0
+}
+fn default_outlier_elev_diff() -> f64 {
+    50.0
 }
 
 /// Per-block metadata entry in `blocks.json`.
@@ -132,8 +159,40 @@ impl PreprocessingPipeline {
         // ── 1. Ensure output directory exists ─────────────────────────────
         fs::create_dir_all(&config.output_dir)?;
 
-        // ── 2. Open the LiDAR file and inspect the header ─────────────────
+        // ── 1b. Optional outlier removal pre-pass ─────────────────────────────────
+        // When enabled, all points are loaded into memory, filtered with the local
+        // elevation residual algorithm (outlier_filter::apply), and fed to the
+        // partitioner directly — no temp file needed.
+        //
+        // Header inspection always uses `config.input` (the original file) because
+        // the bounding box and CRS are unchanged by outlier filtering.
+        //
+        // NOTE (2026-06-17): This previously called `LidarRemoveOutliersTool` via
+        // wbtools_oss and wrote a temp .las file.  That crate was removed for build
+        // speed; see src/preprocessing/outlier_filter.rs for the revert path.
         let input_path = &config.input;
+        let outlier_filtered_pts: Option<Vec<PointRecord>> = if config.outlier_removal {
+            eprintln!(
+                "[preprocessing] outlier removal: radius={:.2}, elev_diff={:.2}, use_median={}",
+                config.outlier_radius, config.outlier_elev_diff, config.outlier_use_median
+            );
+            let raw = load_all_points(input_path)?;
+            let filtered = crate::preprocessing::outlier_filter::apply(
+                &raw,
+                config.outlier_radius,
+                config.outlier_elev_diff,
+                config.outlier_use_median,
+            );
+            eprintln!(
+                "[preprocessing] outlier removal: {} → {} points ({} removed)",
+                raw.len(), filtered.len(), raw.len().saturating_sub(filtered.len())
+            );
+            Some(filtered)
+        } else {
+            None
+        };
+
+        // ── 2. Open the LiDAR file and inspect the header ───────────────────────────
         let (x_min, y_min, x_max, y_max, total_points, crs_epsg) =
             inspect_lidar_header(input_path)?;
 
@@ -156,7 +215,9 @@ impl PreprocessingPipeline {
         eprintln!("[preprocessing] grid: {grid_cols} cols × {grid_rows} rows");
         eprintln!("[preprocessing] points: {total_points}");
 
-        // ── 3. Stream all points into the block partitioner ───────────────
+        // ── 3. Stream / feed points into the block partitioner ───────────────────
+        // If outlier removal produced a filtered Vec, feed it directly.
+        // Otherwise stream from the original file (no allocation).
         let mut partitioner = BlockPartitioner::new(
             x_min,
             y_min,
@@ -165,19 +226,30 @@ impl PreprocessingPipeline {
             config.block_size,
             &config.output_dir,
         );
-        stream_points(input_path, &mut partitioner)?;
+        if let Some(ref filtered) = outlier_filtered_pts {
+            for pt in filtered {
+                partitioner.add_point(*pt)?;
+            }
+        } else {
+            stream_points(input_path, &mut partitioner)?;
+        }
 
-        // ── 4. Finalise — merges spill files, returns complete blocks ──────
-        let raw_blocks = partitioner.finalize()?;
-        eprintln!("[preprocessing] raw blocks: {}", raw_blocks.len());
+        // ── 4. Finalise — flush in-memory cells to disk, return lightweight stubs ───
+        // `finalize_stubs()` clears the heap before returning: all block data is
+        // on disk as spill files.  Point data is loaded per-block on-demand in
+        // the parallel Step 7 closure and dropped immediately after, bounding
+        // peak memory to (thread_count × largest_block_size) rather than the
+        // entire dataset.
+        let stubs = partitioner.finalize_stubs()?;
+        eprintln!("[preprocessing] raw blocks: {}", stubs.len());
 
-        // ── 5. Density gate ───────────────────────────────────────────────
+        // ── 5. Density gate (on stub point counts — no data load needed) ──────
         let cell_area = config.block_size * config.block_size;
-        let retained: Vec<_> = raw_blocks
+        let retained: Vec<BlockStub> = stubs
             .into_iter()
-            .filter(|b| {
+            .filter(|s| {
                 #[allow(clippy::cast_precision_loss)]
-                let density = b.points.len() as f64 / cell_area;
+                let density = s.point_count as f64 / cell_area;
                 density >= config.min_density
             })
             .collect();
@@ -207,55 +279,76 @@ impl PreprocessingPipeline {
         let block_results: Vec<Result<BlockProcessResult>> = retained
             .into_par_iter()
             .with_min_len(RAYON_MIN_CHUNK)
-            .map(|block| {
+            .map(|stub| {
                 let dtm_ref = dtm.as_deref();
+
+                // Capture metadata before consuming the stub.
+                let raw_count = stub.point_count;
+                let block_id  = stub.id;
+                let origin_x  = stub.origin_x;
+                let origin_y  = stub.origin_y;
+
+                // Load point data from spill files for this block only.
+                // `block.points` is dropped at the end of this closure so
+                // peak memory stays at (thread_count × largest_block_size).
+                let block = stub.load()?;
 
                 // (a) Build k-d tree from full unsampled block
                 let index = BlockSpatialIndex::build(&block.points);
 
                 // (b) Density-gated sampling — now returns indices too
                 let (sampled, sampled_indices, oversampled) =
+<<<<<<< HEAD
+                    resample_block(&block.points, config.target_points, block_id);
+=======
                     resample_block(&block.points, config.target_points, block.id);
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
-                let raw_count = block.points.len();
                 let sampled_count = sampled.len();
 
-                // (c–e) Extract all 12 features
+                // (c–e) Extract all features (multi-scale or single-scale)
+                let search_radii = config.search_radii_effective();
                 let features = extract_features(
                     &sampled,
                     &block.points,
                     &index,
                     dtm_ref,
-                    block.origin_x,
-                    block.origin_y,
+                    origin_x,
+                    origin_y,
                     config.block_size,
-                    config.search_radius,
+                    &search_radii,
                     config.min_neighbors,
                 );
+                let n_features = features.first().map_or(0, Vec::len);
 
                 // (f) Serialise to .feat
-                let feat_filename = format!("block_{:05}.feat", block.id);
+                let feat_filename = format!("block_{block_id:05}.feat");
                 let feat_path = config.output_dir.join(&feat_filename);
                 write_feat_file(
                     &feat_path,
-                    block.id,
+                    block_id,
                     sampled_count,
-                    block.origin_x,
-                    block.origin_y,
+                    n_features,
+                    origin_x,
+                    origin_y,
                     &features,
                 )?;
 
                 // (g) Optional debug CSV
                 if config.debug_csv {
-                    let csv_path = config.output_dir.join(format!("block_{:05}.csv", block.id));
-                    write_debug_csv(&csv_path, &features)?;
+                    let csv_path = config.output_dir.join(format!("block_{block_id:05}.csv"));
+                    write_debug_csv(&csv_path, &features, &search_radii)?;
                 }
 
                 let meta = BlockMeta {
+<<<<<<< HEAD
+                    id: block_id,
+=======
                     id: block.id,
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                     file: feat_filename,
-                    origin_x: block.origin_x,
-                    origin_y: block.origin_y,
+                    origin_x,
+                    origin_y,
                     raw_point_count: raw_count,
                     sampled_point_count: sampled_count,
                     oversampled,
@@ -281,6 +374,7 @@ impl PreprocessingPipeline {
 
         // ── 8. Write blocks.json ──────────────────────────────────────────
         let manifest = BlockManifest {
+            // Always record the original user-supplied path, not the temp file.
             source: input_path.display().to_string(),
             block_size: config.block_size,
             target_points: config.target_points,
@@ -292,6 +386,14 @@ impl PreprocessingPipeline {
             grid_rows,
             grid_x_min: x_min,
             grid_y_min: y_min,
+<<<<<<< HEAD
+            search_radii: config.search_radii_effective(),
+            outlier_removal: config.outlier_removal,
+            outlier_radius: config.outlier_radius,
+            outlier_elev_diff: config.outlier_elev_diff,
+            outlier_use_median: config.outlier_use_median,
+=======
+>>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             blocks: block_metas,
         };
 
@@ -406,6 +508,64 @@ fn stream_points(path: &Path, partitioner: &mut BlockPartitioner) -> Result<()> 
     Ok(())
 }
 
+// ── Outlier removal helper ────────────────────────────────────────────────────
+// REMOVED (2026-06-17): run_outlier_removal() via wbtools_oss has been replaced
+// by the in-memory outlier_filter::apply() call in run_internal() Step 1b.
+// See src/preprocessing/outlier_filter.rs for the revert path.
+
+// ── LiDAR load helper ────────────────────────────────────────────────────────
+
+/// Load all points from a LiDAR file into a `Vec<PointRecord>`.
+/// Used only when outlier removal is enabled; for the normal path
+/// `stream_points` is used to avoid loading the full file into memory.
+fn load_all_points(path: &Path) -> Result<Vec<PointRecord>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use wblidar::io::PointReader;
+    use wblidar::las::LasReader;
+    use wblidar::laz::LazReader;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut pt = PointRecord::default();
+    let mut out = Vec::new();
+
+    match ext.as_str() {
+        "las" => {
+            let f = File::open(path)?;
+            let mut reader = LasReader::new(BufReader::new(f))?;
+            while reader.read_point(&mut pt)? {
+                out.push(pt);
+            }
+        }
+        "laz" => {
+            let f = File::open(path)?;
+            let mut reader = LazReader::new(BufReader::new(f))?;
+            while reader.read_point(&mut pt)? {
+                out.push(pt);
+            }
+        }
+        "copc" => {
+            use wblidar::copc::CopcReader;
+            let mut reader = CopcReader::open_path(path)?;
+            while reader.read_point(&mut pt)? {
+                out.push(pt);
+            }
+        }
+        _ => {
+            return Err(ClassifierError::UnsupportedFormat {
+                path: path.display().to_string(),
+            });
+        }
+    }
+
+    Ok(out)
+}
+
 // ── Output serialisation helpers ──────────────────────────────────────────────
 
 /// Write a `.feat` binary block file.
@@ -416,7 +576,7 @@ fn stream_points(path: &Path, partitioner: &mut BlockPartitioner) -> Result<()> 
 ///   magic:      4 bytes  = b"WBFT"
 ///   version:    u8       = 1
 ///   n_points:   u32 LE
-///   n_features: u32 LE
+///   n_features: u32 LE  (7 + 5 × n_radii)
 ///   block_id:   u64 LE
 ///   origin_x:   f64 LE
 ///   origin_y:   f64 LE
@@ -427,9 +587,10 @@ fn write_feat_file(
     path: &Path,
     block_id: u64,
     n_points: usize,
+    n_features: usize,
     origin_x: f64,
     origin_y: f64,
-    features: &[[f32; N_FEATURES]],
+    features: &[Vec<f32>],
 ) -> Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
@@ -440,37 +601,44 @@ fn write_feat_file(
     #[allow(clippy::cast_possible_truncation)]
     w.write_all(&(n_points as u32).to_le_bytes())?;
     #[allow(clippy::cast_possible_truncation)]
-    w.write_all(&(N_FEATURES as u32).to_le_bytes())?;
+    w.write_all(&(n_features as u32).to_le_bytes())?;
     w.write_all(&block_id.to_le_bytes())?;
     w.write_all(&origin_x.to_le_bytes())?;
     w.write_all(&origin_y.to_le_bytes())?;
 
-    // Data — cast `&[[f32; N_FEATURES]]` to `&[u8]` via bytemuck
-    let flat: &[f32] = bytemuck::cast_slice(features);
-    let bytes: &[u8] = bytemuck::cast_slice(flat);
-    w.write_all(bytes)?;
+    // Data — write each row as raw f32 bytes
+    for row in features {
+        let bytes: &[u8] = bytemuck::cast_slice(row.as_slice());
+        w.write_all(bytes)?;
+    }
     w.flush()?;
 
     Ok(())
 }
 
-/// Write a debug CSV file with one row per point and 12 named columns.
-fn write_debug_csv(path: &Path, features: &[[f32; N_FEATURES]]) -> Result<()> {
+/// Write a debug CSV file with dynamic column names derived from `search_radii`.
+fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
 
-    writeln!(
-        w,
-        "x_norm,y_norm,z_norm,intensity_norm,return_ratio,scan_angle_norm,\
-         hag,linearity,planarity,sphericity,omnivariance,curvature"
-    )?;
+    // Build dynamic header.
+    let mut cols = vec![
+        "x_norm", "y_norm", "z_norm", "intensity_norm",
+        "return_ratio", "scan_angle_norm", "hag",
+    ];
+    let eigen_names = ["linearity", "planarity", "sphericity", "omnivariance", "curvature"];
+    let mut extra: Vec<String> = Vec::new();
+    for r in search_radii {
+        for name in &eigen_names {
+            extra.push(format!("{name}_r{r:.2}"));
+        }
+    }
+    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    cols.extend_from_slice(&extra_refs);
+    writeln!(w, "{}", cols.join(","))?;
 
     for row in features {
-        let line = row
-            .iter()
-            .map(|v| format!("{v:.6}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let line = row.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
         writeln!(w, "{line}")?;
     }
 

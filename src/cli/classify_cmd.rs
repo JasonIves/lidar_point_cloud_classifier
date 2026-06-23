@@ -129,13 +129,23 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
         i += 1;
     }
 
-    Ok(ClassifyConfig {
+    let cfg = ClassifyConfig {
         input:   input.ok_or_else(|| ClassifierError::Pipeline("classify: --input is required".into()))?,
         model:   model.ok_or_else(|| ClassifierError::Pipeline("classify: --model is required".into()))?,
         blocks:  blocks.ok_or_else(|| ClassifierError::Pipeline("classify: --blocks is required".into()))?,
         output:  output.ok_or_else(|| ClassifierError::Pipeline("classify: --output is required".into()))?,
         threads,
-    })
+    };
+
+    if let Some(t) = cfg.threads {
+        if t == 0 {
+            return Err(ClassifierError::Pipeline(
+                "classify: --threads must be >= 1".to_string(),
+            ));
+        }
+    }
+
+    Ok(cfg)
 }
 
 fn require_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str> {

@@ -18,9 +18,14 @@ required-features = ["training"]
 
 [dependencies]
 # Whitebox Next Gen path dependencies (read-only; never modify these crates)
-wblidar  = { path = "../whitebox_next_gen/crates/wblidar",  features = ["parallel"] }
-wbcore   = { path = "../whitebox_next_gen/crates/wbcore" }
-wbraster = { path = "../whitebox_next_gen/crates/wbraster" }
+wblidar     = { path = "../whitebox_next_gen/crates/wblidar",     features = ["parallel"] }
+# TEMP (2026-06-17): wbcore and wbtools_oss commented out for build speed.
+# These were used only in preprocessing/pipeline.rs::run_outlier_removal().
+# The algorithm has been reimplemented locally in src/preprocessing/outlier_filter.rs.
+# To revert: uncomment below, delete outlier_filter.rs, see stage-04-outlier-removal.md.
+# wbcore      = { path = "../whitebox_next_gen/crates/wbcore" }
+# wbtools_oss = { path = "../whitebox_next_gen/crates/wbtools_oss" }
+wbraster    = { path = "../whitebox_next_gen/crates/wbraster" }
 
 # Parallelism
 rayon = "1"
