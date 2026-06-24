@@ -22,21 +22,13 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let mut cfg = TrainConfig::default();
-<<<<<<< HEAD
     let mut data_dirs: Vec<PathBuf> = Vec::new();
-=======
-    let mut data_dir: Option<PathBuf> = None;
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     let mut val_tile_blocks_path: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-<<<<<<< HEAD
             "--data-dir"          => { i += 1; data_dirs.push(PathBuf::from(&args[i])); }
-=======
-            "--data-dir"          => { i += 1; data_dir = Some(PathBuf::from(&args[i])); }
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             "--output-model"      => { i += 1; cfg.output_model = PathBuf::from(&args[i]); }
             "--n-classes"         => { i += 1; cfg.n_classes = parse_usize(&args[i], "--n-classes")?; }
             "--epochs"            => { i += 1; cfg.epochs = parse_usize(&args[i], "--epochs")?; }
@@ -64,7 +56,6 @@ pub fn run(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-<<<<<<< HEAD
     if data_dirs.is_empty() {
         return Err(ClassifierError::Pipeline("at least one --data-dir is required".into()));
     }
@@ -100,9 +91,6 @@ pub fn run(args: &[String]) -> Result<()> {
             return Err(ClassifierError::Pipeline("train: --threads must be >= 1".into()));
         }
     }
-=======
-    let data_dir = data_dir.ok_or_else(|| ClassifierError::Pipeline("--data-dir is required".into()))?;
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
     // Load explicit val-tile-blocks override if provided.
     let val_tile_ids: Option<HashSet<u64>> = if let Some(ref p) = val_tile_blocks_path {
@@ -114,15 +102,9 @@ pub fn run(args: &[String]) -> Result<()> {
         None
     };
 
-<<<<<<< HEAD
     // Load dataset — accepts one or more preprocessing directories.
     let dataset = LabeledBlockDataset::load(
         &data_dirs,
-=======
-    // Load dataset first (borrows val_tile_ids by ref), then store in cfg.
-    let dataset = LabeledBlockDataset::load(
-        &data_dir,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         cfg.val_split,
         val_tile_ids.as_ref(),
         cfg.seed,
@@ -130,7 +112,6 @@ pub fn run(args: &[String]) -> Result<()> {
 
     cfg.val_tile_block_ids = val_tile_ids;
 
-<<<<<<< HEAD
     // Default metrics output: <first_data_dir>/../metrics/metrics.csv
     if cfg.metrics_out.as_os_str() == "metrics.csv" {
         let anchor = &data_dirs[0];
@@ -141,11 +122,6 @@ pub fn run(args: &[String]) -> Result<()> {
             .join("metrics");
         std::fs::create_dir_all(&metrics_dir).ok();
         cfg.metrics_out = metrics_dir.join("metrics.csv");
-=======
-    // Set default metrics output path under data_dir if not overridden.
-    if cfg.metrics_out.as_os_str() == "metrics.csv" {
-        cfg.metrics_out = data_dir.join("metrics.csv");
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     }
 
     let device = burn::backend::ndarray::NdArrayDevice::default();
@@ -160,11 +136,7 @@ fn print_usage() {
         "Usage: wb_lidar_train train [options]\n\
          \n\
          Required:\n\
-<<<<<<< HEAD
            --data-dir      <dir>    Directory from `preprocess-labeled`; repeat for multiple files\n\
-=======
-           --data-dir      <dir>    Directory from `preprocess-labeled`\n\
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
            --output-model  <path>   Output .wbmodel file\n\
          \n\
          Optional:\n\

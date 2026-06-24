@@ -19,8 +19,10 @@ use rayon::prelude::*;
 
 use crate::error::{ClassifierError, Result};
 use crate::model::pointnet::PointNetClassifier;
-use crate::preprocessing::{BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION, N_FEATURES};
-use crate::preprocessing::RAYON_MIN_CHUNK;
+use crate::preprocessing::{
+    BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION,
+    N_SCALAR_FEATURES, N_EIGEN_FEATURES_PER_RADIUS, RAYON_MIN_CHUNK,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BlockInferenceResult
@@ -114,9 +116,17 @@ fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
     let origin_x   = read_f64_le(r)?;
     let origin_y   = read_f64_le(r)?;
 
-    if n_features != N_FEATURES {
+    // Multi-scale-aware validation (Stage 06): n_features must be
+    // N_SCALAR_FEATURES + N_EIGEN_FEATURES_PER_RADIUS × n_radii, where n_radii ≥ 1.
+    // This accepts both the legacy 12-feature single-scale format and any
+    // multi-scale format produced by Stage 06.
+    if n_features < N_SCALAR_FEATURES
+        || (n_features - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS != 0
+        || (n_features - N_SCALAR_FEATURES) / N_EIGEN_FEATURES_PER_RADIUS == 0
+    {
         return Err(ClassifierError::Pipeline(format!(
-            "{path_hint}: n_features={n_features} != N_FEATURES={N_FEATURES}"
+            "{path_hint}: n_features={n_features} is not a valid multi-scale feature count \
+             (expected {N_SCALAR_FEATURES} + {N_EIGEN_FEATURES_PER_RADIUS}×N for N≥1)"
         )));
     }
 

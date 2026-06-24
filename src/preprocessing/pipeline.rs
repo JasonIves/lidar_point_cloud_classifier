@@ -58,11 +58,12 @@ pub struct BlockManifest {
     pub grid_x_min: f64,
     /// Header-derived south-west Y origin — the same value passed to `BlockPartitioner`.
     #[serde(default)]
-<<<<<<< HEAD
-    pub grid_y_min: f64,    /// Search radii used for multi-scale eigenvalue feature extraction.
+    pub grid_y_min: f64,
+    /// Search radii used for multi-scale eigenvalue feature extraction.
     /// Empty list means single-scale using `search_radius`.
     #[serde(default)]
-    pub search_radii: Vec<f64>,    /// Whether the outlier removal pre-pass was applied before block partitioning.
+    pub search_radii: Vec<f64>,
+    /// Whether the outlier removal pre-pass was applied before block partitioning.
     #[serde(default)]
     pub outlier_removal: bool,
     /// Neighbourhood radius used for outlier elevation residual calculation.
@@ -74,9 +75,6 @@ pub struct BlockManifest {
     /// Whether median (true) or mean (false) was used for the neighbourhood baseline.
     #[serde(default)]
     pub outlier_use_median: bool,
-=======
-    pub grid_y_min: f64,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub blocks: Vec<BlockMeta>,
 }
 
@@ -298,11 +296,7 @@ impl PreprocessingPipeline {
 
                 // (b) Density-gated sampling — now returns indices too
                 let (sampled, sampled_indices, oversampled) =
-<<<<<<< HEAD
                     resample_block(&block.points, config.target_points, block_id);
-=======
-                    resample_block(&block.points, config.target_points, block.id);
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
                 let sampled_count = sampled.len();
 
@@ -341,11 +335,7 @@ impl PreprocessingPipeline {
                 }
 
                 let meta = BlockMeta {
-<<<<<<< HEAD
                     id: block_id,
-=======
-                    id: block.id,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                     file: feat_filename,
                     origin_x,
                     origin_y,
@@ -386,14 +376,11 @@ impl PreprocessingPipeline {
             grid_rows,
             grid_x_min: x_min,
             grid_y_min: y_min,
-<<<<<<< HEAD
             search_radii: config.search_radii_effective(),
             outlier_removal: config.outlier_removal,
             outlier_radius: config.outlier_radius,
             outlier_elev_diff: config.outlier_elev_diff,
             outlier_use_median: config.outlier_use_median,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             blocks: block_metas,
         };
 

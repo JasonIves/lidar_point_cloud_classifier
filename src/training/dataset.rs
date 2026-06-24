@@ -1,7 +1,6 @@
 //! Labeled block dataset — loads `.feat` + `.lbl` pairs and manages the
 //! spatially-disjoint train/val split.
 //!
-<<<<<<< HEAD
 //! Supports **multiple input directories** (one per preprocessed LiDAR file).
 //! Block IDs within a single directory are `row * grid_cols + col` and can
 //! collide across directories.  The dataset encodes a per-directory index into
@@ -10,10 +9,6 @@
 //! calls `load_block(id)` unchanged; the composite key is transparent to it.
 //!
 //! See `docs/stages/stage-05-multi-directory-dataset.md` for full design rationale.
-=======
-//! The dataset does **not** own burn tensors.  It returns `(Array2<f32>, Vec<u8>)`
-//! tuples; callers convert to burn tensors for the GPU/CPU backend.
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_lossless, clippy::must_use_candidate, clippy::missing_errors_doc, clippy::doc_markdown)]
 
@@ -26,11 +21,11 @@ use ndarray::Array2;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
-<<<<<<< HEAD
 use crate::preprocessing::{FEAT_MAGIC, FEAT_VERSION, N_FEATURES, n_features_for_radii, N_SCALAR_FEATURES, N_EIGEN_FEATURES_PER_RADIUS};
 
-// ─────────────────────────────────────────────────────────────────────────────// Composite block ID
-// ───────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Composite block ID
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Encode `(dir_index, local_block_id)` into a single `u64`.
 ///
@@ -49,13 +44,8 @@ fn decode_global_id(gid: u64) -> (usize, u64) {
     ((gid >> 32) as usize, gid & 0xFFFF_FFFF)
 }
 
-// ───────────────────────────────────────────────────────────────────────────────// Types
-=======
-use crate::preprocessing::{FEAT_MAGIC, FEAT_VERSION, N_FEATURES};
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A loaded block: feature matrix + label vector.
@@ -67,7 +57,6 @@ pub struct LoadedBlock {
     pub block_id: u64,
 }
 
-<<<<<<< HEAD
 /// One preprocessed-LiDAR-file directory: path + parsed manifest.
 struct DirEntry {
     path: PathBuf,
@@ -87,18 +76,11 @@ pub struct LabeledBlockDataset {
     /// Feature count derived from manifest `search_radii`.
     /// 12 for single-radius (backward-compatible), 7+5×N for N radii.
     n_features_inner: usize,
-=======
-/// Manages the `.feat` / `.lbl` dataset and provides train/val split.
-pub struct LabeledBlockDataset {
-    data_dir: PathBuf,
-    manifest: LabeledBlockManifest,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub train_ids: Vec<u64>,
     pub val_ids:   Vec<u64>,
 }
 
 impl LabeledBlockDataset {
-<<<<<<< HEAD
     /// Load from one or more `preprocess-labeled` output directories.
     ///
     /// Each directory must contain a `labeled_blocks.json` manifest.  All
@@ -112,24 +94,10 @@ impl LabeledBlockDataset {
     /// `n_classes` values are inconsistent across directories.
     pub fn load(
         data_dirs: &[PathBuf],
-=======
-    /// Load from a `labeled_blocks.json` manifest.
-    ///
-    /// The train/val split is determined by `macro_tile_id`:
-    /// - If `val_tile_block_ids` is `Some(set)`, those block IDs go to validation.
-    /// - Otherwise, a stride-based spatial split assigns approximately
-    ///   `val_split` fraction of macro-tiles to validation.
-    ///
-    /// # Errors
-    /// Returns an error if the manifest cannot be read or parsed.
-    pub fn load(
-        data_dir: &Path,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         val_split: f64,
         val_tile_block_ids: Option<&HashSet<u64>>,
         seed: u64,
     ) -> Result<Self> {
-<<<<<<< HEAD
         if data_dirs.is_empty() {
             return Err(ClassifierError::Pipeline(
                 "at least one --data-dir is required".into(),
@@ -294,63 +262,6 @@ impl LabeledBlockDataset {
                             counts[idx] += v;
                         }
                     }
-=======
-        let manifest_path = data_dir.join("labeled_blocks.json");
-        let f = File::open(&manifest_path).map_err(|e| {
-            ClassifierError::Pipeline(format!("cannot open labeled_blocks.json: {e}"))
-        })?;
-        let manifest: LabeledBlockManifest = serde_json::from_reader(BufReader::new(f))
-            .map_err(|e| ClassifierError::Pipeline(format!("labeled_blocks.json parse: {e}")))?;
-
-        let (train_ids, val_ids) = if let Some(explicit) = val_tile_block_ids {
-            // Explicit override
-            let mut train = Vec::new();
-            let mut val   = Vec::new();
-            for b in &manifest.blocks {
-                if explicit.contains(&b.meta.id) { val.push(b.meta.id); }
-                else { train.push(b.meta.id); }
-            }
-            (train, val)
-        } else {
-            spatial_split(&manifest, val_split, seed)
-        };
-
-        eprintln!(
-            "[dataset] train blocks: {}, val blocks: {}",
-            train_ids.len(), val_ids.len()
-        );
-
-        Ok(Self {
-            data_dir: data_dir.to_path_buf(),
-            manifest,
-            train_ids,
-            val_ids,
-        })
-    }
-
-    /// Return the number of classes from the manifest `label_map`.
-    pub fn n_classes(&self) -> usize {
-        // The label_map maps ASPRS codes → class indices; max index + 1 = n_classes.
-        self.manifest
-            .label_map
-            .values()
-            .copied()
-            .max()
-            .map_or(8, |m| m as usize + 1)
-    }
-
-    /// Compute per-class point counts from the **training** blocks only.
-    /// Returns a `Vec<u64>` of length `n_classes`.
-    pub fn class_counts_train(&self) -> Vec<u64> {
-        let n = self.n_classes();
-        let train_set: HashSet<u64> = self.train_ids.iter().copied().collect();
-        let mut counts = vec![0u64; n];
-        for b in &self.manifest.blocks {
-            if !train_set.contains(&b.meta.id) { continue; }
-            for (k, &v) in &b.class_distribution {
-                if let Ok(idx) = k.parse::<usize>() {
-                    if idx < n { counts[idx] += v; }
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 }
             }
         }
@@ -359,7 +270,6 @@ impl LabeledBlockDataset {
 
     /// Load a single block (features + labels) from disk.
     ///
-<<<<<<< HEAD
     /// `block_id` must be a `GlobalBlockId` as returned by `train_ids` or
     /// `val_ids` — do not pass raw local block IDs here.
     ///
@@ -393,25 +303,6 @@ impl LabeledBlockDataset {
         let features = load_feat_file(&feat_path)?;
 
         let lbl_path = entry.path.join(&bm.lbl_file);
-=======
-    /// # Errors
-    /// Returns an error if the `.feat` or `.lbl` file cannot be read.
-    pub fn load_block(&self, block_id: u64) -> Result<LoadedBlock> {
-        // Find the block meta entry.
-        let bm = self
-            .manifest
-            .blocks
-            .iter()
-            .find(|b| b.meta.id == block_id)
-            .ok_or_else(|| ClassifierError::Pipeline(format!("block {block_id} not in manifest")))?;
-
-        // Load .feat file.
-        let feat_path = self.data_dir.join(&bm.meta.file);
-        let features = load_feat_file(&feat_path)?;
-
-        // Load .lbl file.
-        let lbl_path = self.data_dir.join(&bm.lbl_file);
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         let n_points = features.nrows();
         let labels = load_lbl_file(&lbl_path, n_points)?;
 
@@ -494,24 +385,21 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
         .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
 
     let version    = hdr[0];
-    let n_points   = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
-    let n_features = u32::from_le_bytes(hdr[5..9].try_into().unwrap()) as usize;
+    // Fixed-size sub-slices of a [u8; 33] array: try_into cannot fail, but we
+    // propagate as Pipeline error rather than unwrap() to satisfy the no-panics rule.
+    let corrupt = || ClassifierError::Pipeline("feat: header byte slice conversion failed".into());
+    let n_points   = u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[1..5]).map_err(|_| corrupt())?) as usize;
+    let n_features = u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[5..9]).map_err(|_| corrupt())?) as usize;
 
     if version != FEAT_VERSION {
         return Err(ClassifierError::Pipeline(format!(
             "feat: unsupported version {version}"
         )));
     }
-<<<<<<< HEAD
     // Accept any positive n_features (multi-scale or legacy 12).
     if n_features == 0 || !matches!(n_features, f if (f - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS == 0) {
         return Err(ClassifierError::Pipeline(format!(
             "feat: n_features={n_features} is not a valid value (expected 7 + 5×N)"
-=======
-    if n_features != N_FEATURES {
-        return Err(ClassifierError::Pipeline(format!(
-            "feat: expected {N_FEATURES} features, got {n_features}"
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         )));
     }
 
@@ -521,9 +409,12 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
     f.read_exact(&mut buf)
         .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
 
+    // chunks_exact(4) guarantees each chunk is exactly 4 bytes; the try_into
+    // cannot fail, but we use an array copy instead of try_into to avoid any
+    // unwrap() in production code.
     let floats: Vec<f32> = buf
         .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
     Array2::from_shape_vec((n_points, n_features), floats)
@@ -549,7 +440,6 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn test_global_id_round_trip() {
         // Encoding and decoding must be lossless for representative inputs.
         for (dir, local) in [(0usize, 0u64), (1, 42), (3, 65535), (255, 4_000_000)] {
@@ -569,8 +459,6 @@ mod tests {
     }
 
     #[test]
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     fn test_explicit_val_tile_override() {
         // If we supply explicit val block IDs, those blocks must be in val set
         // regardless of macro_tile_id.
@@ -644,10 +532,7 @@ mod tests {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
-<<<<<<< HEAD
             search_radii: vec![],
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             min_neighbors: 8,
             crs_epsg: None,
             label_map: HM::new(),

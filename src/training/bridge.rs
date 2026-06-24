@@ -125,7 +125,6 @@ fn extract_pair<B: AutodiffBackend>(
 fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Linear> {
     let w_burn = layer.weight.val();            // Tensor<B::InnerBackend, 2> [d_in, d_out]
     let [d_in, d_out] = w_burn.dims();
-<<<<<<< HEAD
     // Layout contract: burn 0.16 stores Linear weights as [d_input, d_output].
     // We transpose to [d_output, d_input] to match Stage 02's convention.
     // If this assertion fires after a burn version bump, verify the weight
@@ -135,8 +134,6 @@ fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Lin
         "burn Linear weight has unexpected zero dimension: [{d_in}, {d_out}] — \
          verify burn weight layout convention has not changed"
     );
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
     let w_data: Vec<f32> = w_burn
         .transpose()                            // [d_out, d_in]

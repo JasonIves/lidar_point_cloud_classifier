@@ -10,10 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use burn::{
-    module::AutodiffModule,
     nn::loss::CrossEntropyLossConfig,
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
-    tensor::{backend::AutodiffBackend, Tensor},
+    tensor::backend::AutodiffBackend,
 };
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -160,11 +159,7 @@ where
 
     // ── Model + config ────────────────────────────────────────────────────
     let net_cfg = PointNetConfig {
-<<<<<<< HEAD
         n_features_in: dataset.n_features(),
-=======
-        n_features_in: crate::preprocessing::N_FEATURES,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         encoder_dims: vec![64, 128, 256],
         decoder_dims: vec![256, 128],
         n_classes: config.n_classes,
@@ -248,14 +243,9 @@ where
                 };
 
                 let n = block.features.nrows();
-<<<<<<< HEAD
                 let n_features_block = block.features.ncols();
                 let raw_floats: Vec<f32> = block.features.into_raw_vec_and_offset().0;
                 let feat_tensor = features_to_tensor::<B>(raw_floats, n, n_features_block, device);
-=======
-                let raw_floats: Vec<f32> = block.features.into_raw_vec_and_offset().0;
-                let feat_tensor = features_to_tensor::<B>(raw_floats, n, device);
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 let targets = labels_to_tensor::<B>(&block.labels, device);
 
                 // Forward
@@ -303,7 +293,6 @@ where
             train_loss,
             device,
             config.n_classes,
-<<<<<<< HEAD
             class_weights.as_deref(),
         )?;
 
@@ -311,14 +300,6 @@ where
             "[trainer] epoch {}/{} — train_loss={:.4}  val_loss_uw={:.4}  val_loss_w={:.4}  val_mIoU={:.4}",
             epoch + 1, config.epochs,
             train_loss, val_metrics.val_loss, val_metrics.val_loss_weighted, val_metrics.miou
-=======
-        )?;
-
-        eprintln!(
-            "[trainer] epoch {}/{} — train_loss={:.4}  val_loss={:.4}  val_mIoU={:.4}",
-            epoch + 1, config.epochs,
-            train_loss, val_metrics.val_loss, val_metrics.miou
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         );
 
         // Append to metrics CSV.
@@ -405,15 +386,11 @@ fn validate_epoch<B: AutodiffBackend>(
     train_loss: f64,
     device: &B::Device,
     n_classes: usize,
-<<<<<<< HEAD
     class_weights: Option<&[f32]>,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 ) -> Result<EpochMetrics>
 where
     B::InnerBackend: burn::tensor::backend::Backend<Device = B::Device>,
 {
-<<<<<<< HEAD
     // Clone the model so the original's BN running statistics are not
     // contaminated by validation-batch statistics.
     // The clone runs in TRAINING mode (batch statistics), which avoids the
@@ -422,10 +399,6 @@ where
     // distributions.  Running statistics built from training blocks would
     // normalise validation activations incorrectly, causing logit explosion.
     let val_model = model.clone();
-=======
-    use burn::tensor::TensorData;
-    let val_model = model.valid();
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     let mut acc = MetricsAccumulator::new(n_classes);
 
     for &block_id in val_ids {
@@ -435,7 +408,6 @@ where
         };
 
         let n = block.features.nrows();
-<<<<<<< HEAD
         let n_features_block = block.features.ncols();
         let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
 
@@ -445,17 +417,6 @@ where
         let logits = val_model.forward(feat_tensor);  // [N, n_classes]
         let nc = logits.dims()[1];
         let flat_out: Vec<f32> = logits
-=======
-        let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
-
-        // Validation tensors use InnerBackend (no grad).
-        let feat_data = TensorData::new(flat, vec![n, crate::preprocessing::N_FEATURES]);
-        let feat_inner = Tensor::<B::InnerBackend, 2>::from_floats(feat_data, device);
-
-        let logits_inner = val_model.forward(feat_inner);  // [N, n_classes]
-        let nc = logits_inner.dims()[1];
-        let flat_out: Vec<f32> = logits_inner
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             .into_data()
             .to_vec::<f32>()
             .unwrap_or_default();
@@ -464,17 +425,11 @@ where
                 let row = &flat_out[i * nc..(i + 1) * nc];
                 row.iter()
                     .enumerate()
-<<<<<<< HEAD
-=======
-                    // Guard against NaN logits (e.g. exploding gradients): treat
-                    // NaN as equal so the lower index wins rather than panicking.
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map_or(0, |(j, _)| j as u8)
             })
             .collect();
 
-<<<<<<< HEAD
         let loss_uw = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
         acc.add_loss(loss_uw);
 
@@ -482,10 +437,6 @@ where
             &flat_out, &block.labels, n, nc, class_weights,
         );
         acc.add_loss_weighted(loss_w);
-=======
-        let loss_val = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
-        acc.add_loss(loss_val);
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
         acc.accumulate(&preds, &block.labels);
     }
@@ -510,7 +461,6 @@ fn cross_entropy_from_logits(logits: &[f32], labels: &[u8], n: usize, nc: usize)
     if n > 0 { loss / n as f64 } else { 0.0 }
 }
 
-<<<<<<< HEAD
 /// Class-weighted cross-entropy, normalized by the sum of sample weights.
 /// This matches burn's `CrossEntropyLoss` with `with_weights` convention
 /// and is directly comparable to `train_loss`.
@@ -542,8 +492,6 @@ fn cross_entropy_from_logits_weighted(
     if w_sum > 0.0 { loss / w_sum } else { 0.0 }
 }
 
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 // ─────────────────────────────────────────────────────────────────────────────
 // SWA
 // ─────────────────────────────────────────────────────────────────────────────
@@ -576,7 +524,6 @@ fn apply_swa(
     let mut base = models[0].clone();
     let other_models = &models[1..];
 
-<<<<<<< HEAD
     // ── Helper: accumulate one Linear layer's weight+bias into `base_lin` ──
     // Defined as a macro so it can be reused without fighting the borrow checker.
     macro_rules! accum_linear {
@@ -594,21 +541,11 @@ fn apply_swa(
     macro_rules! accum_bn {
         ($base_bn:expr, $other_bn:expr) => {
             if let (Some(ref mut bb), Some(ref mb)) = ($base_bn, $other_bn) {
-=======
-    // Average all parameters using ndarray arithmetic.
-    // Encoder layers
-    for i in 0..base.encoder_layers.len() {
-        for m in other_models {
-            base.encoder_layers[i].0.weight = (&base.encoder_layers[i].0.weight + &m.encoder_layers[i].0.weight).to_owned();
-            base.encoder_layers[i].0.bias   = (&base.encoder_layers[i].0.bias   + &m.encoder_layers[i].0.bias).to_owned();
-            if let (Some(ref mut bb), Some(ref mb)) = (&mut base.encoder_layers[i].1, &m.encoder_layers[i].1) {
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                 bb.gamma = (&bb.gamma + &mb.gamma).to_owned();
                 bb.beta  = (&bb.beta  + &mb.beta).to_owned();
                 bb.mean  = (&bb.mean  + &mb.mean).to_owned();
                 bb.var   = (&bb.var   + &mb.var).to_owned();
             }
-<<<<<<< HEAD
         };
     }
     macro_rules! divide_bn {
@@ -628,19 +565,10 @@ fn apply_swa(
         }
         divide_linear!(base.encoder_layers[i].0);
         divide_bn!(base.encoder_layers[i].1);
-=======
-        }
-        base.encoder_layers[i].0.weight /= n;
-        base.encoder_layers[i].0.bias   /= n;
-        if let Some(ref mut bb) = base.encoder_layers[i].1 {
-            bb.gamma /= n; bb.beta /= n; bb.mean /= n; bb.var /= n;
-        }
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     }
     // Decoder layers
     for i in 0..base.decoder_layers.len() {
         for m in other_models {
-<<<<<<< HEAD
             accum_linear!(base.decoder_layers[i].0, m.decoder_layers[i].0);
             accum_bn!(&mut base.decoder_layers[i].1, &m.decoder_layers[i].1);
         }
@@ -702,29 +630,6 @@ fn apply_swa(
         divide_linear!(bt.fc0);  divide_linear!(bt.fc1);  divide_linear!(bt.fc2);
         divide_bn!(bt.bn_fc0);   divide_bn!(bt.bn_fc1);
     }
-=======
-            base.decoder_layers[i].0.weight = (&base.decoder_layers[i].0.weight + &m.decoder_layers[i].0.weight).to_owned();
-            base.decoder_layers[i].0.bias   = (&base.decoder_layers[i].0.bias   + &m.decoder_layers[i].0.bias).to_owned();
-            if let (Some(ref mut bb), Some(ref mb)) = (&mut base.decoder_layers[i].1, &m.decoder_layers[i].1) {
-                bb.gamma = (&bb.gamma + &mb.gamma).to_owned();
-                bb.beta  = (&bb.beta  + &mb.beta).to_owned();
-                bb.mean  = (&bb.mean  + &mb.mean).to_owned();
-                bb.var   = (&bb.var   + &mb.var).to_owned();
-            }
-        }
-        base.decoder_layers[i].0.weight /= n;
-        base.decoder_layers[i].0.bias   /= n;
-        if let Some(ref mut bb) = base.decoder_layers[i].1 {
-            bb.gamma /= n; bb.beta /= n; bb.mean /= n; bb.var /= n;
-        }
-    }
-    for m in other_models {
-        base.class_proj.weight = (&base.class_proj.weight + &m.class_proj.weight).to_owned();
-        base.class_proj.bias   = (&base.class_proj.bias   + &m.class_proj.bias).to_owned();
-    }
-    base.class_proj.weight /= n;
-    base.class_proj.bias   /= n;
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 
     crate::model::weights::save_model(output_path, &base)
 }
@@ -783,7 +688,6 @@ mod tests {
         let loss = cross_entropy_from_logits(&logits, &labels, 2, 2);
         assert!(loss < 0.001, "expected near-zero loss, got {loss}");
     }
-<<<<<<< HEAD
 
     /// Verify that `apply_swa` averages T-Net weights, not just encoder/decoder.
     ///
@@ -856,6 +760,4 @@ mod tests {
         assert!(max_err < 1e-5,
             "SWA T-Net weight not correctly averaged; max element error = {max_err}");
     }
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 }

@@ -16,10 +16,7 @@ pub struct ClassMetrics {
     pub class_idx: usize,
     pub tp: u64,
     pub fp: u64,
-<<<<<<< HEAD
     pub tn: u64,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub r#fn: u64,
     pub iou: f64,
     pub precision: f64,
@@ -32,7 +29,6 @@ pub struct ClassMetrics {
 pub struct EpochMetrics {
     pub epoch: usize,
     pub train_loss: f64,
-<<<<<<< HEAD
     /// Unweighted mean cross-entropy on validation blocks (comparable across runs).
     pub val_loss: f64,
     /// Class-weighted mean cross-entropy on validation blocks (comparable to train_loss).
@@ -40,10 +36,6 @@ pub struct EpochMetrics {
     pub miou: f64,
     /// Overall accuracy: sum(TP) / total_validation_points.
     pub overall_accuracy: f64,
-=======
-    pub val_loss: f64,
-    pub miou: f64,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub f1_macro: f64,
     pub per_class: Vec<ClassMetrics>,
 }
@@ -58,13 +50,10 @@ pub struct MetricsAccumulator {
     confusion: Vec<Vec<u64>>,
     loss_sum: f64,
     loss_count: u64,
-<<<<<<< HEAD
     loss_weighted_sum: f64,
     loss_weighted_count: u64,
     /// Total number of predictions accumulated (used to compute TN and OA).
     total_points: u64,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 }
 
 impl MetricsAccumulator {
@@ -77,12 +66,9 @@ impl MetricsAccumulator {
             confusion: vec![vec![0; n_classes]; n_classes],
             loss_sum: 0.0,
             loss_count: 0,
-<<<<<<< HEAD
             loss_weighted_sum: 0.0,
             loss_weighted_count: 0,
             total_points: 0,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         }
     }
 
@@ -101,39 +87,28 @@ impl MetricsAccumulator {
                 self.fn_[g] += 1;
             }
             self.confusion[g][p] += 1;
-<<<<<<< HEAD
             self.total_points += 1;
         }
     }
 
     /// Record a block-level unweighted validation loss.
-=======
-        }
-    }
-
-    /// Record a block-level validation loss.
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     pub fn add_loss(&mut self, loss: f64) {
         self.loss_sum += loss;
         self.loss_count += 1;
     }
 
-<<<<<<< HEAD
     /// Record a block-level class-weighted validation loss.
     pub fn add_loss_weighted(&mut self, loss: f64) {
         self.loss_weighted_sum += loss;
         self.loss_weighted_count += 1;
     }
 
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     /// Compute final metrics from accumulated counters.
     pub fn compute(&self, epoch: usize, train_loss: f64) -> EpochMetrics {
         let mut per_class = Vec::with_capacity(self.n_classes);
         let mut iou_sum = 0.0;
         let mut f1_sum = 0.0;
         let mut present = 0usize;
-<<<<<<< HEAD
         let mut tp_total = 0u64;
 
         for c in 0..self.n_classes {
@@ -144,36 +119,20 @@ impl MetricsAccumulator {
             let tn  = self.total_points.saturating_sub(tp + fp + fn_);
             tp_total += tp;
 
-=======
-
-        for c in 0..self.n_classes {
-            let tp = self.tp[c];
-            let fp = self.fp[c];
-            let fn_ = self.fn_[c];
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             let denom_iou = tp + fp + fn_;
 
             if denom_iou == 0 {
                 // Class absent from validation set — exclude from averages.
                 per_class.push(ClassMetrics {
                     class_idx: c,
-<<<<<<< HEAD
                     tp, fp, tn, r#fn: fn_,
-=======
-                    tp, fp, r#fn: fn_,
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
                     iou: 0.0, precision: 0.0, recall: 0.0, f1: 0.0,
                 });
                 continue;
             }
 
-<<<<<<< HEAD
             let iou       = tp as f64 / denom_iou as f64;
             let precision = if tp + fp  == 0 { 0.0 } else { tp as f64 / (tp + fp)  as f64 };
-=======
-            let iou = tp as f64 / denom_iou as f64;
-            let precision = if tp + fp == 0 { 0.0 } else { tp as f64 / (tp + fp) as f64 };
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             let recall    = if tp + fn_ == 0 { 0.0 } else { tp as f64 / (tp + fn_) as f64 };
             let f1 = if precision + recall < 1e-12 {
                 0.0
@@ -185,7 +144,6 @@ impl MetricsAccumulator {
             f1_sum  += f1;
             present += 1;
 
-<<<<<<< HEAD
             per_class.push(ClassMetrics { class_idx: c, tp, fp, tn, r#fn: fn_, iou, precision, recall, f1 });
         }
 
@@ -196,16 +154,6 @@ impl MetricsAccumulator {
         let val_loss_weighted = if self.loss_weighted_count == 0 { val_loss } else { self.loss_weighted_sum / self.loss_weighted_count as f64 };
 
         EpochMetrics { epoch, train_loss, val_loss, val_loss_weighted, miou, overall_accuracy, f1_macro, per_class }
-=======
-            per_class.push(ClassMetrics { class_idx: c, tp, fp, r#fn: fn_, iou, precision, recall, f1 });
-        }
-
-        let miou     = if present == 0 { 0.0 } else { iou_sum / present as f64 };
-        let f1_macro = if present == 0 { 0.0 } else { f1_sum  / present as f64 };
-        let val_loss = if self.loss_count == 0 { 0.0 } else { self.loss_sum / self.loss_count as f64 };
-
-        EpochMetrics { epoch, train_loss, val_loss, miou, f1_macro, per_class }
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     }
 
     /// Return the confusion matrix as a 2D vec (rows=true, cols=predicted).
@@ -214,7 +162,6 @@ impl MetricsAccumulator {
     }
 }
 
-<<<<<<< HEAD
 /// Write per-epoch metrics to a CSV file.
 ///
 /// On epoch 1 the file is **truncated** (any prior run's data is discarded) and
@@ -238,24 +185,10 @@ pub fn append_metrics_csv(path: &Path, m: &EpochMetrics) -> std::io::Result<()> 
         write!(w, "epoch,train_loss,val_loss_uw,val_loss_w,val_miou,val_oa,f1_macro")?;
         for c in 0..m.per_class.len() {
             write!(w, ",tp_cls_{c},fp_cls_{c},tn_cls_{c},fn_cls_{c},prec_cls_{c},rec_cls_{c},f1_cls_{c},iou_cls_{c}")?;
-=======
-/// Write per-epoch metrics to a CSV file (appending).
-pub fn append_metrics_csv(path: &Path, m: &EpochMetrics) -> std::io::Result<()> {
-    let file_exists = path.exists();
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    let mut w = BufWriter::new(file);
-
-    if !file_exists {
-        // Header row
-        write!(w, "epoch,train_loss,val_loss,val_miou,f1_macro")?;
-        for c in 0..m.per_class.len() {
-            write!(w, ",IoU_cls_{c}")?;
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
         }
         writeln!(w)?;
     }
 
-<<<<<<< HEAD
     write!(w, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
         m.epoch, m.train_loss, m.val_loss, m.val_loss_weighted,
         m.miou, m.overall_accuracy, m.f1_macro)?;
@@ -263,19 +196,11 @@ pub fn append_metrics_csv(path: &Path, m: &EpochMetrics) -> std::io::Result<()> 
         write!(w, ",{},{},{},{},{:.6},{:.6},{:.6},{:.6}",
             cm.tp, cm.fp, cm.tn, cm.r#fn,
             cm.precision, cm.recall, cm.f1, cm.iou)?;
-=======
-    write!(w, "{},{:.6},{:.6},{:.6},{:.6}",
-        m.epoch, m.train_loss, m.val_loss, m.miou, m.f1_macro)?;
-    for cm in &m.per_class {
-        write!(w, ",{:.6}", cm.iou)?;
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
     }
     writeln!(w)?;
     w.flush()
 }
 
-<<<<<<< HEAD
-=======
 /// Write the confusion matrix to a CSV file.
 pub fn write_confusion_matrix_csv(
     path: &Path,
@@ -294,7 +219,6 @@ pub fn write_confusion_matrix_csv(
     w.flush()
 }
 
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────

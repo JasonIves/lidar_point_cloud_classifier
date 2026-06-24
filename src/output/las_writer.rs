@@ -236,14 +236,11 @@ mod tests {
             grid_rows: 1,
             grid_x_min: origin_x,
             grid_y_min: origin_y,
-<<<<<<< HEAD
             search_radii: vec![],
             outlier_removal: false,
             outlier_radius: 2.0,
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
-=======
->>>>>>> cf241b7a93ef85c278c70d77292d38d1c3a9def4
             blocks: vec![BlockMeta {
                 id: 0,
                 file: "block_00000.feat".into(),
