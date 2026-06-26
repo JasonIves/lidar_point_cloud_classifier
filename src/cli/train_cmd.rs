@@ -1,6 +1,10 @@
 //! `train` sub-command — runs the PointNet training loop.
 
-#![allow(clippy::missing_errors_doc, clippy::doc_markdown)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::doc_markdown,
+    clippy::too_many_lines
+)]
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -28,25 +32,82 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--data-dir"          => { i += 1; data_dirs.push(PathBuf::from(&args[i])); }
-            "--output-model"      => { i += 1; cfg.output_model = PathBuf::from(&args[i]); }
-            "--n-classes"         => { i += 1; cfg.n_classes = parse_usize(&args[i], "--n-classes")?; }
-            "--epochs"            => { i += 1; cfg.epochs = parse_usize(&args[i], "--epochs")?; }
-            "--batch-size"        => { i += 1; cfg.batch_size = parse_usize(&args[i], "--batch-size")?; }
-            "--learning-rate"     => { i += 1; cfg.learning_rate = parse_f64(&args[i], "--learning-rate")?; }
-            "--weight-decay"      => { i += 1; cfg.weight_decay = parse_f32(&args[i], "--weight-decay")?; }
-            "--val-split"         => { i += 1; cfg.val_split = parse_f64(&args[i], "--val-split")?; }
-            "--val-tile-blocks"   => { i += 1; val_tile_blocks_path = Some(PathBuf::from(&args[i])); }
-            "--seed"              => { i += 1; cfg.seed = parse_u64(&args[i], "--seed")?; }
-            "--use-feature-tnet"  => { cfg.use_feature_tnet = true; }
-            "--no-batch-norm"     => { cfg.use_batch_norm = false; }
-            "--no-class-weights"  => { cfg.use_class_weights = false; }
-            "--checkpoint-dir"    => { i += 1; cfg.checkpoint_dir = Some(PathBuf::from(&args[i])); }
-            "--checkpoint-every"  => { i += 1; cfg.checkpoint_every = parse_usize(&args[i], "--checkpoint-every")?; }
-            "--keep-best-n"       => { i += 1; cfg.keep_best_n = parse_usize(&args[i], "--keep-best-n")?; }
-            "--swa"               => { cfg.swa = true; }
-            "--metrics-out"       => { i += 1; cfg.metrics_out = PathBuf::from(&args[i]); }
-            "--threads"           => { i += 1; cfg.n_threads = Some(parse_usize(&args[i], "--threads")?); }
+            "--data-dir" => {
+                i += 1;
+                data_dirs.push(PathBuf::from(&args[i]));
+            }
+            "--output-model" => {
+                i += 1;
+                cfg.output_model = PathBuf::from(&args[i]);
+            }
+            "--n-classes" => {
+                i += 1;
+                cfg.n_classes = parse_usize(&args[i], "--n-classes")?;
+            }
+            "--epochs" => {
+                i += 1;
+                cfg.epochs = parse_usize(&args[i], "--epochs")?;
+            }
+            "--batch-size" => {
+                i += 1;
+                cfg.batch_size = parse_usize(&args[i], "--batch-size")?;
+            }
+            "--learning-rate" => {
+                i += 1;
+                cfg.learning_rate = parse_f64(&args[i], "--learning-rate")?;
+            }
+            "--weight-decay" => {
+                i += 1;
+                cfg.weight_decay = parse_f32(&args[i], "--weight-decay")?;
+            }
+            "--val-split" => {
+                i += 1;
+                cfg.val_split = parse_f64(&args[i], "--val-split")?;
+            }
+            "--val-tile-blocks" => {
+                i += 1;
+                val_tile_blocks_path = Some(PathBuf::from(&args[i]));
+            }
+            "--seed" => {
+                i += 1;
+                cfg.seed = parse_u64(&args[i], "--seed")?;
+            }
+            "--use-feature-tnet" => {
+                cfg.use_feature_tnet = true;
+            }
+            "--no-batch-norm" => {
+                cfg.use_batch_norm = false;
+            }
+            "--no-class-weights" => {
+                cfg.use_class_weights = false;
+            }
+            "--class-weight-beta" => {
+                i += 1;
+                cfg.class_weight_beta = parse_f64(&args[i], "--class-weight-beta")?;
+            }
+            "--checkpoint-dir" => {
+                i += 1;
+                cfg.checkpoint_dir = Some(PathBuf::from(&args[i]));
+            }
+            "--checkpoint-every" => {
+                i += 1;
+                cfg.checkpoint_every = parse_usize(&args[i], "--checkpoint-every")?;
+            }
+            "--keep-best-n" => {
+                i += 1;
+                cfg.keep_best_n = parse_usize(&args[i], "--keep-best-n")?;
+            }
+            "--swa" => {
+                cfg.swa = true;
+            }
+            "--metrics-out" => {
+                i += 1;
+                cfg.metrics_out = PathBuf::from(&args[i]);
+            }
+            "--threads" => {
+                i += 1;
+                cfg.n_threads = Some(parse_usize(&args[i], "--threads")?);
+            }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
                     "train: unknown flag '{flag}'"
@@ -57,7 +118,9 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     if data_dirs.is_empty() {
-        return Err(ClassifierError::Pipeline("at least one --data-dir is required".into()));
+        return Err(ClassifierError::Pipeline(
+            "at least one --data-dir is required".into(),
+        ));
     }
 
     // Range validation.
@@ -68,7 +131,9 @@ pub fn run(args: &[String]) -> Result<()> {
         return Err(ClassifierError::Pipeline("--epochs must be >= 1".into()));
     }
     if cfg.batch_size == 0 {
-        return Err(ClassifierError::Pipeline("--batch-size must be >= 1".into()));
+        return Err(ClassifierError::Pipeline(
+            "--batch-size must be >= 1".into(),
+        ));
     }
     if cfg.learning_rate <= 0.0 || !cfg.learning_rate.is_finite() {
         return Err(ClassifierError::Pipeline(
@@ -81,15 +146,31 @@ pub fn run(args: &[String]) -> Result<()> {
         ));
     }
     if cfg.keep_best_n == 0 {
-        return Err(ClassifierError::Pipeline("--keep-best-n must be >= 1".into()));
+        return Err(ClassifierError::Pipeline(
+            "--keep-best-n must be >= 1".into(),
+        ));
     }
     if cfg.checkpoint_every == 0 {
-        return Err(ClassifierError::Pipeline("--checkpoint-every must be >= 1".into()));
+        return Err(ClassifierError::Pipeline(
+            "--checkpoint-every must be >= 1".into(),
+        ));
     }
     if let Some(t) = cfg.n_threads {
         if t == 0 {
-            return Err(ClassifierError::Pipeline("train: --threads must be >= 1".into()));
+            return Err(ClassifierError::Pipeline(
+                "train: --threads must be >= 1".into(),
+            ));
         }
+    }
+    // --class-weight-beta must be in [0.0, 1.0).
+    // β = 1.0 is excluded because the effective-number formula is undefined there
+    // (the limit is inverse-frequency, approximated at β = 0.9999).
+    if cfg.class_weight_beta < 0.0 || cfg.class_weight_beta >= 1.0 {
+        return Err(ClassifierError::Pipeline(
+            "--class-weight-beta must be in the range [0.0, 1.0). \
+             Use 0.0 for uniform weights, values near 1.0 for stronger minority-class emphasis."
+                .into(),
+        ));
     }
 
     // Load explicit val-tile-blocks override if provided.
@@ -103,12 +184,8 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     // Load dataset — accepts one or more preprocessing directories.
-    let dataset = LabeledBlockDataset::load(
-        &data_dirs,
-        cfg.val_split,
-        val_tile_ids.as_ref(),
-        cfg.seed,
-    )?;
+    let dataset =
+        LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?;
 
     cfg.val_tile_block_ids = val_tile_ids;
 
@@ -151,6 +228,8 @@ fn print_usage() {
            --use-feature-tnet          Enable STN64d (default: off)\n\
            --no-batch-norm             Disable BatchNorm (default: on)\n\
            --no-class-weights          Disable class-weighted loss (default: on)\n\
+           --class-weight-beta <f64>    β for effective-number weighting, range [0.0,1.0)\n\
+                                        0.0=uniform, 0.999=default (strong), 0.9999≈inverse-freq\n\
            --checkpoint-dir    <path>   Save checkpoint .wbmodel files here\n\
            --checkpoint-every  <usize>  Checkpoint interval in epochs (default: 1)\n\
            --keep-best-n       <usize>  Max retained checkpoints (default: 5)\n\
@@ -161,14 +240,18 @@ fn print_usage() {
 }
 
 fn parse_f64(s: &str, flag: &str) -> Result<f64> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f64 '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f64 '{s}'")))
 }
 fn parse_f32(s: &str, flag: &str) -> Result<f32> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f32 '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f32 '{s}'")))
 }
 fn parse_usize(s: &str, flag: &str) -> Result<usize> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid usize '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid usize '{s}'")))
 }
 fn parse_u64(s: &str, flag: &str) -> Result<u64> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid u64 '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid u64 '{s}'")))
 }

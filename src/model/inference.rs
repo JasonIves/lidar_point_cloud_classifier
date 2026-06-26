@@ -6,6 +6,8 @@
 //! labels.  The downstream output writer uses this map to substitute the
 //! classification field while streaming the original LAS/LAZ file.
 
+#![allow(clippy::manual_is_multiple_of)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -20,8 +22,8 @@ use rayon::prelude::*;
 use crate::error::{ClassifierError, Result};
 use crate::model::pointnet::PointNetClassifier;
 use crate::preprocessing::{
-    BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION,
-    N_SCALAR_FEATURES, N_EIGEN_FEATURES_PER_RADIUS, RAYON_MIN_CHUNK,
+    BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION, N_EIGEN_FEATURES_PER_RADIUS,
+    N_SCALAR_FEATURES, RAYON_MIN_CHUNK,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,11 +56,13 @@ impl BlockInferenceResult {
         debug_assert_eq!(xs.len(), labels.len());
         let mut tree: KdTree<f64, u8, [f64; 2]> = KdTree::with_capacity(2, xs.len());
         for ((x, y), &label) in xs.iter().zip(ys.iter()).zip(labels.iter()) {
-            tree.add([*x, *y], label).map_err(|e| {
-                ClassifierError::Pipeline(format!("kd-tree insert error: {e}"))
-            })?;
+            tree.add([*x, *y], label)
+                .map_err(|e| ClassifierError::Pipeline(format!("kd-tree insert error: {e}")))?;
         }
-        Ok(Self { tree, n_points: xs.len() })
+        Ok(Self {
+            tree,
+            n_points: xs.len(),
+        })
     }
 
     /// Find the ASPRS label of the sampled point nearest to `(qx, qy)`.
@@ -94,9 +98,8 @@ struct FeatHeader {
 /// fields and leaving the reader positioned at the start of the data payload.
 fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
     let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(|e| {
-        ClassifierError::Pipeline(format!("{path_hint}: header read error: {e}"))
-    })?;
+    r.read_exact(&mut magic)
+        .map_err(|e| ClassifierError::Pipeline(format!("{path_hint}: header read error: {e}")))?;
     if &magic != FEAT_MAGIC {
         return Err(ClassifierError::Pipeline(format!(
             "{path_hint}: bad magic {magic:?} (expected {FEAT_MAGIC:?})"
@@ -110,11 +113,11 @@ fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
         )));
     }
 
-    let n_points   = read_u32_le(r)? as usize;
+    let n_points = read_u32_le(r)? as usize;
     let n_features = read_u32_le(r)? as usize;
-    let _block_id  = read_u64_le(r)?;
-    let origin_x   = read_f64_le(r)?;
-    let origin_y   = read_f64_le(r)?;
+    let _block_id = read_u64_le(r)?;
+    let origin_x = read_f64_le(r)?;
+    let origin_y = read_f64_le(r)?;
 
     // Multi-scale-aware validation (Stage 06): n_features must be
     // N_SCALAR_FEATURES + N_EIGEN_FEATURES_PER_RADIUS × n_radii, where n_radii ≥ 1.
@@ -130,7 +133,12 @@ fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
         )));
     }
 
-    Ok(FeatHeader { n_points, n_features, origin_x, origin_y })
+    Ok(FeatHeader {
+        n_points,
+        n_features,
+        origin_x,
+        origin_y,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,8 +293,8 @@ mod tests {
     // DoD #16 — nearest_label: exact hit and epsilon-offset
     #[test]
     fn test_nearest_label_exact_and_near() {
-        let xs     = vec![0.0f64, 10.0, 20.0];
-        let ys     = vec![0.0f64, 10.0, 20.0];
+        let xs = vec![0.0f64, 10.0, 20.0];
+        let ys = vec![0.0f64, 10.0, 20.0];
         let labels = vec![2u8, 5u8, 6u8];
         let result = BlockInferenceResult::from_points(&xs, &ys, &labels)
             .expect("kd-tree build must succeed");

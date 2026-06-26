@@ -124,10 +124,8 @@ fn open_reader(path: &Path) -> Result<Box<dyn PointReader>> {
     use wblidar::las::reader::LasReader;
     use wblidar::laz::reader::LazReader;
 
-    let format = LidarFormat::detect(path).map_err(|e| {
-        ClassifierError::UnsupportedFormat {
-            path: format!("{}: {e}", path.display()),
-        }
+    let format = LidarFormat::detect(path).map_err(|e| ClassifierError::UnsupportedFormat {
+        path: format!("{}: {e}", path.display()),
     })?;
 
     match format {
@@ -142,8 +140,7 @@ fn open_reader(path: &Path) -> Result<Box<dyn PointReader>> {
             Ok(Box::new(r))
         }
         LidarFormat::Copc => {
-            let r = CopcReader::open_path(path)
-                .map_err(ClassifierError::Lidar)?;
+            let r = CopcReader::open_path(path).map_err(ClassifierError::Lidar)?;
             Ok(Box::new(r))
         }
         _ => Err(ClassifierError::UnsupportedFormat {
@@ -156,19 +153,19 @@ fn open_reader(path: &Path) -> Result<Box<dyn PointReader>> {
 /// (private there) using only the public `LasReader` API.
 fn infer_writer_config(input_path: &Path) -> Result<WriterConfig> {
     use std::io::BufReader;
-    let reader = LasReader::new(BufReader::new(File::open(input_path)?))
-        .map_err(ClassifierError::Lidar)?;
+    let reader =
+        LasReader::new(BufReader::new(File::open(input_path)?)).map_err(ClassifierError::Lidar)?;
     let hdr = reader.header();
     let cfg = WriterConfig {
-        point_data_format:     hdr.point_data_format,
-        x_scale:               hdr.x_scale,
-        y_scale:               hdr.y_scale,
-        z_scale:               hdr.z_scale,
-        x_offset:              hdr.x_offset,
-        y_offset:              hdr.y_offset,
-        z_offset:              hdr.z_offset,
+        point_data_format: hdr.point_data_format,
+        x_scale: hdr.x_scale,
+        y_scale: hdr.y_scale,
+        z_scale: hdr.z_scale,
+        x_offset: hdr.x_offset,
+        y_offset: hdr.y_offset,
+        z_offset: hdr.z_offset,
         extra_bytes_per_point: hdr.extra_bytes_count,
-        crs:                   reader.crs().cloned(),
+        crs: reader.crs().cloned(),
         ..WriterConfig::default()
     };
     Ok(cfg)
@@ -218,9 +215,9 @@ mod tests {
     use crate::preprocessing::{BlockManifest, BlockMeta};
     use std::io::BufReader;
     use tempfile::NamedTempFile;
+    use wblidar::las::header::PointDataFormat;
     use wblidar::las::reader::LasReader;
     use wblidar::las::writer::{LasWriter, WriterConfig};
-    use wblidar::las::header::PointDataFormat;
 
     /// Write a minimal single-block manifest for testing.
     fn single_block_manifest(block_size: f64, origin_x: f64, origin_y: f64) -> BlockManifest {
@@ -241,6 +238,7 @@ mod tests {
             outlier_radius: 2.0,
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
+            block_overlap: 0.0,
             blocks: vec![BlockMeta {
                 id: 0,
                 file: "block_00000.feat".into(),
@@ -257,10 +255,8 @@ mod tests {
     fn write_synthetic_las(path: &Path, points: &[PointRecord]) -> Result<()> {
         let mut cfg = WriterConfig::default();
         cfg.point_data_format = PointDataFormat::Pdrf6;
-        let mut writer = LasWriter::new(
-            BufWriter::new(File::create(path)?),
-            cfg,
-        ).map_err(ClassifierError::Lidar)?;
+        let mut writer = LasWriter::new(BufWriter::new(File::create(path)?), cfg)
+            .map_err(ClassifierError::Lidar)?;
         for pt in points {
             writer.write_point(pt).map_err(ClassifierError::Lidar)?;
         }
@@ -273,10 +269,46 @@ mod tests {
     fn test_write_classified_substitutes_classification() -> Result<()> {
         // Four original points at known coordinates, all with classification=0
         let orig_pts = vec![
-            PointRecord { x: 1.0, y: 1.0, z: 10.0, intensity: 100, classification: 0, return_number: 1, number_of_returns: 1, ..PointRecord::default() },
-            PointRecord { x: 2.0, y: 2.0, z: 11.0, intensity: 200, classification: 0, return_number: 1, number_of_returns: 1, ..PointRecord::default() },
-            PointRecord { x: 3.0, y: 3.0, z: 12.0, intensity: 300, classification: 0, return_number: 1, number_of_returns: 1, ..PointRecord::default() },
-            PointRecord { x: 4.0, y: 4.0, z: 13.0, intensity: 400, classification: 0, return_number: 1, number_of_returns: 1, ..PointRecord::default() },
+            PointRecord {
+                x: 1.0,
+                y: 1.0,
+                z: 10.0,
+                intensity: 100,
+                classification: 0,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            },
+            PointRecord {
+                x: 2.0,
+                y: 2.0,
+                z: 11.0,
+                intensity: 200,
+                classification: 0,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            },
+            PointRecord {
+                x: 3.0,
+                y: 3.0,
+                z: 12.0,
+                intensity: 300,
+                classification: 0,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            },
+            PointRecord {
+                x: 4.0,
+                y: 4.0,
+                z: 13.0,
+                intensity: 400,
+                classification: 0,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            },
         ];
 
         // Write synthetic LAS input
@@ -288,7 +320,8 @@ mod tests {
             &[1.0, 2.0, 3.0, 4.0],
             &[1.0, 2.0, 3.0, 4.0],
             &[2u8, 5u8, 6u8, 3u8], // Ground, Building, Water, LowVeg
-        ).expect("kd-tree build must succeed");
+        )
+        .expect("kd-tree build must succeed");
         let mut inference_map = HashMap::new();
         inference_map.insert(0u64, inference_result);
 

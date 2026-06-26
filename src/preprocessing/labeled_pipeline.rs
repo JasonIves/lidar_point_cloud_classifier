@@ -1,6 +1,12 @@
-#![allow(clippy::missing_errors_doc, clippy::doc_markdown,
-         clippy::cast_precision_loss, clippy::cast_possible_truncation,
-         clippy::cast_sign_loss, clippy::cast_lossless, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::doc_markdown,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
 //! and emits per-block `.lbl` files alongside the existing `.feat` files.
 //!
 //! Each `.lbl` file is a raw `u8[n_points]` byte array where each byte is
@@ -114,9 +120,7 @@ impl LabeledPreprocessConfig {
 ///
 /// # Errors
 /// Returns `ClassifierError` on any I/O or format error.
-pub fn run_labeled_pipeline(
-    config: &LabeledPreprocessConfig,
-) -> Result<LabeledBlockManifest> {
+pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledBlockManifest> {
     let output_dir = &config.preprocess.output_dir;
     fs::create_dir_all(output_dir)?;
 
@@ -154,7 +158,9 @@ pub fn run_labeled_pipeline(
         let id = proc.meta.id;
 
         // Retrieve raw classification bytes for this block's raw points.
-        let Some(raw_classes) = raw_class_map.get(&id) else { continue };
+        let Some(raw_classes) = raw_class_map.get(&id) else {
+            continue;
+        };
 
         // Map sampled indices → remapped model class labels.
         let labels: Vec<u8> = proc
@@ -359,21 +365,45 @@ fn stream_classifications(
             let f = File::open(input_path)?;
             let mut reader = LasReader::new(BufReader::new(f))?;
             while reader.read_point(&mut pt)? {
-                route_point(&pt, x_min, y_min, block_size, grid_cols, grid_rows, &mut result);
+                route_point(
+                    &pt,
+                    x_min,
+                    y_min,
+                    block_size,
+                    grid_cols,
+                    grid_rows,
+                    &mut result,
+                );
             }
         }
         "laz" => {
             let f = File::open(input_path)?;
             let mut reader = LazReader::new(BufReader::new(f))?;
             while reader.read_point(&mut pt)? {
-                route_point(&pt, x_min, y_min, block_size, grid_cols, grid_rows, &mut result);
+                route_point(
+                    &pt,
+                    x_min,
+                    y_min,
+                    block_size,
+                    grid_cols,
+                    grid_rows,
+                    &mut result,
+                );
             }
         }
         "copc" => {
             use wblidar::copc::CopcReader;
             let mut reader = CopcReader::open_path(input_path)?;
             while reader.read_point(&mut pt)? {
-                route_point(&pt, x_min, y_min, block_size, grid_cols, grid_rows, &mut result);
+                route_point(
+                    &pt,
+                    x_min,
+                    y_min,
+                    block_size,
+                    grid_cols,
+                    grid_rows,
+                    &mut result,
+                );
             }
         }
         _ => {
@@ -407,8 +437,6 @@ fn route_point(
         vec.push(pt.classification);
     }
 }
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
@@ -480,15 +508,19 @@ mod tests {
                 m
             },
             spatial_tile_grid: SpatialTileGrid {
-                cols: 4, rows: 4,
-                bbox_min_x: 0.0, bbox_min_y: 0.0,
-                bbox_max_x: 400.0, bbox_max_y: 400.0,
+                cols: 4,
+                rows: 4,
+                bbox_min_x: 0.0,
+                bbox_min_y: 0.0,
+                bbox_max_x: 400.0,
+                bbox_max_y: 400.0,
             },
             blocks: vec![LabeledBlockMeta {
                 meta: BlockMeta {
                     id: 42,
                     file: "block_00042.feat".to_string(),
-                    origin_x: 100.0, origin_y: 200.0,
+                    origin_x: 100.0,
+                    origin_y: 200.0,
                     raw_point_count: 500,
                     sampled_point_count: 500,
                     oversampled: false,

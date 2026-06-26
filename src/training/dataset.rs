@@ -10,7 +10,17 @@
 //!
 //! See `docs/stages/stage-05-multi-directory-dataset.md` for full design rationale.
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_lossless, clippy::must_use_candidate, clippy::missing_errors_doc, clippy::doc_markdown)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::must_use_candidate,
+    clippy::missing_errors_doc,
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::manual_is_multiple_of
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -21,7 +31,10 @@ use ndarray::Array2;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
-use crate::preprocessing::{FEAT_MAGIC, FEAT_VERSION, N_FEATURES, n_features_for_radii, N_SCALAR_FEATURES, N_EIGEN_FEATURES_PER_RADIUS};
+use crate::preprocessing::{
+    n_features_for_radii, FEAT_MAGIC, FEAT_VERSION, N_EIGEN_FEATURES_PER_RADIUS, N_FEATURES,
+    N_SCALAR_FEATURES,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Composite block ID
@@ -77,7 +90,7 @@ pub struct LabeledBlockDataset {
     /// 12 for single-radius (backward-compatible), 7+5×N for N radii.
     n_features_inner: usize,
     pub train_ids: Vec<u64>,
-    pub val_ids:   Vec<u64>,
+    pub val_ids: Vec<u64>,
 }
 
 impl LabeledBlockDataset {
@@ -111,13 +124,10 @@ impl LabeledBlockDataset {
         for (idx, dir) in data_dirs.iter().enumerate() {
             let manifest_path = dir.join("labeled_blocks.json");
             let f = File::open(&manifest_path).map_err(|e| {
-                ClassifierError::Pipeline(format!(
-                    "cannot open {}: {e}",
-                    manifest_path.display()
-                ))
+                ClassifierError::Pipeline(format!("cannot open {}: {e}", manifest_path.display()))
             })?;
-            let manifest: LabeledBlockManifest =
-                serde_json::from_reader(BufReader::new(f)).map_err(|e| {
+            let manifest: LabeledBlockManifest = serde_json::from_reader(BufReader::new(f))
+                .map_err(|e| {
                     ClassifierError::Pipeline(format!(
                         "labeled_blocks.json parse error in {}: {e}",
                         dir.display()
@@ -144,7 +154,10 @@ impl LabeledBlockDataset {
                 _ => {}
             }
 
-            dirs.push(DirEntry { path: dir.clone(), manifest });
+            dirs.push(DirEntry {
+                path: dir.clone(),
+                manifest,
+            });
         }
 
         let n_classes_inner = validated_n_classes.unwrap_or(8);
@@ -190,7 +203,7 @@ impl LabeledBlockDataset {
             }
             // Match explicit IDs against local block IDs in each directory.
             let mut train = Vec::new();
-            let mut val   = Vec::new();
+            let mut val = Vec::new();
             for (dir_idx, entry) in dirs.iter().enumerate() {
                 for b in &entry.manifest.blocks {
                     let gid = make_global_id(dir_idx, b.meta.id);
@@ -205,10 +218,9 @@ impl LabeledBlockDataset {
         } else {
             // Independent spatial split per directory; results are concatenated.
             let mut train = Vec::new();
-            let mut val   = Vec::new();
+            let mut val = Vec::new();
             for (dir_idx, entry) in dirs.iter().enumerate() {
-                let (local_train, local_val) =
-                    spatial_split(&entry.manifest, val_split, seed);
+                let (local_train, local_val) = spatial_split(&entry.manifest, val_split, seed);
                 for id in local_train {
                     train.push(make_global_id(dir_idx, id));
                 }
@@ -222,16 +234,25 @@ impl LabeledBlockDataset {
         if dirs.len() == 1 {
             eprintln!(
                 "[dataset] train blocks: {}, val blocks: {}",
-                train_ids.len(), val_ids.len()
+                train_ids.len(),
+                val_ids.len()
             );
         } else {
             eprintln!(
                 "[dataset] {} directories — train blocks: {}, val blocks: {}",
-                dirs.len(), train_ids.len(), val_ids.len()
+                dirs.len(),
+                train_ids.len(),
+                val_ids.len()
             );
         }
 
-        Ok(Self { dirs, n_classes_inner, n_features_inner, train_ids, val_ids })
+        Ok(Self {
+            dirs,
+            n_classes_inner,
+            n_features_inner,
+            train_ids,
+            val_ids,
+        })
     }
 
     /// Return the validated common class count across all loaded directories.
@@ -306,7 +327,11 @@ impl LabeledBlockDataset {
         let n_points = features.nrows();
         let labels = load_lbl_file(&lbl_path, n_points)?;
 
-        Ok(LoadedBlock { features, labels, block_id })
+        Ok(LoadedBlock {
+            features,
+            labels,
+            block_id,
+        })
     }
 }
 
@@ -347,7 +372,7 @@ fn spatial_split(
     }
 
     let mut train = Vec::new();
-    let mut val   = Vec::new();
+    let mut val = Vec::new();
 
     for b in &manifest.blocks {
         if val_tiles.contains(&b.macro_tile_id) {
@@ -384,12 +409,14 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
     f.read_exact(&mut hdr)
         .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
 
-    let version    = hdr[0];
+    let version = hdr[0];
     // Fixed-size sub-slices of a [u8; 33] array: try_into cannot fail, but we
     // propagate as Pipeline error rather than unwrap() to satisfy the no-panics rule.
     let corrupt = || ClassifierError::Pipeline("feat: header byte slice conversion failed".into());
-    let n_points   = u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[1..5]).map_err(|_| corrupt())?) as usize;
-    let n_features = u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[5..9]).map_err(|_| corrupt())?) as usize;
+    let n_points =
+        u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[1..5]).map_err(|_| corrupt())?) as usize;
+    let n_features =
+        u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[5..9]).map_err(|_| corrupt())?) as usize;
 
     if version != FEAT_VERSION {
         return Err(ClassifierError::Pipeline(format!(
@@ -397,7 +424,9 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
         )));
     }
     // Accept any positive n_features (multi-scale or legacy 12).
-    if n_features == 0 || !matches!(n_features, f if (f - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS == 0) {
+    if n_features == 0
+        || !matches!(n_features, f if (f - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS == 0)
+    {
         return Err(ClassifierError::Pipeline(format!(
             "feat: n_features={n_features} is not a valid value (expected 7 + 5×N)"
         )));
@@ -476,10 +505,13 @@ mod tests {
 
         let (train, val) = if true {
             let mut tr = Vec::new();
-            let mut v  = Vec::new();
+            let mut v = Vec::new();
             for b in &manifest.blocks {
-                if explicit.contains(&b.meta.id) { v.push(b.meta.id); }
-                else { tr.push(b.meta.id); }
+                if explicit.contains(&b.meta.id) {
+                    v.push(b.meta.id);
+                } else {
+                    tr.push(b.meta.id);
+                }
             }
             (tr, v)
         } else {
@@ -503,7 +535,7 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
     use crate::preprocessing::labeled_pipeline::{
-        LabeledBlockMeta, LabeledBlockManifest, SpatialTileGrid,
+        LabeledBlockManifest, LabeledBlockMeta, SpatialTileGrid,
     };
     use crate::preprocessing::pipeline::BlockMeta;
     use std::collections::HashMap as HM;
@@ -537,9 +569,12 @@ mod tests {
             crs_epsg: None,
             label_map: HM::new(),
             spatial_tile_grid: SpatialTileGrid {
-                cols: 4, rows: 4,
-                bbox_min_x: 0.0, bbox_min_y: 0.0,
-                bbox_max_x: 200.0, bbox_max_y: 200.0,
+                cols: 4,
+                rows: 4,
+                bbox_min_x: 0.0,
+                bbox_min_y: 0.0,
+                bbox_max_x: 200.0,
+                bbox_max_y: 200.0,
             },
             blocks,
         }

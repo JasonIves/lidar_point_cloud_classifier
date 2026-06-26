@@ -10,11 +10,11 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod cli;
 pub mod error;
+pub mod model;
 pub mod output;
 pub mod preprocessing;
-pub mod model;
-pub mod cli;
 
 #[cfg(feature = "training")]
 pub mod training;

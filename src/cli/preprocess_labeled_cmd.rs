@@ -1,12 +1,12 @@
 //! `preprocess-labeled` sub-command — runs the labeled preprocessing pipeline.
 
-#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::error::{ClassifierError, Result};
-use crate::preprocessing::labeled_pipeline::{LabeledPreprocessConfig, run_labeled_pipeline};
+use crate::preprocessing::labeled_pipeline::{run_labeled_pipeline, LabeledPreprocessConfig};
 use crate::preprocessing::PreprocessConfig;
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -15,47 +15,97 @@ pub fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let mut input:         Option<PathBuf>   = None;
-    let mut output:        Option<PathBuf>   = None;
-    let mut block_size:    f64               = 50.0;
-    let mut target_points: usize             = 1024;
-    let mut min_density:   f64               = 1.0;
-    let mut search_radius: f64               = 1.0;
-    let mut search_radii:  Vec<f64>          = Vec::new();
-    let mut min_neighbors: usize             = 8;
-    let mut hag_model:     Option<PathBuf>   = None;
-    let mut label_map_path: Option<PathBuf>  = None;
-    let mut tile_grid:     usize             = 4;
-    let mut threads:       Option<usize>     = None;
-    let mut debug_csv:     bool              = false;
-    let mut outlier_removal:   bool  = false;
-    let mut outlier_radius:    f64   = 2.0;
-    let mut outlier_elev_diff: f64   = 50.0;
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut block_size: f64 = 50.0;
+    let mut target_points: usize = 1024;
+    let mut min_density: f64 = 1.0;
+    let mut search_radius: f64 = 1.0;
+    let mut search_radii: Vec<f64> = Vec::new();
+    let mut min_neighbors: usize = 8;
+    let mut hag_model: Option<PathBuf> = None;
+    let mut label_map_path: Option<PathBuf> = None;
+    let mut tile_grid: usize = 4;
+    let mut threads: Option<usize> = None;
+    let mut debug_csv: bool = false;
+    let mut outlier_removal: bool = false;
+    let mut outlier_radius: f64 = 2.0;
+    let mut outlier_elev_diff: f64 = 50.0;
     let mut outlier_use_median: bool = false;
+    let mut block_overlap: f64 = 0.0;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--input"          => { i += 1; input         = Some(PathBuf::from(&args[i])); }
-            "--output"         => { i += 1; output        = Some(PathBuf::from(&args[i])); }
-            "--block-size"     => { i += 1; block_size    = parse_f64(&args[i], "--block-size")?; }
-            "--target-points"  => { i += 1; target_points = parse_usize(&args[i], "--target-points")?; }
-            "--min-density"    => { i += 1; min_density   = parse_f64(&args[i], "--min-density")?; }
-            "--search-radius"  => { i += 1; search_radius = parse_f64(&args[i], "--search-radius")?; }
-            "--search-radii"   => {
+            "--input" => {
+                i += 1;
+                input = Some(PathBuf::from(&args[i]));
+            }
+            "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(&args[i]));
+            }
+            "--block-size" => {
+                i += 1;
+                block_size = parse_f64(&args[i], "--block-size")?;
+            }
+            "--target-points" => {
+                i += 1;
+                target_points = parse_usize(&args[i], "--target-points")?;
+            }
+            "--min-density" => {
+                i += 1;
+                min_density = parse_f64(&args[i], "--min-density")?;
+            }
+            "--search-radius" => {
+                i += 1;
+                search_radius = parse_f64(&args[i], "--search-radius")?;
+            }
+            "--search-radii" => {
                 i += 1;
                 search_radii = parse_radii(&args[i], "--search-radii")?;
             }
-            "--min-neighbors"  => { i += 1; min_neighbors = parse_usize(&args[i], "--min-neighbors")?; }
-            "--hag-model"      => { i += 1; hag_model     = Some(PathBuf::from(&args[i])); }
-            "--label-map"      => { i += 1; label_map_path = Some(PathBuf::from(&args[i])); }
-            "--tile-grid"      => { i += 1; tile_grid     = parse_usize(&args[i], "--tile-grid")?; }
-            "--threads"        => { i += 1; threads       = Some(parse_usize(&args[i], "--threads")?); }
-            "--debug-csv"      => { debug_csv = true; }
-            "--outlier-removal"    => { outlier_removal = true; }
-            "--outlier-radius"     => { i += 1; outlier_radius    = parse_f64(&args[i], "--outlier-radius")?; }
-            "--outlier-elev-diff"  => { i += 1; outlier_elev_diff = parse_f64(&args[i], "--outlier-elev-diff")?; }
-            "--outlier-use-median" => { outlier_use_median = true; }
+            "--min-neighbors" => {
+                i += 1;
+                min_neighbors = parse_usize(&args[i], "--min-neighbors")?;
+            }
+            "--hag-model" => {
+                i += 1;
+                hag_model = Some(PathBuf::from(&args[i]));
+            }
+            "--label-map" => {
+                i += 1;
+                label_map_path = Some(PathBuf::from(&args[i]));
+            }
+            "--tile-grid" => {
+                i += 1;
+                tile_grid = parse_usize(&args[i], "--tile-grid")?;
+            }
+            "--threads" => {
+                i += 1;
+                threads = Some(parse_usize(&args[i], "--threads")?);
+            }
+            "--debug-csv" => {
+                debug_csv = true;
+            }
+            "--outlier-removal" => {
+                outlier_removal = true;
+            }
+            "--outlier-radius" => {
+                i += 1;
+                outlier_radius = parse_f64(&args[i], "--outlier-radius")?;
+            }
+            "--outlier-elev-diff" => {
+                i += 1;
+                outlier_elev_diff = parse_f64(&args[i], "--outlier-elev-diff")?;
+            }
+            "--outlier-use-median" => {
+                outlier_use_median = true;
+            }
+            "--block-overlap" => {
+                i += 1;
+                block_overlap = parse_f64(&args[i], "--block-overlap")?;
+            }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
                     "preprocess-labeled: unknown flag '{flag}'"
@@ -65,7 +115,7 @@ pub fn run(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let input  = input.ok_or_else(|| ClassifierError::Pipeline("--input is required".into()))?;
+    let input = input.ok_or_else(|| ClassifierError::Pipeline("--input is required".into()))?;
     let output = output.ok_or_else(|| ClassifierError::Pipeline("--output is required".into()))?;
 
     // Range validation.
@@ -116,6 +166,16 @@ pub fn run(args: &[String]) -> Result<()> {
             "--outlier-elev-diff must be a non-negative finite number".to_string(),
         ));
     }
+    if block_overlap < 0.0 || !block_overlap.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--block-overlap must be >= 0.0 and finite".to_string(),
+        ));
+    }
+    if block_overlap >= block_size {
+        return Err(ClassifierError::Pipeline(
+            "--block-overlap must be less than --block-size".to_string(),
+        ));
+    }
 
     // Load label map from JSON file, or use default.
     let label_map: HashMap<u8, u8> = if let Some(ref p) = label_map_path {
@@ -145,9 +205,14 @@ pub fn run(args: &[String]) -> Result<()> {
         outlier_radius,
         outlier_elev_diff,
         outlier_use_median,
+        block_overlap,
     };
 
-    let config = LabeledPreprocessConfig { preprocess, label_map, tile_grid };
+    let config = LabeledPreprocessConfig {
+        preprocess,
+        label_map,
+        tile_grid,
+    };
     run_labeled_pipeline(&config)?;
 
     Ok(())
@@ -175,6 +240,10 @@ fn print_usage() {
            --threads       <usize>  Rayon thread pool size\n\
            --debug-csv              Also emit per-block .csv files\n\
          \n\
+         Block overlap (disabled by default):\n\
+           --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
+                                       Recommended: block-size / 2.  Must be < block-size.\n\
+         \n\
          Outlier removal (disabled by default):\n\
            --outlier-removal           Enable outlier removal pre-pass (whole-file)\n\
            --outlier-radius  <f64>     Neighbourhood radius for residual calc (default: 2.0)\n\
@@ -184,20 +253,21 @@ fn print_usage() {
 }
 
 fn parse_f64(s: &str, flag: &str) -> Result<f64> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f64 '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f64 '{s}'")))
 }
 
 fn parse_usize(s: &str, flag: &str) -> Result<usize> {
-    s.parse().map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid usize '{s}'")))
+    s.parse()
+        .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid usize '{s}'")))
 }
 
 fn parse_radii(s: &str, flag: &str) -> Result<Vec<f64>> {
     s.split(',')
         .map(|v| {
             let v = v.trim();
-            v.parse::<f64>().map_err(|_| ClassifierError::Pipeline(
-                format!("{flag}: invalid radius '{v}'")
-            ))
+            v.parse::<f64>()
+                .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid radius '{v}'")))
         })
         .collect()
 }

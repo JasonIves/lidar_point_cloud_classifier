@@ -87,6 +87,24 @@ impl BlockStub {
             points,
         })
     }
+
+    /// Read all spill files for this block **without deleting them**.
+    ///
+    /// Used by the Stage 08 border-point loader to read a neighbour block's
+    /// points as context for feature extraction.  The neighbour stub retains
+    /// ownership of its spill files and will delete them when its own `load()`
+    /// is called in the parallel closure.
+    ///
+    /// # Errors
+    /// Returns [`ClassifierError::SpillCorrupt`] if any spill file is unreadable.
+    pub fn read_points(&self) -> Result<Vec<PointRecord>> {
+        let mut points = Vec::with_capacity(self.point_count);
+        for path in &self.spill_paths {
+            let spilled = read_spill_file(path)?;
+            points.extend(spilled);
+        }
+        Ok(points)
+    }
 }
 
 /// Accumulates `PointRecord`s into 2-D grid cells with an optional spill path.
@@ -194,7 +212,8 @@ impl BlockPartitioner {
     /// Returns an error if a spill file cannot be read.
     pub fn finalize(mut self) -> Result<Vec<Block>> {
         // Collect all keys touched (in-memory or spilled).
-        let mut all_keys: std::collections::HashSet<(i32, i32)> = self.cells.keys().copied().collect();
+        let mut all_keys: std::collections::HashSet<(i32, i32)> =
+            self.cells.keys().copied().collect();
         for k in self.spill_paths.keys() {
             all_keys.insert(*k);
         }
@@ -240,11 +259,8 @@ impl BlockPartitioner {
     /// drops below half the high-water mark.
     fn spill_largest_cells(&mut self) -> Result<()> {
         // Collect (key, size) pairs and sort descending by size.
-        let mut sizes: Vec<((i32, i32), usize)> = self
-            .cells
-            .iter()
-            .map(|(k, v)| (*k, v.len()))
-            .collect();
+        let mut sizes: Vec<((i32, i32), usize)> =
+            self.cells.iter().map(|(k, v)| (*k, v.len())).collect();
         sizes.sort_unstable_by_key(|&(_, len)| std::cmp::Reverse(len));
 
         let target = SPILL_HIGH_WATER_BYTES / 2;
@@ -276,8 +292,7 @@ impl BlockPartitioner {
 
 /// Count the number of points in a spill file from its size alone (no data read).
 fn spill_point_count(path: &Path) -> usize {
-    fs::metadata(path)
-        .map_or(0, |m| m.len() as usize / PT_BYTES)
+    fs::metadata(path).map_or(0, |m| m.len() as usize / PT_BYTES)
 }
 
 /// Memory-safe finalization for large files.
@@ -326,13 +341,16 @@ impl BlockPartitioner {
         let mut stubs = Vec::with_capacity(self.spill_paths.len());
         for ((col, row), paths) in self.spill_paths.drain() {
             let point_count: usize = paths.iter().map(|p| spill_point_count(p)).sum();
-            let id = crate::preprocessing::block_id(
-                row as i64, col as i64, self.grid_cols as i64,
-            );
+            let id = crate::preprocessing::block_id(row as i64, col as i64, self.grid_cols as i64);
             let origin_x = self.x_min + col as f64 * self.block_size;
             let origin_y = self.y_min + row as f64 * self.block_size;
             stubs.push(BlockStub {
-                col, row, id, origin_x, origin_y, point_count,
+                col,
+                row,
+                id,
+                origin_x,
+                origin_y,
+                point_count,
                 spill_paths: paths,
             });
         }
@@ -388,16 +406,18 @@ fn read_spill_file(path: &Path) -> Result<Vec<PointRecord>> {
         // Each try_into converts a known-size sub-slice to a fixed-size array.
         // The slices are statically sized so this can never fail; we propagate
         // as SpillCorrupt rather than unwrap() to satisfy the no-panics rule.
-        let corrupt = || ClassifierError::SpillCorrupt { path: path.display().to_string() };
+        let corrupt = || ClassifierError::SpillCorrupt {
+            path: path.display().to_string(),
+        };
         let pt = PointRecord {
-            x:                 f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
-            y:                 f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
-            z:                 f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
-            intensity:         u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
-            classification:    buf[26],
-            return_number:     buf[27],
+            x: f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
+            y: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
+            z: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
+            intensity: u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
+            classification: buf[26],
+            return_number: buf[27],
             number_of_returns: buf[28],
-            scan_angle:        i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
+            scan_angle: i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
             ..PointRecord::default()
         };
         pts.push(pt);
@@ -412,7 +432,12 @@ mod tests {
     use super::*;
 
     fn make_pt(x: f64, y: f64) -> PointRecord {
-        PointRecord { x, y, z: 0.0, ..PointRecord::default() }
+        PointRecord {
+            x,
+            y,
+            z: 0.0,
+            ..PointRecord::default()
+        }
     }
 
     #[test]
@@ -431,10 +456,14 @@ mod tests {
         blocks.sort_by_key(|b| (b.col, b.row));
 
         assert_eq!(blocks.len(), 4);
-        assert_eq!(blocks[0].col, 0); assert_eq!(blocks[0].row, 0);
-        assert_eq!(blocks[1].col, 0); assert_eq!(blocks[1].row, 1);
-        assert_eq!(blocks[2].col, 1); assert_eq!(blocks[2].row, 0);
-        assert_eq!(blocks[3].col, 1); assert_eq!(blocks[3].row, 1);
+        assert_eq!(blocks[0].col, 0);
+        assert_eq!(blocks[0].row, 0);
+        assert_eq!(blocks[1].col, 0);
+        assert_eq!(blocks[1].row, 1);
+        assert_eq!(blocks[2].col, 1);
+        assert_eq!(blocks[2].row, 0);
+        assert_eq!(blocks[3].col, 1);
+        assert_eq!(blocks[3].row, 1);
 
         for b in &blocks {
             assert_eq!(b.points.len(), 1);

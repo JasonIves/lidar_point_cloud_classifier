@@ -52,11 +52,17 @@ mod tests {
 
         // At t=0: lr should equal lr_max
         let lr0 = sched.lr(0);
-        assert!((lr0 - 1e-3).abs() < 1e-10, "lr(0) should be lr_max, got {lr0}");
+        assert!(
+            (lr0 - 1e-3).abs() < 1e-10,
+            "lr(0) should be lr_max, got {lr0}"
+        );
 
         // At t=T: lr should be very close to lr_min (cos(π) = -1)
         let lr_t = sched.lr(100);
-        assert!((lr_t - 1e-6).abs() < 1e-10, "lr(T) should be lr_min, got {lr_t}");
+        assert!(
+            (lr_t - 1e-6).abs() < 1e-10,
+            "lr(T) should be lr_min, got {lr_t}"
+        );
 
         // At t=T/2: lr should be (lr_max + lr_min) / 2 (cos(π/2) = 0)
         let lr_half = sched.lr(50);

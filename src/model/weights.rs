@@ -34,10 +34,10 @@
 //!     bn_gamma, bn_beta, bn_mean, bn_var: f32[dim_out] each
 //! ```
 
-use std::io::{self, Read, Write};
-use std::path::Path;
 use std::fs::File;
 use std::io::BufWriter;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use ndarray::{Array1, Array2};
 
@@ -73,20 +73,44 @@ pub fn save_model(path: &Path, model: &PointNetClassifier) -> Result<()> {
     // ── Header ────────────────────────────────────────────────────────────
     w.write_all(MAGIC)?;
     write_u8(&mut w, VERSION)?;
-    write_u8(&mut w, u8::try_from(cfg.n_features_in).map_err(|_| ClassifierError::Pipeline("n_features_in exceeds u8".into()))?)?;
-    write_u8(&mut w, u8::try_from(cfg.encoder_dims.len()).map_err(|_| ClassifierError::Pipeline("encoder_dims.len() exceeds u8".into()))?)?;
-    write_u8(&mut w, u8::try_from(cfg.decoder_dims.len()).map_err(|_| ClassifierError::Pipeline("decoder_dims.len() exceeds u8".into()))?)?;
-    write_u8(&mut w, u8::try_from(cfg.n_classes).map_err(|_| ClassifierError::Pipeline("n_classes exceeds u8".into()))?)?;
+    write_u8(
+        &mut w,
+        u8::try_from(cfg.n_features_in)
+            .map_err(|_| ClassifierError::Pipeline("n_features_in exceeds u8".into()))?,
+    )?;
+    write_u8(
+        &mut w,
+        u8::try_from(cfg.encoder_dims.len())
+            .map_err(|_| ClassifierError::Pipeline("encoder_dims.len() exceeds u8".into()))?,
+    )?;
+    write_u8(
+        &mut w,
+        u8::try_from(cfg.decoder_dims.len())
+            .map_err(|_| ClassifierError::Pipeline("decoder_dims.len() exceeds u8".into()))?,
+    )?;
+    write_u8(
+        &mut w,
+        u8::try_from(cfg.n_classes)
+            .map_err(|_| ClassifierError::Pipeline("n_classes exceeds u8".into()))?,
+    )?;
     write_u8(&mut w, u8::from(cfg.use_batch_norm))?;
     write_u8(&mut w, u8::from(cfg.use_input_tnet))?;
     write_u8(&mut w, u8::from(cfg.use_feature_tnet))?;
     write_u8(&mut w, 0x00)?; // reserved
 
     for &dim in &cfg.encoder_dims {
-        write_u16(&mut w, u16::try_from(dim).map_err(|_| ClassifierError::Pipeline("encoder dim exceeds u16".into()))?)?;
+        write_u16(
+            &mut w,
+            u16::try_from(dim)
+                .map_err(|_| ClassifierError::Pipeline("encoder dim exceeds u16".into()))?,
+        )?;
     }
     for &dim in &cfg.decoder_dims {
-        write_u16(&mut w, u16::try_from(dim).map_err(|_| ClassifierError::Pipeline("decoder dim exceeds u16".into()))?)?;
+        write_u16(
+            &mut w,
+            u16::try_from(dim)
+                .map_err(|_| ClassifierError::Pipeline("decoder dim exceeds u16".into()))?,
+        )?;
     }
     w.write_all(&model.label_map)?;
 
@@ -145,14 +169,14 @@ pub fn load_model(path: &Path) -> Result<PointNetClassifier> {
         )));
     }
 
-    let n_features_in   = read_u8(&mut f)? as usize;
+    let n_features_in = read_u8(&mut f)? as usize;
     let n_encoder_layers = read_u8(&mut f)? as usize;
     let n_decoder_layers = read_u8(&mut f)? as usize;
-    let n_classes        = read_u8(&mut f)? as usize;
-    let use_batch_norm   = read_u8(&mut f)? != 0;
-    let use_input_tnet   = read_u8(&mut f)? != 0;
+    let n_classes = read_u8(&mut f)? as usize;
+    let use_batch_norm = read_u8(&mut f)? != 0;
+    let use_input_tnet = read_u8(&mut f)? != 0;
     let use_feature_tnet = read_u8(&mut f)? != 0;
-    let _reserved        = read_u8(&mut f)?;
+    let _reserved = read_u8(&mut f)?;
 
     let mut encoder_dims = Vec::with_capacity(n_encoder_layers);
     for _ in 0..n_encoder_layers {
@@ -210,9 +234,8 @@ pub fn load_model(path: &Path) -> Result<PointNetClassifier> {
     }
 
     // ── Class projection (no BN) ──────────────────────────────────────────
-    let (class_proj, _) =
-        read_layer_block(&mut f, prev_dim, n_classes, false)
-            .map_err(|e| ClassifierError::Pipeline(format!("class_proj read: {e}")))?;
+    let (class_proj, _) = read_layer_block(&mut f, prev_dim, n_classes, false)
+        .map_err(|e| ClassifierError::Pipeline(format!("class_proj read: {e}")))?;
 
     Ok(PointNetClassifier {
         config,
@@ -231,7 +254,11 @@ pub fn load_model(path: &Path) -> Result<PointNetClassifier> {
 
 fn write_tnet<W: Write>(w: &mut W, stn: &TNet, use_bn: bool) -> Result<()> {
     // 3 encoder layers + 3 FC layers; last FC has no BN
-    let enc_layers = [(&stn.enc0, &stn.bn_enc0), (&stn.enc1, &stn.bn_enc1), (&stn.enc2, &stn.bn_enc2)];
+    let enc_layers = [
+        (&stn.enc0, &stn.bn_enc0),
+        (&stn.enc1, &stn.bn_enc1),
+        (&stn.enc2, &stn.bn_enc2),
+    ];
     for (i, (linear, bn)) in enc_layers.iter().enumerate() {
         write_layer_block(w, linear, bn.as_ref(), use_bn)
             .map_err(|e| ClassifierError::Pipeline(format!("tnet enc[{i}] write: {e}")))?;
@@ -250,7 +277,7 @@ fn write_tnet<W: Write>(w: &mut W, stn: &TNet, use_bn: bool) -> Result<()> {
 fn read_tnet<R: Read>(r: &mut R, k: usize, use_bn: bool) -> Result<TNet> {
     // Encoder: Linear(k→64), Linear(64→128), Linear(128→1024)
     let enc_dims = [TNET_ENC_DIMS[0], TNET_ENC_DIMS[1], TNET_ENC_DIMS[2]];
-    let enc_in   = [k, enc_dims[0], enc_dims[1]];
+    let enc_in = [k, enc_dims[0], enc_dims[1]];
     let mut enc_layers = Vec::with_capacity(3);
     for i in 0..3 {
         let (linear, bn) = read_layer_block(r, enc_in[i], enc_dims[i], use_bn)
@@ -259,8 +286,8 @@ fn read_tnet<R: Read>(r: &mut R, k: usize, use_bn: bool) -> Result<TNet> {
     }
 
     // FC: Linear(1024→512), Linear(512→256), Linear(256→k²)  [last has no BN]
-    let fc_in   = [TNET_ENC_DIMS[2], TNET_FC_DIMS[0], TNET_FC_DIMS[1]];
-    let fc_out  = [TNET_FC_DIMS[0],  TNET_FC_DIMS[1], k * k];
+    let fc_in = [TNET_ENC_DIMS[2], TNET_FC_DIMS[0], TNET_FC_DIMS[1]];
+    let fc_out = [TNET_FC_DIMS[0], TNET_FC_DIMS[1], k * k];
     let mut fc_layers = Vec::with_capacity(3);
     for i in 0..3 {
         let has_bn_here = use_bn && i < 2; // no BN on last FC
@@ -269,16 +296,24 @@ fn read_tnet<R: Read>(r: &mut R, k: usize, use_bn: bool) -> Result<TNet> {
         fc_layers.push((linear, bn));
     }
 
-    let [(enc0, bn_enc0), (enc1, bn_enc1), (enc2, bn_enc2)] =
-        <[_; 3]>::try_from(enc_layers)
-            .map_err(|_| ClassifierError::Pipeline("tnet enc layer count mismatch".into()))?;
-    let [(fc0, bn_fc0), (fc1, bn_fc1), (fc2, _)] =
-        <[_; 3]>::try_from(fc_layers)
-            .map_err(|_| ClassifierError::Pipeline("tnet fc layer count mismatch".into()))?;
+    let [(enc0, bn_enc0), (enc1, bn_enc1), (enc2, bn_enc2)] = <[_; 3]>::try_from(enc_layers)
+        .map_err(|_| ClassifierError::Pipeline("tnet enc layer count mismatch".into()))?;
+    let [(fc0, bn_fc0), (fc1, bn_fc1), (fc2, _)] = <[_; 3]>::try_from(fc_layers)
+        .map_err(|_| ClassifierError::Pipeline("tnet fc layer count mismatch".into()))?;
 
     Ok(TNet {
-        k, enc0, enc1, enc2, bn_enc0, bn_enc1, bn_enc2,
-        fc0, fc1, fc2, bn_fc0, bn_fc1,
+        k,
+        enc0,
+        enc1,
+        enc2,
+        bn_enc0,
+        bn_enc1,
+        bn_enc2,
+        fc0,
+        fc1,
+        fc2,
+        bn_fc0,
+        bn_fc1,
     })
 }
 
@@ -324,9 +359,9 @@ fn read_layer_block<R: Read>(
 
     let bn = if read_bn {
         let gamma = Array1::from_vec(read_f32_vec(r, dim_out)?);
-        let beta  = Array1::from_vec(read_f32_vec(r, dim_out)?);
-        let mean  = Array1::from_vec(read_f32_vec(r, dim_out)?);
-        let var   = Array1::from_vec(read_f32_vec(r, dim_out)?);
+        let beta = Array1::from_vec(read_f32_vec(r, dim_out)?);
+        let mean = Array1::from_vec(read_f32_vec(r, dim_out)?);
+        let var = Array1::from_vec(read_f32_vec(r, dim_out)?);
         Some(BatchNorm1d::new(gamma, beta, mean, var)?)
     } else {
         None
@@ -402,22 +437,31 @@ mod tests {
         // Encoder layer 0: Linear(12→16)
         let enc0_w: Vec<f32> = (0..16 * 12).map(|i| i as f32 * 0.001).collect();
         let enc0 = (
-            Linear::new(Array2::from_shape_vec((16, 12), enc0_w).unwrap(),
-                        Array1::from_vec(vec![0.1f32; 16])).unwrap(),
+            Linear::new(
+                Array2::from_shape_vec((16, 12), enc0_w).unwrap(),
+                Array1::from_vec(vec![0.1f32; 16]),
+            )
+            .unwrap(),
             None,
         );
         // Encoder layer 1: Linear(16→32)
         let enc1_w: Vec<f32> = (0..32 * 16).map(|i| i as f32 * 0.001).collect();
         let enc1 = (
-            Linear::new(Array2::from_shape_vec((32, 16), enc1_w).unwrap(),
-                        Array1::from_vec(vec![-0.1f32; 32])).unwrap(),
+            Linear::new(
+                Array2::from_shape_vec((32, 16), enc1_w).unwrap(),
+                Array1::from_vec(vec![-0.1f32; 32]),
+            )
+            .unwrap(),
             None,
         );
         // Decoder layer: Linear(16+32=48 → 24)
         let dec0_w: Vec<f32> = (0..24 * 48).map(|i| i as f32 * 0.001).collect();
         let dec0 = (
-            Linear::new(Array2::from_shape_vec((24, 48), dec0_w).unwrap(),
-                        Array1::zeros(24)).unwrap(),
+            Linear::new(
+                Array2::from_shape_vec((24, 48), dec0_w).unwrap(),
+                Array1::zeros(24),
+            )
+            .unwrap(),
             None,
         );
         // Class projection: Linear(24→4)
@@ -425,7 +469,8 @@ mod tests {
         let class_proj = Linear::new(
             Array2::from_shape_vec((4, 24), proj_w).unwrap(),
             Array1::zeros(4),
-        ).unwrap();
+        )
+        .unwrap();
 
         PointNetClassifier {
             config,

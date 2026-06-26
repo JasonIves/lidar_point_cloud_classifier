@@ -21,7 +21,7 @@ fn run() -> lidar_point_cloud_classifier::Result<()> {
 
     match args[1].as_str() {
         "preprocess-labeled" => preprocess_labeled_cmd::run(&args[2..]),
-        "train"              => train_cmd::run(&args[2..]),
+        "train" => train_cmd::run(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())

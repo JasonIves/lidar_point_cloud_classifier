@@ -124,6 +124,20 @@ pub struct PreprocessConfig {
 
     /// Use neighbourhood median instead of mean for the baseline Z.
     pub outlier_use_median: bool,
+
+    // ── Block overlap (Stage 08) ──────────────────────────────────────────
+    /// Overlap radius in projection units added to each block's k-d tree context.
+    ///
+    /// Border points from adjacent blocks that fall within this radius of the
+    /// block boundary are included during feature extraction to eliminate the
+    /// spatial edge effect at block seams.  They are **never** resampled or
+    /// written to `.feat` files — only canonical block points appear in output.
+    ///
+    /// - `0.0` (default) — disabled; behaviour identical to Stage 01–07.
+    /// - Recommended: `block_size / 2` — fully covers any neighbourhood radius
+    ///   ≤ `block_size / 2`.
+    /// - Constraint: `0.0 ≤ block_overlap < block_size`.
+    pub block_overlap: f64,
 }
 
 impl Default for PreprocessConfig {
@@ -144,6 +158,7 @@ impl Default for PreprocessConfig {
             outlier_radius: 2.0,
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
+            block_overlap: 0.0,
         }
     }
 }

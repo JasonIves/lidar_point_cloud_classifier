@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use wblidar::PointRecord;
 
+use std::collections::HashMap;
+
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::{
     block_partitioner::{BlockPartitioner, BlockStub},
@@ -75,6 +77,10 @@ pub struct BlockManifest {
     /// Whether median (true) or mean (false) was used for the neighbourhood baseline.
     #[serde(default)]
     pub outlier_use_median: bool,
+    /// Overlap radius (projection units) used for border-point augmentation.
+    /// `0.0` means no overlap (default, backward-compatible).
+    #[serde(default)]
+    pub block_overlap: f64,
     pub blocks: Vec<BlockMeta>,
 }
 
@@ -183,7 +189,9 @@ impl PreprocessingPipeline {
             );
             eprintln!(
                 "[preprocessing] outlier removal: {} → {} points ({} removed)",
-                raw.len(), filtered.len(), raw.len().saturating_sub(filtered.len())
+                raw.len(),
+                filtered.len(),
+                raw.len().saturating_sub(filtered.len())
             );
             Some(filtered)
         } else {
@@ -203,13 +211,8 @@ impl PreprocessingPipeline {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let grid_rows = (((y_max - y_min) / config.block_size).ceil() as u32).max(1);
 
-        eprintln!(
-            "[preprocessing] input:  {}",
-            input_path.display()
-        );
-        eprintln!(
-            "[preprocessing] extent: ({x_min:.2}, {y_min:.2}) → ({x_max:.2}, {y_max:.2})"
-        );
+        eprintln!("[preprocessing] input:  {}", input_path.display());
+        eprintln!("[preprocessing] extent: ({x_min:.2}, {y_min:.2}) → ({x_max:.2}, {y_max:.2})");
         eprintln!("[preprocessing] grid: {grid_cols} cols × {grid_rows} rows");
         eprintln!("[preprocessing] points: {total_points}");
 
@@ -258,61 +261,141 @@ impl PreprocessingPipeline {
             retained.len()
         );
 
+        // ── 5b. Build cell-lookup map for border-point loading (Stage 08) ──
+        // Maps (col, row) → index into `retained` so the border-point loader
+        // can find neighbour stubs without holding a mutable reference.
+        // Only built when overlap is enabled to avoid the allocation overhead
+        // on the default (overlap = 0) path.
+        let stubs_by_cell: HashMap<(i32, i32), usize> = if config.block_overlap > 0.0 {
+            retained
+                .iter()
+                .enumerate()
+                .map(|(i, s)| ((s.col, s.row), i))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // ── 5c. Pre-load border points sequentially (Stage 08) ────────────
+        // All spill files still exist at this point — no `load()` calls have
+        // happened yet — so reading neighbour spill files here is race-free.
+        // The resulting Vecs are zipped with `retained` in the parallel phase.
+        // When overlap is disabled this is a zero-cost `vec![Vec::new(); n]`.
+        let border_points_per_block: Vec<Vec<wblidar::PointRecord>> = if config.block_overlap > 0.0
+        {
+            retained
+                .iter()
+                .map(|stub| {
+                    load_border_points(
+                        &stubs_by_cell,
+                        &retained,
+                        stub,
+                        config.block_size,
+                        config.block_overlap,
+                    )
+                    .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            vec![Vec::new(); retained.len()]
+        };
+
         // ── 6. Optionally load the DTM raster ─────────────────────────────
         let dtm: Option<Arc<DtmView>> = config
             .hag_model
             .as_ref()
             .map(|path| -> Result<Arc<DtmView>> {
                 let r = wbraster::Raster::read(path).map_err(|e| {
-                    ClassifierError::Raster(format!(
-                        "failed to load DTM '{}': {e}",
-                        path.display()
-                    ))
+                    ClassifierError::Raster(format!("failed to load DTM '{}': {e}", path.display()))
                 })?;
                 Ok(Arc::new(DtmView::from_raster(&r)))
             })
             .transpose()?;
 
         // ── 7. Per-block parallel processing ─────────────────────────────
+        // Zip each stub with its pre-loaded border points so the closure can
+        // build an augmented k-d tree without touching neighbour spill files
+        // (which may have been deleted by a concurrent `load()` call).
         let block_results: Vec<Result<BlockProcessResult>> = retained
             .into_par_iter()
+            .zip(border_points_per_block.into_par_iter())
             .with_min_len(RAYON_MIN_CHUNK)
-            .map(|stub| {
+            .map(|(stub, border_pts)| {
                 let dtm_ref = dtm.as_deref();
 
                 // Capture metadata before consuming the stub.
                 let raw_count = stub.point_count;
-                let block_id  = stub.id;
-                let origin_x  = stub.origin_x;
-                let origin_y  = stub.origin_y;
+                let block_id = stub.id;
+                let origin_x = stub.origin_x;
+                let origin_y = stub.origin_y;
 
                 // Load point data from spill files for this block only.
                 // `block.points` is dropped at the end of this closure so
                 // peak memory stays at (thread_count × largest_block_size).
                 let block = stub.load()?;
 
-                // (a) Build k-d tree from full unsampled block
-                let index = BlockSpatialIndex::build(&block.points);
+                // (a) Build augmented k-d tree.
+                //     When overlap is enabled, border_pts contains neighbour
+                //     points that fall within the overlap radius of this block's
+                //     boundary.  They are included in the spatial index so that
+                //     eigenvalue features near block edges use real neighbour
+                //     context rather than a truncated neighbourhood.
+                //     Border points are NEVER resampled or written to .feat files.
+                let index = if border_pts.is_empty() {
+                    BlockSpatialIndex::build(&block.points)
+                } else {
+                    // Merge canonical + border into a single contiguous Vec for
+                    // the index.  The canonical points come first so that their
+                    // indices are stable for the resampling step below.
+                    let mut all_pts = block.points.clone();
+                    all_pts.extend_from_slice(&border_pts);
+                    BlockSpatialIndex::build(&all_pts)
+                };
 
-                // (b) Density-gated sampling — now returns indices too
+                // (b) Density-gated sampling — now returns indices too.
+                //     Sampling is always performed on canonical block points only;
+                //     border points are context-only and must not appear in output.
                 let (sampled, sampled_indices, oversampled) =
                     resample_block(&block.points, config.target_points, block_id);
 
                 let sampled_count = sampled.len();
 
-                // (c–e) Extract all features (multi-scale or single-scale)
+                // (c–e) Extract all features (multi-scale or single-scale).
+                //     When overlap is active we pass the merged canonical+border
+                //     Vec as the neighbourhood context so that eigenvalue queries
+                //     near block edges draw on real neighbour points.
+                //     When overlap is disabled we pass canonical points only —
+                //     identical to the pre-Stage-08 behaviour.
                 let search_radii = config.search_radii_effective();
-                let features = extract_features(
-                    &sampled,
-                    &block.points,
-                    &index,
-                    dtm_ref,
-                    origin_x,
-                    origin_y,
-                    config.block_size,
-                    &search_radii,
-                    config.min_neighbors,
-                );
+                let features = if border_pts.is_empty() {
+                    extract_features(
+                        &sampled,
+                        &block.points,
+                        &index,
+                        dtm_ref,
+                        origin_x,
+                        origin_y,
+                        config.block_size,
+                        &search_radii,
+                        config.min_neighbors,
+                    )
+                } else {
+                    // Rebuild the merged context slice.  border_pts is small
+                    // (overlap strip only) so this allocation is cheap.
+                    let mut ctx = block.points.clone();
+                    ctx.extend_from_slice(&border_pts);
+                    extract_features(
+                        &sampled,
+                        &ctx,
+                        &index,
+                        dtm_ref,
+                        origin_x,
+                        origin_y,
+                        config.block_size,
+                        &search_radii,
+                        config.min_neighbors,
+                    )
+                };
                 let n_features = features.first().map_or(0, Vec::len);
 
                 // (f) Serialise to .feat
@@ -345,9 +428,16 @@ impl PreprocessingPipeline {
                 };
 
                 // Only allocate the indices vec when caller wants them.
-                let indices = if capture_indices { sampled_indices } else { Vec::new() };
+                let indices = if capture_indices {
+                    sampled_indices
+                } else {
+                    Vec::new()
+                };
 
-                Ok(BlockProcessResult { meta, sampled_indices: indices })
+                Ok(BlockProcessResult {
+                    meta,
+                    sampled_indices: indices,
+                })
             })
             .collect();
 
@@ -381,6 +471,7 @@ impl PreprocessingPipeline {
             outlier_radius: config.outlier_radius,
             outlier_elev_diff: config.outlier_elev_diff,
             outlier_use_median: config.outlier_use_median,
+            block_overlap: config.block_overlap,
             blocks: block_metas,
         };
 
@@ -401,9 +492,7 @@ impl PreprocessingPipeline {
 /// For both LAS and LAZ, the LAS header lives at the start of the file and is
 /// read via `LasReader::new` (no points are decoded).  For COPC, the dedicated
 /// `CopcReader::open_path` is used.
-fn inspect_lidar_header(
-    path: &Path,
-) -> Result<(f64, f64, f64, f64, u64, Option<u32>)> {
+fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, u64, Option<u32>)> {
     use std::fs::File;
     use std::io::BufReader;
     use wblidar::las::LasReader;
@@ -422,11 +511,7 @@ fn inspect_lidar_header(
             let reader = LasReader::new(BufReader::new(f))?;
             let h = reader.header();
             let epsg = reader.crs().and_then(|c| c.epsg);
-            Ok((
-                h.min_x, h.min_y, h.max_x, h.max_y,
-                h.point_count(),
-                epsg,
-            ))
+            Ok((h.min_x, h.min_y, h.max_x, h.max_y, h.point_count(), epsg))
         }
         "copc" => {
             // COPC files carry a standard LAS header; use LasReader for header
@@ -435,11 +520,7 @@ fn inspect_lidar_header(
             let reader = LasReader::new(BufReader::new(f))?;
             let h = reader.header();
             let epsg = reader.crs().and_then(|c| c.epsg);
-            Ok((
-                h.min_x, h.min_y, h.max_x, h.max_y,
-                h.point_count(),
-                epsg,
-            ))
+            Ok((h.min_x, h.min_y, h.max_x, h.max_y, h.point_count(), epsg))
         }
         _ => Err(ClassifierError::UnsupportedFormat {
             path: path.display().to_string(),
@@ -610,10 +691,21 @@ fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> 
 
     // Build dynamic header.
     let mut cols = vec![
-        "x_norm", "y_norm", "z_norm", "intensity_norm",
-        "return_ratio", "scan_angle_norm", "hag",
+        "x_norm",
+        "y_norm",
+        "z_norm",
+        "intensity_norm",
+        "return_ratio",
+        "scan_angle_norm",
+        "hag",
     ];
-    let eigen_names = ["linearity", "planarity", "sphericity", "omnivariance", "curvature"];
+    let eigen_names = [
+        "linearity",
+        "planarity",
+        "sphericity",
+        "omnivariance",
+        "curvature",
+    ];
     let mut extra: Vec<String> = Vec::new();
     for r in search_radii {
         for name in &eigen_names {
@@ -625,10 +717,168 @@ fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> 
     writeln!(w, "{}", cols.join(","))?;
 
     for row in features {
-        let line = row.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+        let line = row
+            .iter()
+            .map(|v| format!("{v:.6}"))
+            .collect::<Vec<_>>()
+            .join(",");
         writeln!(w, "{line}")?;
     }
 
     w.flush()?;
     Ok(())
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── BlockManifest serde round-trip ────────────────────────────────────────
+
+    /// Verify that `block_overlap` survives a JSON round-trip and that an older
+    /// manifest without the field deserialises to `0.0` (backward-compatible).
+    #[test]
+    fn test_manifest_block_overlap_round_trip() {
+        let manifest = BlockManifest {
+            source: "test.las".to_string(),
+            block_size: 50.0,
+            target_points: 1024,
+            min_density: 1.0,
+            search_radius: 1.0,
+            min_neighbors: 8,
+            crs_epsg: None,
+            grid_cols: 4,
+            grid_rows: 4,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
+            search_radii: vec![],
+            outlier_removal: false,
+            outlier_radius: 2.0,
+            outlier_elev_diff: 50.0,
+            outlier_use_median: false,
+            block_overlap: 12.5,
+            blocks: vec![],
+        };
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            json.contains("\"block_overlap\":12.5"),
+            "field missing from JSON"
+        );
+
+        let de: BlockManifest = serde_json::from_str(&json).unwrap();
+        assert!((de.block_overlap - 12.5).abs() < 1e-9);
+    }
+
+    /// Older `blocks.json` files that pre-date Stage 08 lack `block_overlap`.
+    /// Deserialisation must succeed and default to `0.0`.
+    #[test]
+    fn test_manifest_block_overlap_default_on_missing() {
+        // Minimal JSON without block_overlap field.
+        let json = r#"{
+            "source": "old.las",
+            "block_size": 50.0,
+            "target_points": 1024,
+            "min_density": 1.0,
+            "search_radius": 1.0,
+            "min_neighbors": 8,
+            "crs_epsg": null,
+            "blocks": []
+        }"#;
+
+        let de: BlockManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(de.block_overlap, 0.0, "missing field should default to 0.0");
+    }
+
+    // ── load_border_points geometry ───────────────────────────────────────────
+
+    /// `load_border_points` with an empty `stubs_by_cell` map (overlap disabled
+    /// path) must return an empty Vec without error.
+    #[test]
+    fn test_load_border_points_no_neighbours() {
+        use std::collections::HashMap;
+        use wblidar::PointRecord;
+
+        let stubs_by_cell: HashMap<(i32, i32), usize> = HashMap::new();
+        let all_stubs: Vec<crate::preprocessing::block_partitioner::BlockStub> = vec![];
+
+        // Build a real stub via BlockPartitioner so we have a valid target.
+        let dir = tempfile::tempdir().unwrap();
+        use crate::preprocessing::block_partitioner::BlockPartitioner;
+        let mut partitioner = BlockPartitioner::new(0.0, 0.0, 50.0, 50.0, 50.0, dir.path());
+        let mut pt = PointRecord::default();
+        pt.x = 25.0;
+        pt.y = 25.0;
+        pt.z = 10.0;
+        partitioner.add_point(pt).unwrap();
+        let stubs = partitioner.finalize_stubs().unwrap();
+        assert_eq!(stubs.len(), 1);
+
+        // With an empty stubs_by_cell every neighbour lookup misses → empty border.
+        let target = &stubs[0];
+        let result = load_border_points(&stubs_by_cell, &all_stubs, target, 50.0, 5.0).unwrap();
+        assert!(result.is_empty(), "no neighbours → empty border");
+    }
+
+    // ── CLI validation ────────────────────────────────────────────────────────
+
+    /// `block_overlap` defaults to `0.0` in `PreprocessConfig`.
+    #[test]
+    fn test_preprocess_config_default_overlap() {
+        let cfg = crate::preprocessing::PreprocessConfig::default();
+        assert_eq!(cfg.block_overlap, 0.0);
+    }
+}
+
+// ── Stage 08: border-point loader ────────────────────────────────────────────
+
+/// Collect points from the up-to-8 grid neighbours of `target` that fall
+/// within the expanded bounding box `[origin - overlap, origin + block_size + overlap]`.
+///
+/// This function is called **sequentially** before the Rayon parallel phase so
+/// that all spill files are guaranteed to exist (no concurrent `load()` calls
+/// have deleted them yet).  The returned `Vec<PointRecord>` is then zipped with
+/// the stub in the parallel closure and used to augment the k-d tree context.
+///
+/// Points that belong to the target block itself are not included — only
+/// genuine cross-boundary neighbours are returned.
+fn load_border_points(
+    stubs_by_cell: &HashMap<(i32, i32), usize>,
+    all_stubs: &[BlockStub],
+    target: &BlockStub,
+    block_size: f64,
+    overlap: f64,
+) -> Result<Vec<PointRecord>> {
+    // Expanded bounding box of the target block in projection units.
+    let x_lo = target.origin_x - overlap;
+    let x_hi = target.origin_x + block_size + overlap;
+    let y_lo = target.origin_y - overlap;
+    let y_hi = target.origin_y + block_size + overlap;
+
+    let mut border: Vec<PointRecord> = Vec::new();
+
+    // Iterate over all 8 cardinal + diagonal neighbours.
+    for dc in -1_i32..=1 {
+        for dr in -1_i32..=1 {
+            if dc == 0 && dr == 0 {
+                continue; // skip the target block itself
+            }
+            let key = (target.col + dc, target.row + dr);
+            if let Some(&idx) = stubs_by_cell.get(&key) {
+                let neighbour = &all_stubs[idx];
+                // Read neighbour spill files without deleting them.
+                let pts = neighbour.read_points()?;
+                for pt in pts {
+                    // Keep only points that fall inside the expanded bbox.
+                    if pt.x >= x_lo && pt.x <= x_hi && pt.y >= y_lo && pt.y <= y_hi {
+                        border.push(pt);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(border)
 }

@@ -3,7 +3,13 @@
 //! All counters are `u64` to avoid overflow on large regional datasets.
 //! Absent classes (`TP+FP+FN == 0`) are excluded from mIoU and `F1_macro` averages.
 
-#![allow(clippy::must_use_candidate, clippy::missing_errors_doc, clippy::cast_precision_loss, clippy::cast_lossless, clippy::doc_markdown)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::missing_errors_doc,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    clippy::doc_markdown
+)]
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -112,11 +118,11 @@ impl MetricsAccumulator {
         let mut tp_total = 0u64;
 
         for c in 0..self.n_classes {
-            let tp  = self.tp[c];
-            let fp  = self.fp[c];
+            let tp = self.tp[c];
+            let fp = self.fp[c];
             let fn_ = self.fn_[c];
             // TN = all points not involved in a TP/FP/FN for this class.
-            let tn  = self.total_points.saturating_sub(tp + fp + fn_);
+            let tn = self.total_points.saturating_sub(tp + fp + fn_);
             tp_total += tp;
 
             let denom_iou = tp + fp + fn_;
@@ -125,15 +131,29 @@ impl MetricsAccumulator {
                 // Class absent from validation set — exclude from averages.
                 per_class.push(ClassMetrics {
                     class_idx: c,
-                    tp, fp, tn, r#fn: fn_,
-                    iou: 0.0, precision: 0.0, recall: 0.0, f1: 0.0,
+                    tp,
+                    fp,
+                    tn,
+                    r#fn: fn_,
+                    iou: 0.0,
+                    precision: 0.0,
+                    recall: 0.0,
+                    f1: 0.0,
                 });
                 continue;
             }
 
-            let iou       = tp as f64 / denom_iou as f64;
-            let precision = if tp + fp  == 0 { 0.0 } else { tp as f64 / (tp + fp)  as f64 };
-            let recall    = if tp + fn_ == 0 { 0.0 } else { tp as f64 / (tp + fn_) as f64 };
+            let iou = tp as f64 / denom_iou as f64;
+            let precision = if tp + fp == 0 {
+                0.0
+            } else {
+                tp as f64 / (tp + fp) as f64
+            };
+            let recall = if tp + fn_ == 0 {
+                0.0
+            } else {
+                tp as f64 / (tp + fn_) as f64
+            };
             let f1 = if precision + recall < 1e-12 {
                 0.0
             } else {
@@ -141,19 +161,58 @@ impl MetricsAccumulator {
             };
 
             iou_sum += iou;
-            f1_sum  += f1;
+            f1_sum += f1;
             present += 1;
 
-            per_class.push(ClassMetrics { class_idx: c, tp, fp, tn, r#fn: fn_, iou, precision, recall, f1 });
+            per_class.push(ClassMetrics {
+                class_idx: c,
+                tp,
+                fp,
+                tn,
+                r#fn: fn_,
+                iou,
+                precision,
+                recall,
+                f1,
+            });
         }
 
-        let miou             = if present == 0 { 0.0 } else { iou_sum / present as f64 };
-        let f1_macro         = if present == 0 { 0.0 } else { f1_sum  / present as f64 };
-        let overall_accuracy = if self.total_points == 0 { 0.0 } else { tp_total as f64 / self.total_points as f64 };
-        let val_loss         = if self.loss_count == 0 { 0.0 } else { self.loss_sum / self.loss_count as f64 };
-        let val_loss_weighted = if self.loss_weighted_count == 0 { val_loss } else { self.loss_weighted_sum / self.loss_weighted_count as f64 };
+        let miou = if present == 0 {
+            0.0
+        } else {
+            iou_sum / present as f64
+        };
+        let f1_macro = if present == 0 {
+            0.0
+        } else {
+            f1_sum / present as f64
+        };
+        let overall_accuracy = if self.total_points == 0 {
+            0.0
+        } else {
+            tp_total as f64 / self.total_points as f64
+        };
+        let val_loss = if self.loss_count == 0 {
+            0.0
+        } else {
+            self.loss_sum / self.loss_count as f64
+        };
+        let val_loss_weighted = if self.loss_weighted_count == 0 {
+            val_loss
+        } else {
+            self.loss_weighted_sum / self.loss_weighted_count as f64
+        };
 
-        EpochMetrics { epoch, train_loss, val_loss, val_loss_weighted, miou, overall_accuracy, f1_macro, per_class }
+        EpochMetrics {
+            epoch,
+            train_loss,
+            val_loss,
+            val_loss_weighted,
+            miou,
+            overall_accuracy,
+            f1_macro,
+            per_class,
+        }
     }
 
     /// Return the confusion matrix as a 2D vec (rows=true, cols=predicted).
@@ -182,30 +241,40 @@ pub fn append_metrics_csv(path: &Path, m: &EpochMetrics) -> std::io::Result<()> 
 
     if new_run {
         // Header: global fields then 8 per-class columns for each class.
-        write!(w, "epoch,train_loss,val_loss_uw,val_loss_w,val_miou,val_oa,f1_macro")?;
+        write!(
+            w,
+            "epoch,train_loss,val_loss_uw,val_loss_w,val_miou,val_oa,f1_macro"
+        )?;
         for c in 0..m.per_class.len() {
             write!(w, ",tp_cls_{c},fp_cls_{c},tn_cls_{c},fn_cls_{c},prec_cls_{c},rec_cls_{c},f1_cls_{c},iou_cls_{c}")?;
         }
         writeln!(w)?;
     }
 
-    write!(w, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-        m.epoch, m.train_loss, m.val_loss, m.val_loss_weighted,
-        m.miou, m.overall_accuracy, m.f1_macro)?;
+    write!(
+        w,
+        "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+        m.epoch,
+        m.train_loss,
+        m.val_loss,
+        m.val_loss_weighted,
+        m.miou,
+        m.overall_accuracy,
+        m.f1_macro
+    )?;
     for cm in &m.per_class {
-        write!(w, ",{},{},{},{},{:.6},{:.6},{:.6},{:.6}",
-            cm.tp, cm.fp, cm.tn, cm.r#fn,
-            cm.precision, cm.recall, cm.f1, cm.iou)?;
+        write!(
+            w,
+            ",{},{},{},{},{:.6},{:.6},{:.6},{:.6}",
+            cm.tp, cm.fp, cm.tn, cm.r#fn, cm.precision, cm.recall, cm.f1, cm.iou
+        )?;
     }
     writeln!(w)?;
     w.flush()
 }
 
 /// Write the confusion matrix to a CSV file.
-pub fn write_confusion_matrix_csv(
-    path: &Path,
-    matrix: &[Vec<u64>],
-) -> std::io::Result<()> {
+pub fn write_confusion_matrix_csv(path: &Path, matrix: &[Vec<u64>]) -> std::io::Result<()> {
     let f = std::fs::File::create(path)?;
     let mut w = BufWriter::new(f);
     for row in matrix {
@@ -237,20 +306,34 @@ mod tests {
         let mut acc = MetricsAccumulator::new(3);
 
         // Simulate TP[0]=10
-        for _ in 0..10 { acc.accumulate(&[0], &[0]); }
+        for _ in 0..10 {
+            acc.accumulate(&[0], &[0]);
+        }
         // Simulate FP[0]=2 (pred=0, gt=1)
-        for _ in 0..2 { acc.accumulate(&[0], &[1]); }
+        for _ in 0..2 {
+            acc.accumulate(&[0], &[1]);
+        }
         // Simulate FN[0]=3 (pred=1, gt=0)
-        for _ in 0..3 { acc.accumulate(&[1], &[0]); }
+        for _ in 0..3 {
+            acc.accumulate(&[1], &[0]);
+        }
         // Simulate TP[1]=5
-        for _ in 0..5 { acc.accumulate(&[1], &[1]); }
+        for _ in 0..5 {
+            acc.accumulate(&[1], &[1]);
+        }
         // FP[1] not needed separately; already accounted for via FN[0]
         // Simulate FN[1]=4 (pred=2, gt=1)
-        for _ in 0..4 { acc.accumulate(&[2], &[1]); }
+        for _ in 0..4 {
+            acc.accumulate(&[2], &[1]);
+        }
         // TP[2]=8
-        for _ in 0..8 { acc.accumulate(&[2], &[2]); }
+        for _ in 0..8 {
+            acc.accumulate(&[2], &[2]);
+        }
         // FN[2]=2 (pred=0, gt=2)
-        for _ in 0..2 { acc.accumulate(&[0], &[2]); }
+        for _ in 0..2 {
+            acc.accumulate(&[0], &[2]);
+        }
 
         let m = acc.compute(1, 0.0);
         // Class 0: TP=10, FP=2+2=4 (pred=0 when gt=1 × 2, pred=0 when gt=2 × 2), FN=3
@@ -264,7 +347,9 @@ mod tests {
     fn test_miou_absent_class_excluded() {
         let mut acc = MetricsAccumulator::new(3);
         // Only class 0 has any predictions
-        for _ in 0..5 { acc.accumulate(&[0], &[0]); }
+        for _ in 0..5 {
+            acc.accumulate(&[0], &[0]);
+        }
         let m = acc.compute(1, 0.0);
         // Class 1 and 2 are absent → should be excluded from miou
         // miou should equal IoU of class 0 alone
@@ -276,7 +361,7 @@ mod tests {
     fn test_confusion_matrix_shape() {
         // 4-point prediction set, 3 classes
         let preds = vec![0u8, 1, 2, 0];
-        let gts   = vec![0u8, 1, 1, 2];
+        let gts = vec![0u8, 1, 1, 2];
         let mut acc = MetricsAccumulator::new(3);
         acc.accumulate(&preds, &gts);
         let cm = acc.confusion_matrix();
@@ -312,7 +397,9 @@ mod tests {
 
     #[test]
     fn test_spatial_split_fraction() {
-        use crate::preprocessing::labeled_pipeline::{LabeledBlockMeta, LabeledBlockManifest, SpatialTileGrid};
+        use crate::preprocessing::labeled_pipeline::{
+            LabeledBlockManifest, LabeledBlockMeta, SpatialTileGrid,
+        };
         use crate::preprocessing::pipeline::BlockMeta;
         use std::collections::HashMap;
 

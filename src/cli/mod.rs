@@ -26,7 +26,7 @@ pub fn run() -> Result<()> {
 
     match args[1].as_str() {
         "preprocess" => preprocess_cmd::run(&args[2..]),
-        "classify"   => classify_cmd::run(&args[2..]),
+        "classify" => classify_cmd::run(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())

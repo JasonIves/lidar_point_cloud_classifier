@@ -67,9 +67,15 @@ pub fn run(args: &[String]) -> Result<()> {
         .to_path_buf();
 
     // ── Run per-block inference ────────────────────────────────────────────
-    eprintln!("[classify] running inference on {} blocks…", manifest.blocks.len());
+    eprintln!(
+        "[classify] running inference on {} blocks…",
+        manifest.blocks.len()
+    );
     let inference_map = run_inference(&manifest, &model, &feat_dir)?;
-    eprintln!("[classify] inference complete ({} blocks processed)", inference_map.len());
+    eprintln!(
+        "[classify] inference complete ({} blocks processed)",
+        inference_map.len()
+    );
 
     // ── Write classified output ────────────────────────────────────────────
     eprintln!("[classify] writing output: {}", cfg.output.display());
@@ -100,24 +106,38 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
         std::process::exit(0);
     }
 
-    let mut input:   Option<PathBuf> = None;
-    let mut model:   Option<PathBuf> = None;
-    let mut blocks:  Option<PathBuf> = None;
-    let mut output:  Option<PathBuf> = None;
-    let mut threads: Option<usize>   = None;
+    let mut input: Option<PathBuf> = None;
+    let mut model: Option<PathBuf> = None;
+    let mut blocks: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut threads: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--input"   => { i += 1; input   = Some(PathBuf::from(require_value(args, i, "--input")?)); }
-            "--model"   => { i += 1; model   = Some(PathBuf::from(require_value(args, i, "--model")?)); }
-            "--blocks"  => { i += 1; blocks  = Some(PathBuf::from(require_value(args, i, "--blocks")?)); }
-            "--output"  => { i += 1; output  = Some(PathBuf::from(require_value(args, i, "--output")?)); }
+            "--input" => {
+                i += 1;
+                input = Some(PathBuf::from(require_value(args, i, "--input")?));
+            }
+            "--model" => {
+                i += 1;
+                model = Some(PathBuf::from(require_value(args, i, "--model")?));
+            }
+            "--blocks" => {
+                i += 1;
+                blocks = Some(PathBuf::from(require_value(args, i, "--blocks")?));
+            }
+            "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(require_value(args, i, "--output")?));
+            }
             "--threads" => {
                 i += 1;
                 let val = require_value(args, i, "--threads")?;
                 threads = Some(val.parse::<usize>().map_err(|_| {
-                    ClassifierError::Pipeline(format!("--threads must be a positive integer, got '{val}'"))
+                    ClassifierError::Pipeline(format!(
+                        "--threads must be a positive integer, got '{val}'"
+                    ))
                 })?);
             }
             unknown => {
@@ -130,10 +150,14 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
     }
 
     let cfg = ClassifyConfig {
-        input:   input.ok_or_else(|| ClassifierError::Pipeline("classify: --input is required".into()))?,
-        model:   model.ok_or_else(|| ClassifierError::Pipeline("classify: --model is required".into()))?,
-        blocks:  blocks.ok_or_else(|| ClassifierError::Pipeline("classify: --blocks is required".into()))?,
-        output:  output.ok_or_else(|| ClassifierError::Pipeline("classify: --output is required".into()))?,
+        input: input
+            .ok_or_else(|| ClassifierError::Pipeline("classify: --input is required".into()))?,
+        model: model
+            .ok_or_else(|| ClassifierError::Pipeline("classify: --model is required".into()))?,
+        blocks: blocks
+            .ok_or_else(|| ClassifierError::Pipeline("classify: --blocks is required".into()))?,
+        output: output
+            .ok_or_else(|| ClassifierError::Pipeline("classify: --output is required".into()))?,
         threads,
     };
 
@@ -149,9 +173,9 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
 }
 
 fn require_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str> {
-    args.get(i).map(String::as_str).ok_or_else(|| {
-        ClassifierError::Pipeline(format!("classify: {flag} requires a value"))
-    })
+    args.get(i)
+        .map(String::as_str)
+        .ok_or_else(|| ClassifierError::Pipeline(format!("classify: {flag} requires a value")))
 }
 
 fn print_help() {

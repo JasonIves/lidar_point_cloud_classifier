@@ -18,9 +18,7 @@
 use ndarray::{s, Array2, Axis};
 
 use crate::error::{ClassifierError, Result};
-use crate::model::layers::{
-    apply_bn2d, global_max_pool, relu, BatchNorm1d, Linear, TNet,
-};
+use crate::model::layers::{apply_bn2d, global_max_pool, relu, BatchNorm1d, Linear, TNet};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Architecture configuration
@@ -123,9 +121,10 @@ impl PointNetClassifier {
         }
 
         // ── Encoder layer 0 (produces local_feat) ────────────────────────
-        let (enc0_linear, enc0_bn) = self.encoder_layers.first().ok_or_else(|| {
-            ClassifierError::Pipeline("PointNet: encoder_layers is empty".into())
-        })?;
+        let (enc0_linear, enc0_bn) = self
+            .encoder_layers
+            .first()
+            .ok_or_else(|| ClassifierError::Pipeline("PointNet: encoder_layers is empty".into()))?;
         let h = enc0_linear.forward(&features)?;
         let h = apply_bn2d(h, enc0_bn.as_ref())?;
         let local_feat = relu(&h); // [N, encoder_dims[0]]
@@ -149,15 +148,12 @@ impl PointNetClassifier {
 
         // ── Global max pooling + broadcast ────────────────────────────────
         let global_vec = global_max_pool(&deep.view()); // [encoder_dims.last()]
-        // Broadcast to [N, encoder_dims.last()]
+                                                        // Broadcast to [N, encoder_dims.last()]
         let global_mat = Array2::from_shape_fn((n, global_vec.len()), |(_, j)| global_vec[j]);
 
         // ── Segmentation concat ───────────────────────────────────────────
-        let mut seg = ndarray::concatenate(
-            Axis(1),
-            &[local_feat.view(), global_mat.view()],
-        )
-        .map_err(|e| ClassifierError::Pipeline(format!("concat error: {e}")))?;
+        let mut seg = ndarray::concatenate(Axis(1), &[local_feat.view(), global_mat.view()])
+            .map_err(|e| ClassifierError::Pipeline(format!("concat error: {e}")))?;
         // seg: [N, concat_dim]
 
         // ── Decoder layers ────────────────────────────────────────────────
@@ -191,11 +187,7 @@ impl PointNetClassifier {
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map_or(0, |(idx, _)| idx);
             // Map model index → ASPRS code via label_map
-            let asprs_code = self
-                .label_map
-                .get(best_idx)
-                .copied()
-                .unwrap_or(1); // fallback: Unassigned
+            let asprs_code = self.label_map.get(best_idx).copied().unwrap_or(1); // fallback: Unassigned
             labels.push(asprs_code);
         }
         Ok(labels)
@@ -251,10 +243,8 @@ mod tests {
         }
 
         // Class projection
-        let class_proj = Linear::new(
-            Array2::zeros((n_classes, prev_d)),
-            Array1::zeros(n_classes),
-        ).unwrap();
+        let class_proj =
+            Linear::new(Array2::zeros((n_classes, prev_d)), Array1::zeros(n_classes)).unwrap();
 
         // Default label map: identity ASPRS codes 0..n_classes
         let label_map: Vec<u8> = (0u8..n_classes as u8).collect();
@@ -289,25 +279,31 @@ mod tests {
         // Build zero-weight STN3d and STN64d
         let stn3d = TNet {
             k: 3,
-            enc0: Linear::new(Array2::zeros((64, 3)),    Array1::zeros(64)).unwrap(),
-            enc1: Linear::new(Array2::zeros((128, 64)),  Array1::zeros(128)).unwrap(),
-            enc2: Linear::new(Array2::zeros((1024, 128)),Array1::zeros(1024)).unwrap(),
-            bn_enc0: None, bn_enc1: None, bn_enc2: None,
+            enc0: Linear::new(Array2::zeros((64, 3)), Array1::zeros(64)).unwrap(),
+            enc1: Linear::new(Array2::zeros((128, 64)), Array1::zeros(128)).unwrap(),
+            enc2: Linear::new(Array2::zeros((1024, 128)), Array1::zeros(1024)).unwrap(),
+            bn_enc0: None,
+            bn_enc1: None,
+            bn_enc2: None,
             fc0: Linear::new(Array2::zeros((512, 1024)), Array1::zeros(512)).unwrap(),
-            fc1: Linear::new(Array2::zeros((256, 512)),  Array1::zeros(256)).unwrap(),
-            fc2: Linear::new(Array2::zeros((9, 256)),    Array1::zeros(9)).unwrap(),
-            bn_fc0: None, bn_fc1: None,
+            fc1: Linear::new(Array2::zeros((256, 512)), Array1::zeros(256)).unwrap(),
+            fc2: Linear::new(Array2::zeros((9, 256)), Array1::zeros(9)).unwrap(),
+            bn_fc0: None,
+            bn_fc1: None,
         };
         let stn64d = TNet {
             k: 64,
-            enc0: Linear::new(Array2::zeros((64, 64)),   Array1::zeros(64)).unwrap(),
-            enc1: Linear::new(Array2::zeros((128, 64)),  Array1::zeros(128)).unwrap(),
-            enc2: Linear::new(Array2::zeros((1024, 128)),Array1::zeros(1024)).unwrap(),
-            bn_enc0: None, bn_enc1: None, bn_enc2: None,
+            enc0: Linear::new(Array2::zeros((64, 64)), Array1::zeros(64)).unwrap(),
+            enc1: Linear::new(Array2::zeros((128, 64)), Array1::zeros(128)).unwrap(),
+            enc2: Linear::new(Array2::zeros((1024, 128)), Array1::zeros(1024)).unwrap(),
+            bn_enc0: None,
+            bn_enc1: None,
+            bn_enc2: None,
             fc0: Linear::new(Array2::zeros((512, 1024)), Array1::zeros(512)).unwrap(),
-            fc1: Linear::new(Array2::zeros((256, 512)),  Array1::zeros(256)).unwrap(),
+            fc1: Linear::new(Array2::zeros((256, 512)), Array1::zeros(256)).unwrap(),
             fc2: Linear::new(Array2::zeros((4096, 256)), Array1::zeros(4096)).unwrap(),
-            bn_fc0: None, bn_fc1: None,
+            bn_fc0: None,
+            bn_fc1: None,
         };
 
         clf.config.use_input_tnet = true;
@@ -332,14 +328,9 @@ mod tests {
         // Point 0: class 1 wins → ASPRS 5 (Building)
         // Point 1: class 2 wins → ASPRS 6 (Water)
         // Point 2: class 0 wins → ASPRS 2 (Ground)
-        let logits = Array2::from_shape_vec(
-            (3, 3),
-            vec![
-                0.1f32, 0.9, 0.0,
-                0.0,    0.1, 0.8,
-                1.0,    0.0, 0.5,
-            ],
-        ).unwrap();
+        let logits =
+            Array2::from_shape_vec((3, 3), vec![0.1f32, 0.9, 0.0, 0.0, 0.1, 0.8, 1.0, 0.0, 0.5])
+                .unwrap();
 
         // Bypass forward(), inject logits through classify() manually
         // by calling classify() on the full model with crafted input that
@@ -350,9 +341,12 @@ mod tests {
         let mut labels = Vec::with_capacity(n);
         for i in 0..n {
             let row = logits.row(i);
-            let best = row.iter().enumerate()
+            let best = row
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx).unwrap_or(0);
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
             labels.push(clf.label_map[best]);
         }
         assert_eq!(labels, vec![5u8, 6u8, 2u8]);

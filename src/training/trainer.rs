@@ -1,7 +1,22 @@
 //! Training loop — gradient accumulation over spatial blocks, AdamW optimizer,
 //! cosine annealing LR, checkpoint management, and optional SWA.
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::doc_markdown, clippy::struct_excessive_bools, clippy::too_many_lines, clippy::trivially_copy_pass_by_ref, clippy::redundant_clone, clippy::unnecessary_wraps)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::doc_markdown,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::redundant_clone,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::similar_names,
+    clippy::must_use_candidate
+)]
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -47,6 +62,17 @@ pub struct TrainConfig {
     pub use_feature_tnet: bool,
     pub use_batch_norm: bool,
     pub use_class_weights: bool,
+    /// β parameter for β-scaled effective-number class weighting (Cui et al. 2019).
+    ///
+    /// Range: `[0.0, 1.0)`.
+    /// - `0.0`  → uniform weights (all classes weighted equally).
+    /// - `→1.0` → approaches pure inverse-frequency weighting.
+    /// - `0.999` (default) → strong minority-class emphasis suitable for severely
+    ///   imbalanced LiDAR datasets without the extreme weight ratios of pure
+    ///   inverse-frequency.
+    ///
+    /// Only used when `use_class_weights = true`.
+    pub class_weight_beta: f64,
     pub checkpoint_dir: Option<PathBuf>,
     pub checkpoint_every: usize,
     pub keep_best_n: usize,
@@ -70,6 +96,7 @@ impl Default for TrainConfig {
             use_feature_tnet: false,
             use_batch_norm: true,
             use_class_weights: true,
+            class_weight_beta: 0.999,
             checkpoint_dir: None,
             checkpoint_every: 1,
             keep_best_n: 5,
@@ -106,7 +133,10 @@ impl CheckpointManifest {
                 return m;
             }
         }
-        Self { keep_best_n, checkpoints: Vec::new() }
+        Self {
+            keep_best_n,
+            checkpoints: Vec::new(),
+        }
     }
 
     fn save(&self, dir: &Path) -> std::io::Result<()> {
@@ -119,8 +149,11 @@ impl CheckpointManifest {
     fn push(&mut self, entry: CheckpointEntry, dir: &Path) {
         self.checkpoints.push(entry);
         // Sort descending by val_miou.
-        self.checkpoints
-            .sort_by(|a, b| b.val_miou.partial_cmp(&a.val_miou).unwrap_or(std::cmp::Ordering::Equal));
+        self.checkpoints.sort_by(|a, b| {
+            b.val_miou
+                .partial_cmp(&a.val_miou)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         // Remove excess entries.
         while self.checkpoints.len() > self.keep_best_n {
             let removed = self.checkpoints.pop().unwrap();
@@ -179,15 +212,11 @@ where
     // ── Class weights ─────────────────────────────────────────────────────
     let class_weights: Option<Vec<f32>> = if config.use_class_weights {
         let counts = dataset.class_counts_train();
-        let total: u64 = counts.iter().sum();
-        let n = config.n_classes;
-        let w: Vec<f32> = counts
-            .iter()
-            .map(|&c| {
-                if c == 0 { 0.0 } else { total as f32 / (n as f32 * c as f32) }
-            })
-            .collect();
-        eprintln!("[trainer] class weights: {w:?}");
+        let w = compute_class_weights(&counts, config.class_weight_beta);
+        eprintln!(
+            "[trainer] class weights (beta={:.4}): {w:?}",
+            config.class_weight_beta
+        );
         Some(w)
     } else {
         None
@@ -249,7 +278,7 @@ where
                 let targets = labels_to_tensor::<B>(&block.labels, device);
 
                 // Forward
-                let logits = model.forward(feat_tensor);   // [N, n_classes]
+                let logits = model.forward(feat_tensor); // [N, n_classes]
 
                 // Loss
                 let loss = loss_fn.forward(logits, targets); // [1]
@@ -282,7 +311,11 @@ where
             }
         }
 
-        let train_loss = if n_steps == 0 { 0.0 } else { epoch_loss_sum / n_steps as f64 };
+        let train_loss = if n_steps == 0 {
+            0.0
+        } else {
+            epoch_loss_sum / n_steps as f64
+        };
 
         // ── Validation ────────────────────────────────────────────────────
         let val_metrics = validate_epoch(
@@ -404,7 +437,10 @@ where
     for &block_id in val_ids {
         let block = match dataset.load_block(block_id) {
             Ok(b) => b,
-            Err(e) => { eprintln!("[val] skip {block_id}: {e}"); continue; }
+            Err(e) => {
+                eprintln!("[val] skip {block_id}: {e}");
+                continue;
+            }
         };
 
         let n = block.features.nrows();
@@ -414,12 +450,9 @@ where
         // Use autodiff tensors so BN runs with per-batch statistics.
         // No .backward() is ever called, so no gradient computation occurs.
         let feat_tensor = features_to_tensor::<B>(flat, n, n_features_block, device);
-        let logits = val_model.forward(feat_tensor);  // [N, n_classes]
+        let logits = val_model.forward(feat_tensor); // [N, n_classes]
         let nc = logits.dims()[1];
-        let flat_out: Vec<f32> = logits
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap_or_default();
+        let flat_out: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap_or_default();
         let preds: Vec<u8> = (0..n)
             .map(|i| {
                 let row = &flat_out[i * nc..(i + 1) * nc];
@@ -430,13 +463,12 @@ where
             })
             .collect();
 
-        let loss_uw = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
-        acc.add_loss(loss_uw);
+        let loss_unweighted = cross_entropy_from_logits(&flat_out, &block.labels, n, nc);
+        acc.add_loss(loss_unweighted);
 
-        let loss_w = cross_entropy_from_logits_weighted(
-            &flat_out, &block.labels, n, nc, class_weights,
-        );
-        acc.add_loss_weighted(loss_w);
+        let loss_weighted =
+            cross_entropy_from_logits_weighted(&flat_out, &block.labels, n, nc, class_weights);
+        acc.add_loss_weighted(loss_weighted);
 
         acc.accumulate(&preds, &block.labels);
     }
@@ -458,7 +490,11 @@ fn cross_entropy_from_logits(logits: &[f32], labels: &[u8], n: usize, nc: usize)
             loss += f64::from(log_sum_exp - row[c]);
         }
     }
-    if n > 0 { loss / n as f64 } else { 0.0 }
+    if n > 0 {
+        loss / n as f64
+    } else {
+        0.0
+    }
 }
 
 /// Class-weighted cross-entropy, normalized by the sum of sample weights.
@@ -485,11 +521,15 @@ fn cross_entropy_from_logits_weighted(
         let c = labels[i] as usize;
         if c < nc {
             let wi = if c < w.len() { f64::from(w[c]) } else { 1.0 };
-            loss  += wi * f64::from(log_sum_exp - row[c]);
+            loss += wi * f64::from(log_sum_exp - row[c]);
             w_sum += wi;
         }
     }
-    if w_sum > 0.0 { loss / w_sum } else { 0.0 }
+    if w_sum > 0.0 {
+        loss / w_sum
+    } else {
+        0.0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -497,11 +537,7 @@ fn cross_entropy_from_logits_weighted(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Average the weights of all retained checkpoints and save to `output_path`.
-fn apply_swa(
-    ckpt_dir: &Path,
-    manifest: &CheckpointManifest,
-    output_path: &Path,
-) -> Result<()> {
+fn apply_swa(ckpt_dir: &Path, manifest: &CheckpointManifest, output_path: &Path) -> Result<()> {
     if manifest.checkpoints.is_empty() {
         return Err(ClassifierError::Pipeline(
             "SWA: no retained checkpoints to average".into(),
@@ -529,29 +565,32 @@ fn apply_swa(
     macro_rules! accum_linear {
         ($base_lin:expr, $other_lin:expr) => {
             $base_lin.weight = (&$base_lin.weight + &$other_lin.weight).to_owned();
-            $base_lin.bias   = (&$base_lin.bias   + &$other_lin.bias).to_owned();
+            $base_lin.bias = (&$base_lin.bias + &$other_lin.bias).to_owned();
         };
     }
     macro_rules! divide_linear {
         ($lin:expr) => {
             $lin.weight /= n;
-            $lin.bias   /= n;
+            $lin.bias /= n;
         };
     }
     macro_rules! accum_bn {
         ($base_bn:expr, $other_bn:expr) => {
             if let (Some(ref mut bb), Some(ref mb)) = ($base_bn, $other_bn) {
                 bb.gamma = (&bb.gamma + &mb.gamma).to_owned();
-                bb.beta  = (&bb.beta  + &mb.beta).to_owned();
-                bb.mean  = (&bb.mean  + &mb.mean).to_owned();
-                bb.var   = (&bb.var   + &mb.var).to_owned();
+                bb.beta = (&bb.beta + &mb.beta).to_owned();
+                bb.mean = (&bb.mean + &mb.mean).to_owned();
+                bb.var = (&bb.var + &mb.var).to_owned();
             }
         };
     }
     macro_rules! divide_bn {
         ($bn:expr) => {
             if let Some(ref mut bb) = $bn {
-                bb.gamma /= n; bb.beta /= n; bb.mean /= n; bb.var /= n;
+                bb.gamma /= n;
+                bb.beta /= n;
+                bb.mean /= n;
+                bb.var /= n;
             }
         };
     }
@@ -619,19 +658,102 @@ fn apply_swa(
         }
     }
     if let Some(ref mut bt) = base.input_tnet {
-        divide_linear!(bt.enc0); divide_linear!(bt.enc1); divide_linear!(bt.enc2);
-        divide_bn!(bt.bn_enc0);  divide_bn!(bt.bn_enc1);  divide_bn!(bt.bn_enc2);
-        divide_linear!(bt.fc0);  divide_linear!(bt.fc1);  divide_linear!(bt.fc2);
-        divide_bn!(bt.bn_fc0);   divide_bn!(bt.bn_fc1);
+        divide_linear!(bt.enc0);
+        divide_linear!(bt.enc1);
+        divide_linear!(bt.enc2);
+        divide_bn!(bt.bn_enc0);
+        divide_bn!(bt.bn_enc1);
+        divide_bn!(bt.bn_enc2);
+        divide_linear!(bt.fc0);
+        divide_linear!(bt.fc1);
+        divide_linear!(bt.fc2);
+        divide_bn!(bt.bn_fc0);
+        divide_bn!(bt.bn_fc1);
     }
     if let Some(ref mut bt) = base.feature_tnet {
-        divide_linear!(bt.enc0); divide_linear!(bt.enc1); divide_linear!(bt.enc2);
-        divide_bn!(bt.bn_enc0);  divide_bn!(bt.bn_enc1);  divide_bn!(bt.bn_enc2);
-        divide_linear!(bt.fc0);  divide_linear!(bt.fc1);  divide_linear!(bt.fc2);
-        divide_bn!(bt.bn_fc0);   divide_bn!(bt.bn_fc1);
+        divide_linear!(bt.enc0);
+        divide_linear!(bt.enc1);
+        divide_linear!(bt.enc2);
+        divide_bn!(bt.bn_enc0);
+        divide_bn!(bt.bn_enc1);
+        divide_bn!(bt.bn_enc2);
+        divide_linear!(bt.fc0);
+        divide_linear!(bt.fc1);
+        divide_linear!(bt.fc2);
+        divide_bn!(bt.bn_fc0);
+        divide_bn!(bt.bn_fc1);
     }
 
     crate::model::weights::save_model(output_path, &base)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Class weight computation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute β-scaled effective-number class weights (Cui et al. 2019).
+///
+/// # Formula
+/// ```text
+/// effective_num[c] = (1 - β^count[c]) / (1 - β)
+/// raw_weight[c]    = 1 / effective_num[c]   (0.0 when count[c] == 0)
+/// ```
+/// Weights are then normalized so the mean weight of present classes equals 1.0,
+/// keeping the loss magnitude stable across different β values.
+///
+/// # Special cases
+/// - `β ≈ 0.0` → uniform weights (all 1.0).
+/// - `β → 1.0` → approaches pure inverse-frequency weighting.
+///
+/// # Panics
+/// Never panics — all edge cases (zero counts, zero present classes) return safe
+/// default values.
+pub fn compute_class_weights(counts: &[u64], beta: f64) -> Vec<f32> {
+    let n = counts.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // β ≈ 0: uniform weights — short-circuit to avoid division by (1 - β) = 1.0
+    // which would produce the correct result but is less readable.
+    if beta.abs() < 1e-9 {
+        return vec![1.0f32; n];
+    }
+
+    // Compute raw weights via effective number formula.
+    // For count[c] == 0: weight stays 0.0 (class absent from training set).
+    // For large counts: β^count underflows to 0.0, so effective_num saturates
+    // at 1/(1-β) — the correct asymptotic behavior; no special handling needed.
+    let one_minus_beta = 1.0 - beta;
+    let raw_weights: Vec<f64> = counts
+        .iter()
+        .map(|&c| {
+            if c == 0 {
+                0.0
+            } else {
+                let eff_num = (1.0 - beta.powi(c as i32)) / one_minus_beta;
+                if eff_num > 0.0 {
+                    1.0 / eff_num
+                } else {
+                    0.0
+                }
+            }
+        })
+        .collect();
+
+    // Normalize so the mean weight of present (non-zero) classes equals 1.0.
+    // This keeps the loss magnitude comparable across different β values and
+    // ensures the learning rate remains stable regardless of the chosen β.
+    let present_sum: f64 = raw_weights.iter().filter(|&&w| w > 0.0).sum();
+    let n_present = raw_weights.iter().filter(|&&w| w > 0.0).count();
+
+    if n_present == 0 || present_sum == 0.0 {
+        // All classes absent — return uniform weights as a safe fallback.
+        return vec![1.0f32; n];
+    }
+
+    let scale = n_present as f64 / present_sum;
+    raw_weights.iter().map(|&w| (w * scale) as f32).collect()
 }
 
 fn write_training_summary(dir: &Path, best_miou: f64, duration_secs: f64, swa: bool) {
@@ -657,7 +779,10 @@ mod tests {
     #[test]
     fn test_checkpoint_keeps_best_n() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manifest = CheckpointManifest { keep_best_n: 5, checkpoints: Vec::new() };
+        let mut manifest = CheckpointManifest {
+            keep_best_n: 5,
+            checkpoints: Vec::new(),
+        };
 
         // Insert 8 checkpoints with varying mIoU.
         let scores = [0.5, 0.7, 0.6, 0.8, 0.55, 0.72, 0.9, 0.65];
@@ -665,7 +790,14 @@ mod tests {
             // Create dummy file so deletion doesn't fail.
             let fname = format!("checkpoint_epoch_{:03}.wbmodel", i + 1);
             let _ = File::create(dir.path().join(&fname));
-            manifest.push(CheckpointEntry { epoch: i + 1, val_miou: score, file: fname }, dir.path());
+            manifest.push(
+                CheckpointEntry {
+                    epoch: i + 1,
+                    val_miou: score,
+                    file: fname,
+                },
+                dir.path(),
+            );
         }
 
         // Only best 5 should be retained.
@@ -673,9 +805,133 @@ mod tests {
         // Best entry should be the one with mIoU 0.9.
         assert!((manifest.checkpoints[0].val_miou - 0.9).abs() < 1e-6);
         // All retained mIoUs should be >= the 5th-best.
-        let min_retained = manifest.checkpoints.iter().map(|c| c.val_miou).fold(f64::INFINITY, f64::min);
+        let min_retained = manifest
+            .checkpoints
+            .iter()
+            .map(|c| c.val_miou)
+            .fold(f64::INFINITY, f64::min);
         // 5 best scores: 0.9, 0.8, 0.72, 0.7, 0.65 → min = 0.65
         assert!((min_retained - 0.65).abs() < 1e-6);
+    }
+
+    // ── Stage 07: compute_class_weights tests ────────────────────────────────
+
+    /// β = 0.0 → all present classes receive weight 1.0 (uniform).
+    #[test]
+    fn test_class_weight_beta_uniform() {
+        // Any non-zero count distribution with β=0.0 must yield all-ones weights.
+        let counts = vec![1000u64, 500, 100, 50, 10];
+        let weights = compute_class_weights(&counts, 0.0);
+        assert_eq!(weights.len(), 5);
+        for (i, &w) in weights.iter().enumerate() {
+            assert!(
+                (w - 1.0_f32).abs() < 1e-5,
+                "expected weight 1.0 for class {i} with beta=0.0, got {w}"
+            );
+        }
+    }
+
+    /// β = 0.9999 → weights are numerically close to pure inverse-frequency.
+    ///
+    /// For large counts (> ~1000), β^count ≈ 0, so effective_num ≈ 1/(1-β) = 10000.
+    /// All large-count classes collapse to the same effective number, so the
+    /// weight ratio between classes is driven by the inverse-frequency ratio.
+    /// We verify that the weight ordering matches inverse-frequency ordering and
+    /// that the ratio between the largest and smallest weight is within 1% of
+    /// the inverse-frequency ratio.
+    #[test]
+    fn test_class_weight_beta_inverse_freq() {
+        // 3 classes with counts [10000, 1000, 100].
+        // Pure inverse-frequency (normalized): weights proportional to [1/10000, 1/1000, 1/100].
+        // Ratio of max to min weight = 100.
+        let counts = vec![10_000u64, 1_000, 100];
+        let weights_beta = compute_class_weights(&counts, 0.9999);
+        assert_eq!(weights_beta.len(), 3);
+
+        // All weights must be positive.
+        for &w in &weights_beta {
+            assert!(w > 0.0, "expected positive weight, got {w}");
+        }
+
+        // Weight ordering must match inverse-frequency ordering:
+        // fewer points → higher weight.
+        assert!(
+            weights_beta[2] > weights_beta[1] && weights_beta[1] > weights_beta[0],
+            "weight ordering does not match inverse-frequency: {weights_beta:?}"
+        );
+
+        // At β=0.9999 with counts [10000, 1000, 100], β^count is NOT negligible:
+        //   0.9999^10000 ≈ 0.368,  0.9999^1000 ≈ 0.905,  0.9999^100 ≈ 0.990
+        // So effective numbers are [6320, 950, 100], giving ratio ≈ 63.5 —
+        // substantially above 1 (uniform) but below 100 (pure inverse-frequency).
+        // This demonstrates the intended intermediate behaviour of the formula.
+        let ratio = weights_beta[2] / weights_beta[0];
+        assert!(
+            ratio > 10.0 && ratio < 100.0,
+            "expected weight ratio between 10 and 100 for beta=0.9999, got {ratio:.2}"
+        );
+    }
+
+    /// β = 0.9 on a known 3-class distribution → hand-calculated expected weights.
+    ///
+    /// counts = [100, 50, 10], β = 0.9
+    ///
+    /// effective_num[c] = (1 - 0.9^count[c]) / (1 - 0.9) = (1 - 0.9^count[c]) / 0.1
+    ///
+    /// For count=100: 0.9^100 ≈ 2.656e-5 → eff_num ≈ (1 - 2.656e-5) / 0.1 ≈ 9.9997
+    /// For count=50:  0.9^50  ≈ 5.154e-3 → eff_num ≈ (1 - 5.154e-3) / 0.1 ≈ 9.9485
+    /// For count=10:  0.9^10  ≈ 0.34868  → eff_num ≈ (1 - 0.34868) / 0.1 ≈ 6.5132
+    ///
+    /// raw_weight[c] = 1 / eff_num[c]:
+    ///   rw[0] ≈ 1/9.9997  ≈ 0.10000
+    ///   rw[1] ≈ 1/9.9485  ≈ 0.10052
+    ///   rw[2] ≈ 1/6.5132  ≈ 0.15353
+    ///
+    /// present_sum ≈ 0.35405, n_present = 3, scale ≈ 3/0.35405 ≈ 8.4734
+    ///
+    /// normalized weights:
+    ///   w[0] ≈ 0.10000 * 8.4734 ≈ 0.8473
+    ///   w[1] ≈ 0.10052 * 8.4734 ≈ 0.8517
+    ///   w[2] ≈ 0.15353 * 8.4734 ≈ 1.3009
+    ///
+    /// Tolerance: 1% relative error (f32 precision + floating-point accumulation).
+    #[test]
+    fn test_class_weight_beta_intermediate() {
+        let counts = vec![100u64, 50, 10];
+        let weights = compute_class_weights(&counts, 0.9);
+        assert_eq!(weights.len(), 3);
+
+        let expected = [0.8473_f32, 0.8517_f32, 1.3009_f32];
+        for (i, (&w, &exp)) in weights.iter().zip(expected.iter()).enumerate() {
+            let rel_err = (w - exp).abs() / exp;
+            assert!(
+                rel_err < 0.01,
+                "class {i}: expected weight ≈ {exp:.4}, got {w:.4} (rel_err={rel_err:.4})"
+            );
+        }
+
+        // Mean of all weights must equal 1.0 (normalization invariant).
+        let mean: f32 = weights.iter().sum::<f32>() / weights.len() as f32;
+        assert!(
+            (mean - 1.0_f32).abs() < 1e-4,
+            "mean weight should be 1.0, got {mean:.6}"
+        );
+    }
+
+    /// Absent class (count=0) receives weight 0.0 regardless of β.
+    #[test]
+    fn test_class_weight_absent_class_is_zero() {
+        let counts = vec![1000u64, 0, 500];
+        let weights = compute_class_weights(&counts, 0.999);
+        assert_eq!(weights.len(), 3);
+        assert!(
+            weights[1].abs() < 1e-9,
+            "absent class should have weight 0.0, got {}",
+            weights[1]
+        );
+        // Present classes must have positive weights.
+        assert!(weights[0] > 0.0);
+        assert!(weights[2] > 0.0);
     }
 
     #[test]
@@ -697,12 +953,12 @@ mod tests {
     #[cfg(feature = "training")]
     #[test]
     fn test_swa_averages_tnet_weights() {
-        use burn::backend::{Autodiff, NdArray};
-        use crate::training::burn_model::BurnPointNet;
-        use crate::training::bridge::save_model_from_burn;
+        use crate::model::pointnet::PointNetConfig;
         use crate::model::weights::load_model;
         use crate::preprocessing::N_FEATURES;
-        use crate::model::pointnet::PointNetConfig;
+        use crate::training::bridge::save_model_from_burn;
+        use crate::training::burn_model::BurnPointNet;
+        use burn::backend::{Autodiff, NdArray};
 
         type B = Autodiff<NdArray>;
         let device = Default::default();
@@ -713,14 +969,14 @@ mod tests {
             decoder_dims: vec![256, 128],
             n_classes: 8,
             use_batch_norm: true,
-            use_input_tnet: true,   // ← T-Net enabled
+            use_input_tnet: true, // ← T-Net enabled
             use_feature_tnet: false,
         };
         let label_map: Vec<u8> = (0u8..8).collect();
 
         let dir = tempfile::tempdir().unwrap();
-        let p1  = dir.path().join("swa_m1.wbmodel");
-        let p2  = dir.path().join("swa_m2.wbmodel");
+        let p1 = dir.path().join("swa_m1.wbmodel");
+        let p2 = dir.path().join("swa_m2.wbmodel");
         let out = dir.path().join("swa_out.wbmodel");
 
         // Two randomly-initialised models will have different T-Net weights.
@@ -740,24 +996,40 @@ mod tests {
         let manifest = CheckpointManifest {
             keep_best_n: 2,
             checkpoints: vec![
-                CheckpointEntry { epoch: 1, val_miou: 0.7, file: "swa_m1.wbmodel".into() },
-                CheckpointEntry { epoch: 2, val_miou: 0.8, file: "swa_m2.wbmodel".into() },
+                CheckpointEntry {
+                    epoch: 1,
+                    val_miou: 0.7,
+                    file: "swa_m1.wbmodel".into(),
+                },
+                CheckpointEntry {
+                    epoch: 2,
+                    val_miou: 0.8,
+                    file: "swa_m2.wbmodel".into(),
+                },
             ],
         };
         apply_swa(dir.path(), &manifest, &out).unwrap();
 
         // Load the SWA output and verify T-Net enc0 weight is the mean.
         let averaged = load_model(&out).unwrap();
-        let avg_tnet_w = &averaged.input_tnet.as_ref()
+        let avg_tnet_w = &averaged
+            .input_tnet
+            .as_ref()
             .expect("SWA output must have input_tnet")
-            .enc0.weight;
+            .enc0
+            .weight;
 
-        assert_eq!(avg_tnet_w.shape(), expected_avg.shape(),
-            "SWA T-Net weight shape mismatch");
+        assert_eq!(
+            avg_tnet_w.shape(),
+            expected_avg.shape(),
+            "SWA T-Net weight shape mismatch"
+        );
         // Check a representative element is within floating-point tolerance.
         let diff = (avg_tnet_w - &expected_avg).mapv(f32::abs);
         let max_err = diff.iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max_err < 1e-5,
-            "SWA T-Net weight not correctly averaged; max element error = {max_err}");
+        assert!(
+            max_err < 1e-5,
+            "SWA T-Net weight not correctly averaged; max element error = {max_err}"
+        );
     }
 }

@@ -7,7 +7,11 @@
 //! Stage 02 `layers::Linear` stores weight as `[d_output, d_input]`.
 //! The bridge **transposes** each weight matrix before assembly.
 
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::doc_markdown)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::doc_markdown
+)]
 
 use burn::tensor::backend::AutodiffBackend;
 
@@ -54,7 +58,8 @@ pub fn save_model_from_burn<B: AutodiffBackend>(
     if label_map.len() != cfg.n_classes {
         return Err(ClassifierError::Pipeline(format!(
             "bridge: label_map length {} != n_classes {}",
-            label_map.len(), cfg.n_classes,
+            label_map.len(),
+            cfg.n_classes,
         )));
     }
 
@@ -82,9 +87,21 @@ fn extract_tnet3d<B: AutodiffBackend>(stn: &Stn3d<B>, use_bn: bool) -> Result<TN
         enc0: extract_linear::<B>(&stn.enc0)?,
         enc1: extract_linear::<B>(&stn.enc1)?,
         enc2: extract_linear::<B>(&stn.enc2)?,
-        bn_enc0: if use_bn { Some(bn(&stn.bn_enc0)?) } else { None },
-        bn_enc1: if use_bn { Some(bn(&stn.bn_enc1)?) } else { None },
-        bn_enc2: if use_bn { Some(bn(&stn.bn_enc2)?) } else { None },
+        bn_enc0: if use_bn {
+            Some(bn(&stn.bn_enc0)?)
+        } else {
+            None
+        },
+        bn_enc1: if use_bn {
+            Some(bn(&stn.bn_enc1)?)
+        } else {
+            None
+        },
+        bn_enc2: if use_bn {
+            Some(bn(&stn.bn_enc2)?)
+        } else {
+            None
+        },
         fc0: extract_linear::<B>(&stn.fc0)?,
         fc1: extract_linear::<B>(&stn.fc1)?,
         fc2: extract_linear::<B>(&stn.fc2)?,
@@ -100,9 +117,21 @@ fn extract_tnet64d<B: AutodiffBackend>(stn: &Stn64d<B>, use_bn: bool) -> Result<
         enc0: extract_linear::<B>(&stn.enc0)?,
         enc1: extract_linear::<B>(&stn.enc1)?,
         enc2: extract_linear::<B>(&stn.enc2)?,
-        bn_enc0: if use_bn { Some(bn(&stn.bn_enc0)?) } else { None },
-        bn_enc1: if use_bn { Some(bn(&stn.bn_enc1)?) } else { None },
-        bn_enc2: if use_bn { Some(bn(&stn.bn_enc2)?) } else { None },
+        bn_enc0: if use_bn {
+            Some(bn(&stn.bn_enc0)?)
+        } else {
+            None
+        },
+        bn_enc1: if use_bn {
+            Some(bn(&stn.bn_enc1)?)
+        } else {
+            None
+        },
+        bn_enc2: if use_bn {
+            Some(bn(&stn.bn_enc2)?)
+        } else {
+            None
+        },
         fc0: extract_linear::<B>(&stn.fc0)?,
         fc1: extract_linear::<B>(&stn.fc1)?,
         fc2: extract_linear::<B>(&stn.fc2)?,
@@ -117,13 +146,17 @@ fn extract_pair<B: AutodiffBackend>(
     use_bn: bool,
 ) -> Result<(Linear, Option<BatchNorm1d>)> {
     let l = extract_linear::<B>(linear)?;
-    let b = if use_bn { Some(extract_bn::<B>(bn)?) } else { None };
+    let b = if use_bn {
+        Some(extract_bn::<B>(bn)?)
+    } else {
+        None
+    };
     Ok((l, b))
 }
 
 /// Extract a burn Linear → Stage 02 Linear (transpose weight: [in,out] → [out,in]).
 fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Linear> {
-    let w_burn = layer.weight.val();            // Tensor<B::InnerBackend, 2> [d_in, d_out]
+    let w_burn = layer.weight.val(); // Tensor<B::InnerBackend, 2> [d_in, d_out]
     let [d_in, d_out] = w_burn.dims();
     // Layout contract: burn 0.16 stores Linear weights as [d_input, d_output].
     // We transpose to [d_output, d_input] to match Stage 02's convention.
@@ -136,7 +169,7 @@ fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Lin
     );
 
     let w_data: Vec<f32> = w_burn
-        .transpose()                            // [d_out, d_in]
+        .transpose() // [d_out, d_in]
         .into_data()
         .to_vec::<f32>()
         .map_err(|e| ClassifierError::Pipeline(format!("linear weight: {e:?}")))?;
@@ -159,13 +192,29 @@ fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Lin
 
 /// Extract a burn BatchNorm<B, 1> → Stage 02 BatchNorm1d.
 fn extract_bn<B: AutodiffBackend>(bn: &burn::nn::BatchNorm<B, 1>) -> Result<BatchNorm1d> {
-    let gamma = bn.gamma.val().into_data().to_vec::<f32>()
+    let gamma = bn
+        .gamma
+        .val()
+        .into_data()
+        .to_vec::<f32>()
         .map_err(|e| ClassifierError::Pipeline(format!("bn gamma: {e:?}")))?;
-    let beta = bn.beta.val().into_data().to_vec::<f32>()
+    let beta = bn
+        .beta
+        .val()
+        .into_data()
+        .to_vec::<f32>()
         .map_err(|e| ClassifierError::Pipeline(format!("bn beta: {e:?}")))?;
-    let mean = bn.running_mean.value().into_data().to_vec::<f32>()
+    let mean = bn
+        .running_mean
+        .value()
+        .into_data()
+        .to_vec::<f32>()
         .map_err(|e| ClassifierError::Pipeline(format!("bn mean: {e:?}")))?;
-    let var = bn.running_var.value().into_data().to_vec::<f32>()
+    let var = bn
+        .running_var
+        .value()
+        .into_data()
+        .to_vec::<f32>()
         .map_err(|e| ClassifierError::Pipeline(format!("bn var: {e:?}")))?;
 
     BatchNorm1d::new(
@@ -183,9 +232,9 @@ fn extract_bn<B: AutodiffBackend>(bn: &burn::nn::BatchNorm<B, 1>) -> Result<Batc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::{Autodiff, NdArray};
     use crate::model::weights::load_model;
     use crate::preprocessing::N_FEATURES;
+    use burn::backend::{Autodiff, NdArray};
 
     type B = Autodiff<NdArray>;
 
@@ -250,4 +299,3 @@ mod tests {
         assert!((avg[[0, 0]] - (w1[[0, 0]] + w2[[0, 0]]) / 2.0).abs() < 1e-6);
     }
 }
-

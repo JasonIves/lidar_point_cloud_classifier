@@ -1,4 +1,8 @@
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 //! Coordinate normalisation and density-gated point sampling.
 //!
 //! **Sampling contract (from spec):**
@@ -81,7 +85,11 @@ pub fn normalise_scalar_features(
     block_size: f64,
     hag_values: &[f64],
 ) -> Vec<[f32; 7]> {
-    assert_eq!(pts.len(), hag_values.len(), "pts and hag_values length mismatch");
+    assert_eq!(
+        pts.len(),
+        hag_values.len(),
+        "pts and hag_values length mismatch"
+    );
 
     // Compute z range for z_norm.
     let z_min = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
@@ -115,13 +123,20 @@ pub fn normalise_scalar_features(
             };
 
             #[allow(clippy::cast_precision_loss)]
-            let scan_angle_norm =
-                (f64::from(pt.scan_angle).abs() / 90.0).clamp(0.0, 1.0) as f32;
+            let scan_angle_norm = (f64::from(pt.scan_angle).abs() / 90.0).clamp(0.0, 1.0) as f32;
 
             #[allow(clippy::cast_precision_loss)]
             let hag = (hag_raw / h_max).clamp(0.0, 1.0) as f32;
 
-            [x_norm, y_norm, z_norm, intensity_norm, return_ratio, scan_angle_norm, hag]
+            [
+                x_norm,
+                y_norm,
+                z_norm,
+                intensity_norm,
+                return_ratio,
+                scan_angle_norm,
+                hag,
+            ]
         })
         .collect()
 }
@@ -179,9 +194,9 @@ impl DtmView {
             x_min: r.x_min,
             // `wbraster::Raster` stores y_min (south edge); top = y_min + rows * cell_size_y
             // `as f64` cast for raster geometry is lossless for any realistic
-        // row count (usize fits in f64 without precision loss up to 2^53).
-        #[allow(clippy::cast_precision_loss)]
-        y_max: r.y_min + r.rows as f64 * r.cell_size_y,
+            // row count (usize fits in f64 without precision loss up to 2^53).
+            #[allow(clippy::cast_precision_loss)]
+            y_max: r.y_min + r.rows as f64 * r.cell_size_y,
             cell_size_x: r.cell_size_x,
             cell_size_y: r.cell_size_y,
         }
@@ -233,12 +248,20 @@ impl DtmView {
         // isize-checked bounds: both indices are verified positive above.
         #[allow(clippy::cast_sign_loss)]
         let v = self.data[row as usize * self.cols + col as usize];
-        if self.is_nodata(v) { None } else { Some(v) }
+        if self.is_nodata(v) {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     #[inline]
     fn is_nodata(&self, v: f64) -> bool {
-        if self.nodata.is_nan() { v.is_nan() } else { (v - self.nodata).abs() < 1e-9 }
+        if self.nodata.is_nan() {
+            v.is_nan()
+        } else {
+            (v - self.nodata).abs() < 1e-9
+        }
     }
 }
 
@@ -255,9 +278,15 @@ fn percentile_99(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     // `as usize` is safe: idx is derived from sorted.len()-1 * 0.99, so it
     // is always < sorted.len() and non-negative.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let idx = ((sorted.len() - 1) as f64 * 0.99) as usize;
-    sorted.select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+    sorted.select_nth_unstable_by(idx, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater)
+    });
     sorted[idx]
 }
 
@@ -280,7 +309,9 @@ mod tests {
 
     #[test]
     fn test_resample_subsamples_correctly() {
-        let pts: Vec<PointRecord> = (0..100).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
+        let pts: Vec<PointRecord> = (0..100)
+            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+            .collect();
         let (sampled, _indices, over) = resample_block(&pts, 50, 42);
         assert_eq!(sampled.len(), 50);
         assert!(!over);
@@ -288,7 +319,9 @@ mod tests {
 
     #[test]
     fn test_resample_oversamples_to_target() {
-        let pts: Vec<PointRecord> = (0..10).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
+        let pts: Vec<PointRecord> = (0..10)
+            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+            .collect();
         let (sampled, _indices, over) = resample_block(&pts, 50, 42);
         assert_eq!(sampled.len(), 50);
         assert!(over);
@@ -296,7 +329,9 @@ mod tests {
 
     #[test]
     fn test_resample_exact_count_no_oversample() {
-        let pts: Vec<PointRecord> = (0..1024).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
+        let pts: Vec<PointRecord> = (0..1024)
+            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+            .collect();
         let (sampled, _indices, over) = resample_block(&pts, 1024, 0);
         assert_eq!(sampled.len(), 1024);
         assert!(!over);
@@ -304,18 +339,23 @@ mod tests {
 
     #[test]
     fn test_resample_is_reproducible() {
-        let pts: Vec<PointRecord> = (0..200).map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1)).collect();
+        let pts: Vec<PointRecord> = (0..200)
+            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+            .collect();
         let (s1, _, _) = resample_block(&pts, 100, 99);
         let (s2, _, _) = resample_block(&pts, 100, 99);
         let xs1: Vec<i64> = s1.iter().map(|p| (p.x * 1e6) as i64).collect();
         let xs2: Vec<i64> = s2.iter().map(|p| (p.x * 1e6) as i64).collect();
-        assert_eq!(xs1, xs2, "resample must be reproducible given the same seed");
+        assert_eq!(
+            xs1, xs2,
+            "resample must be reproducible given the same seed"
+        );
     }
 
     #[test]
     fn test_scalar_features_range() {
         let pts = vec![
-            make_pt(0.0,  0.0, 0.0, 0,     1, 1),
+            make_pt(0.0, 0.0, 0.0, 0, 1, 1),
             make_pt(25.0, 25.0, 10.0, 32767, 1, 2),
             make_pt(50.0, 50.0, 20.0, 65535, 2, 2),
         ];

@@ -145,9 +145,8 @@ mod tests {
     #[test]
     fn test_adaptive_radius_expands_when_needed() {
         // Place 10 points just beyond base_radius = 1.0, within 1.5.
-        let far: Vec<(f64, f64, f64)> = (0..10)
-            .map(|i| (1.1 + i as f64 * 0.01, 0.0, 0.0))
-            .collect();
+        let far: Vec<(f64, f64, f64)> =
+            (0..10).map(|i| (1.1 + i as f64 * 0.01, 0.0, 0.0)).collect();
         let pts = pts_from_coords(&far);
         let idx = BlockSpatialIndex::build(&pts);
 

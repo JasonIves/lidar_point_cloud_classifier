@@ -13,6 +13,7 @@
 //!     [--hag-model      <path>]
 //!     [--threads        <usize>]
 //!     [--debug-csv]
+//!     [--block-overlap  <f64>]   # default 0.0 (disabled)
 //! ```
 
 use std::path::PathBuf;
@@ -57,20 +58,29 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                 cfg.output_dir = PathBuf::from(next_value(args, &mut i, "--output")?);
             }
             "--block-size" => {
-                cfg.block_size = parse_f64(next_value(args, &mut i, "--block-size")?, "--block-size")?;
+                cfg.block_size =
+                    parse_f64(next_value(args, &mut i, "--block-size")?, "--block-size")?;
             }
             "--target-points" => {
-                cfg.target_points = parse_usize(next_value(args, &mut i, "--target-points")?, "--target-points")?;
+                cfg.target_points = parse_usize(
+                    next_value(args, &mut i, "--target-points")?,
+                    "--target-points",
+                )?;
             }
             "--min-density" => {
-                cfg.min_density = parse_f64(next_value(args, &mut i, "--min-density")?, "--min-density")?;
+                cfg.min_density =
+                    parse_f64(next_value(args, &mut i, "--min-density")?, "--min-density")?;
             }
             "--search-radius" => {
-                cfg.search_radius = parse_f64(next_value(args, &mut i, "--search-radius")?, "--search-radius")?;
+                cfg.search_radius = parse_f64(
+                    next_value(args, &mut i, "--search-radius")?,
+                    "--search-radius",
+                )?;
             }
             "--search-radii" => {
                 let s = next_value(args, &mut i, "--search-radii")?;
-                cfg.search_radii = s.split(',')
+                cfg.search_radii = s
+                    .split(',')
                     .map(|v| {
                         let v = v.trim();
                         parse_f64(v, "--search-radii")
@@ -78,13 +88,19 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                     .collect::<Result<Vec<f64>>>()?;
             }
             "--min-neighbors" => {
-                cfg.min_neighbors = parse_usize(next_value(args, &mut i, "--min-neighbors")?, "--min-neighbors")?;
+                cfg.min_neighbors = parse_usize(
+                    next_value(args, &mut i, "--min-neighbors")?,
+                    "--min-neighbors",
+                )?;
             }
             "--hag-model" => {
                 cfg.hag_model = Some(PathBuf::from(next_value(args, &mut i, "--hag-model")?));
             }
             "--threads" => {
-                cfg.threads = Some(parse_usize(next_value(args, &mut i, "--threads")?, "--threads")?);
+                cfg.threads = Some(parse_usize(
+                    next_value(args, &mut i, "--threads")?,
+                    "--threads",
+                )?);
             }
             "--debug-csv" => {
                 cfg.debug_csv = true;
@@ -93,8 +109,10 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                 cfg.outlier_removal = true;
             }
             "--outlier-radius" => {
-                cfg.outlier_radius =
-                    parse_f64(next_value(args, &mut i, "--outlier-radius")?, "--outlier-radius")?;
+                cfg.outlier_radius = parse_f64(
+                    next_value(args, &mut i, "--outlier-radius")?,
+                    "--outlier-radius",
+                )?;
             }
             "--outlier-elev-diff" => {
                 cfg.outlier_elev_diff = parse_f64(
@@ -104,6 +122,12 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             }
             "--outlier-use-median" => {
                 cfg.outlier_use_median = true;
+            }
+            "--block-overlap" => {
+                cfg.block_overlap = parse_f64(
+                    next_value(args, &mut i, "--block-overlap")?,
+                    "--block-overlap",
+                )?;
             }
             unknown => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -116,9 +140,7 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
 
     // Validate required arguments.
     if cfg.input.as_os_str().is_empty() {
-        return Err(ClassifierError::Pipeline(
-            "--input is required".to_string(),
-        ));
+        return Err(ClassifierError::Pipeline("--input is required".to_string()));
     }
     if cfg.output_dir.as_os_str().is_empty() {
         return Err(ClassifierError::Pipeline(
@@ -170,6 +192,16 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             "--outlier-elev-diff must be a non-negative finite number".to_string(),
         ));
     }
+    if cfg.block_overlap < 0.0 || !cfg.block_overlap.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--block-overlap must be >= 0.0 and finite".to_string(),
+        ));
+    }
+    if cfg.block_overlap >= cfg.block_size {
+        return Err(ClassifierError::Pipeline(
+            "--block-overlap must be less than --block-size".to_string(),
+        ));
+    }
 
     Ok(cfg)
 }
@@ -211,6 +243,12 @@ fn print_help() {
            --hag-model     <path>  DTM raster for Height Above Ground (default: block-min-z proxy)\n\
            --threads       <uint>  Rayon thread pool size (default: system cores)\n\
            --debug-csv             Also emit per-block .csv files alongside .feat files\n\
+         \n\
+         BLOCK OVERLAP (disabled by default):\n\
+           --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
+                                       Recommended: block-size / 2.  Must be < block-size.\n\
+                                       Border points augment the k-d tree for edge-accurate features\n\
+                                       but are never written to .feat output files.\n\
          \n\
          OUTLIER REMOVAL (disabled by default):\n\
            --outlier-removal           Enable lidar_remove_outliers pre-pass (whole-file)\n\

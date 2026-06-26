@@ -10,7 +10,14 @@
 //! while Stage 02's `layers::Linear` stores it as `[d_output, d_input]`.
 //! The bridge transposes the extracted tensors to reconcile this difference.
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate, clippy::doc_markdown)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::doc_markdown
+)]
 
 use burn::{
     module::Module,
@@ -84,7 +91,7 @@ impl<B: Backend> Stn3d<B> {
         // source tensor in the LAST dimension.  max_dim(0) on [N, 1024] violates
         // this.  Workaround: transpose to [1024, N], max over last dim → [1024, 1],
         // transpose back → [1, 1024].
-        let g = h.transpose().max_dim(1).transpose();   // [1, 1024]
+        let g = h.transpose().max_dim(1).transpose(); // [1, 1024]
 
         let g = self.fc0.forward(g);
         let g = apply_bn2d(g, &self.bn_fc0);
@@ -94,11 +101,11 @@ impl<B: Backend> Stn3d<B> {
         let g = apply_bn2d(g, &self.bn_fc1);
         let g = g.clamp_min(0.0);
 
-        let g = self.fc2.forward(g);                    // [1, 9]
-        let g = g.reshape([3, 3]);                      // [3, 3]
+        let g = self.fc2.forward(g); // [1, 9]
+        let g = g.reshape([3, 3]); // [3, 3]
 
         let eye = identity_2d::<B>(3, &device);
-        g + eye                                          // [3, 3]
+        g + eye // [3, 3]
     }
 }
 
@@ -159,7 +166,7 @@ impl<B: Backend> Stn64d<B> {
 
         // Same transpose workaround as Stn3d: [N, 1024] → [1024, N] → max over
         // last dim → [1024, 1] → transpose → [1, 1024].
-        let g = h.transpose().max_dim(1).transpose();   // [1, 1024]
+        let g = h.transpose().max_dim(1).transpose(); // [1, 1024]
 
         let g = self.fc0.forward(g);
         let g = apply_bn2d(g, &self.bn_fc0);
@@ -169,7 +176,7 @@ impl<B: Backend> Stn64d<B> {
         let g = apply_bn2d(g, &self.bn_fc1);
         let g = g.clamp_min(0.0);
 
-        let g = self.fc2.forward(g);                    // [1, 4096]
+        let g = self.fc2.forward(g); // [1, 4096]
         let g = g.reshape([64, 64]);
 
         let eye = identity_2d::<B>(64, &device);
@@ -233,7 +240,11 @@ impl<B: Backend> BurnPointNet<B> {
 
         Ok(Self {
             stn3d: Stn3d::new(device),
-            stn64d: if cfg.use_feature_tnet { Some(Stn64d::new(device)) } else { None },
+            stn64d: if cfg.use_feature_tnet {
+                Some(Stn64d::new(device))
+            } else {
+                None
+            },
 
             // Use cfg.n_features_in so multi-scale feature counts (Stage 06) are
             // correctly wired into the first encoder layer.
@@ -265,35 +276,35 @@ impl<B: Backend> BurnPointNet<B> {
         // ── Input T-Net (STN3d) ────────────────────────────────────────────
         // Always extract the first 3 features (x_norm, y_norm, z_norm) for the
         // spatial transform, regardless of total feature count.
-        let xyz = input.clone().narrow(1, 0, 3);  // [N, 3] — always first 3 features
+        let xyz = input.clone().narrow(1, 0, 3); // [N, 3] — always first 3 features
         let t1 = self.stn3d.forward(xyz.clone()); // [3, 3]
-        // Apply transform: xyz_new = xyz @ T1  → [N, 3]
-        let xyz_new = xyz.matmul(t1);             // [N, 3]
-        // Build transformed input: replace columns 0..3 with xyz_new, keep the rest
-        let rest = input.narrow(1, 3, n_feat - 3);   // [N, n_feat-3]
-        let input = Tensor::cat(vec![xyz_new, rest], 1);   // [N, n_feat]
+                                                  // Apply transform: xyz_new = xyz @ T1  → [N, 3]
+        let xyz_new = xyz.matmul(t1); // [N, 3]
+                                      // Build transformed input: replace columns 0..3 with xyz_new, keep the rest
+        let rest = input.narrow(1, 3, n_feat - 3); // [N, n_feat-3]
+        let input = Tensor::cat(vec![xyz_new, rest], 1); // [N, n_feat]
 
         // ── Encoder Layer 0 (save as local_feat) ──────────────────────────
         let local_feat = {
-            let h = self.enc0.forward(input);              // [N, 64]
+            let h = self.enc0.forward(input); // [N, 64]
             let h = apply_bn2d(h, &self.bn_enc0);
             h.clamp_min(0.0)
         };
 
         // ── Feature T-Net (optional) ──────────────────────────────────────
         let local_feat = if let Some(stn64d) = &self.stn64d {
-            let t2 = stn64d.forward(local_feat.clone());   // [64, 64]
+            let t2 = stn64d.forward(local_feat.clone()); // [64, 64]
             local_feat.matmul(t2)
         } else {
             local_feat
         };
 
         // ── Encoder Layers 1+ ─────────────────────────────────────────────
-        let h = self.enc1.forward(local_feat.clone());     // [N, 128]
+        let h = self.enc1.forward(local_feat.clone()); // [N, 128]
         let h = apply_bn2d(h, &self.bn_enc1);
         let h = h.clamp_min(0.0);
 
-        let h = self.enc2.forward(h);                      // [N, 256]
+        let h = self.enc2.forward(h); // [N, 256]
         let h = apply_bn2d(h, &self.bn_enc2);
         let h = h.clamp_min(0.0);
 
@@ -308,26 +319,23 @@ impl<B: Backend> BurnPointNet<B> {
         let combined = Tensor::cat(vec![local_feat, global], 1); // [N, 320]
 
         // ── Decoder ───────────────────────────────────────────────────────
-        let h = self.dec0.forward(combined);               // [N, 256]
+        let h = self.dec0.forward(combined); // [N, 256]
         let h = apply_bn2d(h, &self.bn_dec0);
         let h = h.clamp_min(0.0);
 
-        let h = self.dec1.forward(h);                      // [N, 128]
+        let h = self.dec1.forward(h); // [N, 128]
         let h = apply_bn2d(h, &self.bn_dec1);
         let h = h.clamp_min(0.0);
 
-        self.proj.forward(h)                               // [N, n_classes]
+        self.proj.forward(h) // [N, n_classes]
     }
 
     /// Return a `Vec<usize>` of per-point class indices.
     pub fn classify(&self, input: Tensor<B, 2>) -> Vec<usize> {
-        let logits = self.forward(input);                  // [N, n_classes]
+        let logits = self.forward(input); // [N, n_classes]
         let n = logits.dims()[0];
         let nc = logits.dims()[1];
-        let flat: Vec<f32> = logits
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap_or_default();
+        let flat: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap_or_default();
         (0..n)
             .map(|i| {
                 let row = &flat[i * nc..(i + 1) * nc];
@@ -378,9 +386,9 @@ pub fn labels_to_tensor<B: Backend>(
 /// Apply `BatchNorm<B, 1>` to a 2D tensor `[N, C]` by reshaping to `[N, C, 1]`.
 fn apply_bn2d<B: Backend>(x: Tensor<B, 2>, bn: &nn::BatchNorm<B, 1>) -> Tensor<B, 2> {
     let [n, c] = x.dims();
-    let x3 = x.reshape([n, c, 1]);      // [N, C, 1]
-    let x3 = bn.forward(x3);           // [N, C, 1]
-    x3.reshape([n, c])                 // [N, C]
+    let x3 = x.reshape([n, c, 1]); // [N, C, 1]
+    let x3 = bn.forward(x3); // [N, C, 1]
+    x3.reshape([n, c]) // [N, C]
 }
 
 /// Create a `k×k` identity matrix as a burn tensor.
@@ -399,8 +407,8 @@ fn identity_2d<B: Backend>(k: usize, device: &B::Device) -> Tensor<B, 2> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use crate::preprocessing::N_FEATURES;
+    use burn::backend::NdArray;
 
     type B = NdArray;
 
@@ -423,7 +431,9 @@ mod tests {
         let model = BurnPointNet::<B>::new(&cfg, &device).unwrap();
 
         let n = 32usize;
-        let flat: Vec<f32> = (0..(n * N_FEATURES)).map(|i| (i % 100) as f32 / 100.0).collect();
+        let flat: Vec<f32> = (0..(n * N_FEATURES))
+            .map(|i| (i % 100) as f32 / 100.0)
+            .collect();
         let input = features_to_tensor::<B>(flat, n, N_FEATURES, &device);
 
         let out = model.forward(input);

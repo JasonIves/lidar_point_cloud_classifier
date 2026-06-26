@@ -23,11 +23,11 @@
 //! its intended neighbourhood size.  Degenerate cases (fewer than 3 neighbours)
 //! fall back to `[0.0; 5]`.
 
-use nalgebra::{Matrix3, linalg::SymmetricEigen};
+use nalgebra::{linalg::SymmetricEigen, Matrix3};
 use wblidar::PointRecord;
 
-use crate::preprocessing::spatial_index::BlockSpatialIndex;
 use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, DtmView};
+use crate::preprocessing::spatial_index::BlockSpatialIndex;
 
 /// Extract the full feature vector for every point in `pts`.
 ///
@@ -77,7 +77,7 @@ pub fn extract_features(
         .map(|(s, pt)| {
             let center = [pt.x, pt.y, pt.z];
             let mut row = Vec::with_capacity(row_len);
-            row.extend_from_slice(&s);  // indices 0–6
+            row.extend_from_slice(&s); // indices 0–6
 
             for &radius in search_radii {
                 let indices = if multi_scale {
@@ -150,11 +150,7 @@ fn eigenvalue_features(all_pts: &[PointRecord], indices: &[usize]) -> [f32; 5] {
     cyz /= n;
     czz /= n;
 
-    let cov = Matrix3::new(
-        cxx, cxy, cxz,
-        cxy, cyy, cyz,
-        cxz, cyz, czz,
-    );
+    let cov = Matrix3::new(cxx, cxy, cxz, cxy, cyy, cyz, cxz, cyz, czz);
 
     let eig = SymmetricEigen::new(cov);
     // nalgebra returns eigenvalues in ascending order; we want λ1 ≥ λ2 ≥ λ3.
@@ -173,16 +169,20 @@ fn eigenvalue_features(all_pts: &[PointRecord], indices: &[usize]) -> [f32; 5] {
     // f64→f32 precision loss is intentional: all values are clamped to [0,1]
     // or are the cube-root of a product of small eigenvalues.
     #[allow(clippy::cast_precision_loss)]
-    let linearity   = ((l1 - l2) / l1).clamp(0.0, 1.0) as f32;
+    let linearity = ((l1 - l2) / l1).clamp(0.0, 1.0) as f32;
     #[allow(clippy::cast_precision_loss)]
-    let planarity   = ((l2 - l3) / l1).clamp(0.0, 1.0) as f32;
+    let planarity = ((l2 - l3) / l1).clamp(0.0, 1.0) as f32;
     #[allow(clippy::cast_precision_loss)]
-    let sphericity  = (l3 / l1).clamp(0.0, 1.0) as f32;
+    let sphericity = (l3 / l1).clamp(0.0, 1.0) as f32;
     #[allow(clippy::cast_precision_loss)]
     let omnivariance = (l1 * l2 * l3).cbrt() as f32;
     let sum = l1 + l2 + l3;
     #[allow(clippy::cast_precision_loss)]
-    let curvature   = if sum < 1e-12 { 0.0 } else { (l3 / sum).clamp(0.0, 1.0) as f32 };
+    let curvature = if sum < 1e-12 {
+        0.0
+    } else {
+        (l3 / sum).clamp(0.0, 1.0) as f32
+    };
 
     [linearity, planarity, sphericity, omnivariance, curvature]
 }
@@ -195,7 +195,9 @@ mod tests {
 
     fn pt(x: f64, y: f64, z: f64) -> PointRecord {
         let mut p = PointRecord::default();
-        p.x = x; p.y = y; p.z = z;
+        p.x = x;
+        p.y = y;
+        p.z = z;
         p.intensity = 32767;
         p.return_number = 1;
         p.number_of_returns = 1;
@@ -210,34 +212,56 @@ mod tests {
     fn test_eigenvalue_features_planar_cloud() {
         let pts = vec![
             pt(-1.0, 0.0, 0.0),
-            pt( 1.0, 0.0, 0.0),
-            pt( 0.0,-1.0, 0.0),
-            pt( 0.0, 1.0, 0.0),
-            pt( 0.0, 0.0, 0.0), // centroid
+            pt(1.0, 0.0, 0.0),
+            pt(0.0, -1.0, 0.0),
+            pt(0.0, 1.0, 0.0),
+            pt(0.0, 0.0, 0.0), // centroid
         ];
         let indices: Vec<usize> = (0..pts.len()).collect();
         let feats = eigenvalue_features(&pts, &indices);
 
         // λ3 ≈ 0 → sphericity ≈ 0, curvature ≈ 0
-        assert!(feats[2] < 0.01, "sphericity should be ~0 for planar cloud, got {}", feats[2]);
-        assert!(feats[4] < 0.01, "curvature should be ~0 for planar cloud, got {}", feats[4]);
+        assert!(
+            feats[2] < 0.01,
+            "sphericity should be ~0 for planar cloud, got {}",
+            feats[2]
+        );
+        assert!(
+            feats[4] < 0.01,
+            "curvature should be ~0 for planar cloud, got {}",
+            feats[4]
+        );
         // Planarity should be non-trivial (l2 > l3)
-        assert!(feats[1] > 0.0, "planarity should be positive, got {}", feats[1]);
+        assert!(
+            feats[1] > 0.0,
+            "planarity should be positive, got {}",
+            feats[1]
+        );
     }
 
     /// A perfectly linear cloud along the X axis.
     /// Expected: linearity ≈ 1, planarity ≈ 0, sphericity ≈ 0.
     #[test]
     fn test_eigenvalue_features_linear_cloud() {
-        let pts: Vec<PointRecord> = (-5..=5)
-            .map(|i| pt(i as f64, 0.0, 0.0))
-            .collect();
+        let pts: Vec<PointRecord> = (-5..=5).map(|i| pt(i as f64, 0.0, 0.0)).collect();
         let indices: Vec<usize> = (0..pts.len()).collect();
         let feats = eigenvalue_features(&pts, &indices);
 
-        assert!(feats[0] > 0.9, "linearity should be ~1 for linear cloud, got {}", feats[0]);
-        assert!(feats[1] < 0.1, "planarity should be ~0 for linear cloud, got {}", feats[1]);
-        assert!(feats[2] < 0.1, "sphericity should be ~0 for linear cloud, got {}", feats[2]);
+        assert!(
+            feats[0] > 0.9,
+            "linearity should be ~1 for linear cloud, got {}",
+            feats[0]
+        );
+        assert!(
+            feats[1] < 0.1,
+            "planarity should be ~0 for linear cloud, got {}",
+            feats[1]
+        );
+        assert!(
+            feats[2] < 0.1,
+            "sphericity should be ~0 for linear cloud, got {}",
+            feats[2]
+        );
     }
 
     /// Degenerate case: fewer than 3 neighbours → all-zero features.
@@ -268,21 +292,30 @@ mod tests {
             &all_pts,
             &index,
             None,
-            0.0, 0.0,
+            0.0,
+            0.0,
             50.0,
-            &[5.0],   // single radius
+            &[5.0], // single radius
             3,
         );
 
         assert_eq!(feats.len(), all_pts.len());
         for row in &feats {
-            assert_eq!(row.len(), crate::preprocessing::N_FEATURES, "single-radius should produce 12 features");
+            assert_eq!(
+                row.len(),
+                crate::preprocessing::N_FEATURES,
+                "single-radius should produce 12 features"
+            );
             // Scalar features (0–6) should be in [0,1]
             for &v in &row[0..7] {
                 assert!((0.0..=1.0).contains(&v), "scalar feature out of range: {v}");
             }
             // omnivariance (index 10) can be > 1, just check it's non-negative
-            assert!(row[10] >= 0.0, "omnivariance must be non-negative: {}", row[10]);
+            assert!(
+                row[10] >= 0.0,
+                "omnivariance must be non-negative: {}",
+                row[10]
+            );
         }
     }
 
@@ -299,9 +332,10 @@ mod tests {
             &all_pts,
             &index,
             None,
-            0.0, 0.0,
+            0.0,
+            0.0,
             50.0,
-            &[1.0, 3.0, 6.0],  // 3 radii
+            &[1.0, 3.0, 6.0], // 3 radii
             3,
         );
 
@@ -315,13 +349,12 @@ mod tests {
     /// Single-radius extract_features output matches the legacy N_FEATURES baseline.
     #[test]
     fn test_extract_features_single_radius_matches_legacy_width() {
-        let all_pts: Vec<PointRecord> = (0..10)
-            .map(|i| pt(i as f64, 0.0, 0.0))
-            .collect();
+        let all_pts: Vec<PointRecord> = (0..10).map(|i| pt(i as f64, 0.0, 0.0)).collect();
         let index = BlockSpatialIndex::build(&all_pts);
 
         // Single radius in the Vec form
-        let feats_new = extract_features(&all_pts, &all_pts, &index, None, 0.0, 0.0, 50.0, &[2.0], 3);
+        let feats_new =
+            extract_features(&all_pts, &all_pts, &index, None, 0.0, 0.0, 50.0, &[2.0], 3);
         // All rows should be exactly N_FEATURES wide
         for row in &feats_new {
             assert_eq!(row.len(), crate::preprocessing::N_FEATURES);

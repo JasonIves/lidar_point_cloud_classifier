@@ -107,10 +107,19 @@ impl BatchNorm1d {
         if beta.len() != n || mean.len() != n || var.len() != n {
             return Err(ClassifierError::Pipeline(format!(
                 "BatchNorm1d: parameter length mismatch (gamma={}, beta={}, mean={}, var={})",
-                n, beta.len(), mean.len(), var.len()
+                n,
+                beta.len(),
+                mean.len(),
+                var.len()
             )));
         }
-        Ok(Self { gamma, beta, mean, var, eps: 1e-5 })
+        Ok(Self {
+            gamma,
+            beta,
+            mean,
+            var,
+            eps: 1e-5,
+        })
     }
 
     /// Normalise an `[N, features]` matrix in-place, returning the result.
@@ -125,8 +134,7 @@ impl BatchNorm1d {
                 self.gamma.len()
             )));
         }
-        let inv_std: Array1<f32> =
-            self.var.mapv(|v| 1.0_f32 / (v + self.eps).sqrt());
+        let inv_std: Array1<f32> = self.var.mapv(|v| 1.0_f32 / (v + self.eps).sqrt());
         // Broadcast: input[N, C] → subtract mean[C], multiply scale[C], add beta[C]
         let centered = input - &self.mean;
         let normed = centered * &inv_std;
@@ -141,11 +149,11 @@ impl BatchNorm1d {
         if input.len() != self.gamma.len() {
             return Err(ClassifierError::Pipeline(format!(
                 "BatchNorm1d::forward_1d: input len ({}) != num features ({})",
-                input.len(), self.gamma.len()
+                input.len(),
+                self.gamma.len()
             )));
         }
-        let inv_std: Array1<f32> =
-            self.var.mapv(|v| 1.0_f32 / (v + self.eps).sqrt());
+        let inv_std: Array1<f32> = self.var.mapv(|v| 1.0_f32 / (v + self.eps).sqrt());
         let normed = (input - &self.mean) * &inv_std;
         Ok(normed * &self.gamma + &self.beta)
     }
@@ -225,7 +233,8 @@ impl TNet {
         if input.ncols() != self.k {
             return Err(ClassifierError::Pipeline(format!(
                 "TNet::forward: input cols ({}) != k ({})",
-                input.ncols(), self.k
+                input.ncols(),
+                self.k
             )));
         }
 
@@ -262,7 +271,8 @@ impl TNet {
         if g.len() != k * k {
             return Err(ClassifierError::Pipeline(format!(
                 "TNet::forward: final FC output len ({}) != k² ({})",
-                g.len(), k * k
+                g.len(),
+                k * k
             )));
         }
         let transform = Array2::from_shape_vec((k, k), g.to_vec())
@@ -285,10 +295,7 @@ impl TNet {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Apply an optional `BatchNorm1d` to a 2-D array (no-op when `bn` is `None`).
-pub(crate) fn apply_bn2d(
-    x: Array2<f32>,
-    bn: Option<&BatchNorm1d>,
-) -> Result<Array2<f32>> {
+pub(crate) fn apply_bn2d(x: Array2<f32>, bn: Option<&BatchNorm1d>) -> Result<Array2<f32>> {
     match bn {
         Some(b) => b.forward(x),
         None => Ok(x),
@@ -296,10 +303,7 @@ pub(crate) fn apply_bn2d(
 }
 
 /// Apply an optional `BatchNorm1d` to a 1-D vector (no-op when `bn` is `None`).
-pub(crate) fn apply_bn1d(
-    x: Array1<f32>,
-    bn: Option<&BatchNorm1d>,
-) -> Result<Array1<f32>> {
+pub(crate) fn apply_bn1d(x: Array1<f32>, bn: Option<&BatchNorm1d>) -> Result<Array1<f32>> {
     match bn {
         Some(b) => b.forward_1d(x),
         None => Ok(x),
@@ -327,10 +331,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (4, 3),
             vec![
-                1.0, 2.0, 3.0,
-                4.0, 5.0, 6.0,
-                0.0, 0.0, 0.0,
-                -1.0, -2.0, -3.0,
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, -1.0, -2.0, -3.0,
             ],
         )
         .unwrap();
@@ -338,8 +339,16 @@ mod tests {
         let out = linear.forward(&x)?;
         assert_eq!(out.shape(), &[4, 2]);
         // Row 0: [1*1+2*0+3*0+0.5, 1*0+2*1+3*0-0.5] = [1.5, 1.5]
-        assert!((out[[0, 0]] - 1.5).abs() < 1e-6, "out[0,0] = {}", out[[0,0]]);
-        assert!((out[[0, 1]] - 1.5).abs() < 1e-6, "out[0,1] = {}", out[[0,1]]);
+        assert!(
+            (out[[0, 0]] - 1.5).abs() < 1e-6,
+            "out[0,0] = {}",
+            out[[0, 0]]
+        );
+        assert!(
+            (out[[0, 1]] - 1.5).abs() < 1e-6,
+            "out[0,1] = {}",
+            out[[0, 1]]
+        );
         // Row 2 (zero input): [0.5, -0.5]
         assert!((out[[2, 0]] - 0.5).abs() < 1e-6);
         assert!((out[[2, 1]] + 0.5).abs() < 1e-6);
@@ -362,9 +371,9 @@ mod tests {
     fn test_batchnorm1d_inference_mode() -> Result<()> {
         // For gamma=1, beta=0, mean=0, var=1: output should equal input
         let gamma = Array1::from_vec(vec![1.0f32, 1.0]);
-        let beta  = Array1::zeros(2);
-        let mean  = Array1::zeros(2);
-        let var   = Array1::from_vec(vec![1.0f32, 1.0]);
+        let beta = Array1::zeros(2);
+        let mean = Array1::zeros(2);
+        let var = Array1::from_vec(vec![1.0f32, 1.0]);
         let bn = BatchNorm1d::new(gamma, beta, mean, var)?;
 
         let x = Array2::from_shape_vec((3, 2), vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
@@ -372,34 +381,43 @@ mod tests {
         // With mean=0, var=1: y = 1 * (x-0)/sqrt(1+1e-5) + 0 ≈ x
         for i in 0..3 {
             for j in 0..2 {
-                assert!((out[[i, j]] - x[[i, j]]).abs() < 1e-4,
-                    "bn out[{i},{j}] = {} expected ≈ {}", out[[i,j]], x[[i,j]]);
+                assert!(
+                    (out[[i, j]] - x[[i, j]]).abs() < 1e-4,
+                    "bn out[{i},{j}] = {} expected ≈ {}",
+                    out[[i, j]],
+                    x[[i, j]]
+                );
             }
         }
 
         // Non-trivial: gamma=2, beta=1, mean=1, var=4  → y = 2*(x-1)/sqrt(4+eps)+1
         let gamma2 = Array1::from_vec(vec![2.0f32, 2.0]);
-        let beta2  = Array1::from_vec(vec![1.0f32, 1.0]);
-        let mean2  = Array1::from_vec(vec![1.0f32, 1.0]);
-        let var2   = Array1::from_vec(vec![4.0f32, 4.0]);
+        let beta2 = Array1::from_vec(vec![1.0f32, 1.0]);
+        let mean2 = Array1::from_vec(vec![1.0f32, 1.0]);
+        let var2 = Array1::from_vec(vec![4.0f32, 4.0]);
         let bn2 = BatchNorm1d::new(gamma2, beta2, mean2, var2)?;
         let x2 = array![[3.0f32, 5.0]];
         let out2 = bn2.forward(x2)?;
         // y[0,0] = 2*(3-1)/sqrt(4+1e-5)+1 ≈ 2*2/2+1 = 3.0
         // y[0,1] = 2*(5-1)/sqrt(4+1e-5)+1 ≈ 2*4/2+1 = 5.0
-        assert!((out2[[0, 0]] - 3.0).abs() < 1e-3, "out2[0,0] = {}", out2[[0,0]]);
-        assert!((out2[[0, 1]] - 5.0).abs() < 1e-3, "out2[0,1] = {}", out2[[0,1]]);
+        assert!(
+            (out2[[0, 0]] - 3.0).abs() < 1e-3,
+            "out2[0,0] = {}",
+            out2[[0, 0]]
+        );
+        assert!(
+            (out2[[0, 1]] - 5.0).abs() < 1e-3,
+            "out2[0,1] = {}",
+            out2[[0, 1]]
+        );
         Ok(())
     }
 
     // DoD #6 — ReLU
     #[test]
     fn test_relu_zeros_negatives() {
-        let x = Array2::from_shape_vec(
-            (2, 3),
-            vec![-1.0f32, 0.0, 1.0, -100.0, 0.5, -0.001],
-        )
-        .unwrap();
+        let x =
+            Array2::from_shape_vec((2, 3), vec![-1.0f32, 0.0, 1.0, -100.0, 0.5, -0.001]).unwrap();
         let out = relu(&x);
         assert_eq!(out[[0, 0]], 0.0);
         assert_eq!(out[[0, 1]], 0.0);
@@ -416,18 +434,15 @@ mod tests {
         let x = Array2::from_shape_vec(
             (4, 3),
             vec![
-                1.0f32, 5.0, -1.0,
-                3.0,   2.0,  0.0,
-                -2.0,  4.0,  7.0,
-                0.0,   1.0,  3.0,
+                1.0f32, 5.0, -1.0, 3.0, 2.0, 0.0, -2.0, 4.0, 7.0, 0.0, 1.0, 3.0,
             ],
         )
         .unwrap();
         let pool = global_max_pool(&x.view());
         assert_eq!(pool.len(), 3);
-        assert!((pool[0] - 3.0).abs() < 1e-6);  // max of col 0
-        assert!((pool[1] - 5.0).abs() < 1e-6);  // max of col 1
-        assert!((pool[2] - 7.0).abs() < 1e-6);  // max of col 2
+        assert!((pool[0] - 3.0).abs() < 1e-6); // max of col 0
+        assert!((pool[1] - 5.0).abs() < 1e-6); // max of col 1
+        assert!((pool[2] - 7.0).abs() < 1e-6); // max of col 2
     }
 
     // DoD #8 — STN3d produces [3,3] output and identity weights → identity
@@ -439,17 +454,23 @@ mod tests {
         let tnet = make_tnet_zeros(3)?;
         let pts = Array2::from_shape_vec(
             (5, 3),
-            vec![1.0f32, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0,
-                 1.0, 1.0, 0.0,  0.0, 1.0, 1.0],
-        ).unwrap();
+            vec![
+                1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+            ],
+        )
+        .unwrap();
         let t = tnet.forward(&pts)?;
         assert_eq!(t.shape(), &[3, 3]);
         // T should equal I₃ (all linear layers output 0 → fc2 outputs 0 → reshape + I)
         let identity = Array2::<f32>::eye(3);
         for i in 0..3 {
             for j in 0..3 {
-                assert!((t[[i, j]] - identity[[i, j]]).abs() < 1e-5,
-                    "T[{i},{j}] = {} expected {}", t[[i,j]], identity[[i,j]]);
+                assert!(
+                    (t[[i, j]] - identity[[i, j]]).abs() < 1e-5,
+                    "T[{i},{j}] = {} expected {}",
+                    t[[i, j]],
+                    identity[[i, j]]
+                );
             }
         }
         Ok(())
@@ -469,15 +490,15 @@ mod tests {
     fn make_tnet_zeros(k: usize) -> Result<TNet> {
         Ok(TNet {
             k,
-            enc0: Linear::new(Array2::zeros((64, k)),    Array1::zeros(64))?,
-            enc1: Linear::new(Array2::zeros((128, 64)),  Array1::zeros(128))?,
-            enc2: Linear::new(Array2::zeros((1024, 128)),Array1::zeros(1024))?,
+            enc0: Linear::new(Array2::zeros((64, k)), Array1::zeros(64))?,
+            enc1: Linear::new(Array2::zeros((128, 64)), Array1::zeros(128))?,
+            enc2: Linear::new(Array2::zeros((1024, 128)), Array1::zeros(1024))?,
             bn_enc0: None,
             bn_enc1: None,
             bn_enc2: None,
             fc0: Linear::new(Array2::zeros((512, 1024)), Array1::zeros(512))?,
-            fc1: Linear::new(Array2::zeros((256, 512)),  Array1::zeros(256))?,
-            fc2: Linear::new(Array2::zeros((k*k, 256)),  Array1::zeros(k*k))?,
+            fc1: Linear::new(Array2::zeros((256, 512)), Array1::zeros(256))?,
+            fc2: Linear::new(Array2::zeros((k * k, 256)), Array1::zeros(k * k))?,
             bn_fc0: None,
             bn_fc1: None,
         })
