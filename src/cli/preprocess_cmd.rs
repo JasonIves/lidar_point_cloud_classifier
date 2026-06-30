@@ -103,10 +103,10 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                 )?);
             }
             "--debug-csv" => {
-                cfg.debug_csv = true;
+                cfg.debug_csv = parse_optional_bool(args, &mut i, true);
             }
             "--outlier-removal" => {
-                cfg.outlier_removal = true;
+                cfg.outlier_removal = parse_optional_bool(args, &mut i, true);
             }
             "--outlier-radius" => {
                 cfg.outlier_radius = parse_f64(
@@ -121,7 +121,7 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                 )?;
             }
             "--outlier-use-median" => {
-                cfg.outlier_use_median = true;
+                cfg.outlier_use_median = parse_optional_bool(args, &mut i, true);
             }
             "--block-overlap" => {
                 cfg.block_overlap = parse_f64(
@@ -204,6 +204,29 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     }
 
     Ok(cfg)
+}
+
+/// If the next token after a boolean flag is literally `"true"` or `"false"`,
+/// consume it and return the parsed value.  Otherwise leave `i` unchanged and
+/// return `default_val`.  This lets callers use either style:
+///   `--outlier-removal`        (flag-only, sets true)
+///   `--outlier-removal true`   (explicit value)
+///   `--outlier-removal false`  (explicit disable)
+fn parse_optional_bool(args: &[String], i: &mut usize, default_val: bool) -> bool {
+    if let Some(next) = args.get(*i + 1) {
+        match next.as_str() {
+            "true" | "1" | "yes" => {
+                *i += 1;
+                return true;
+            }
+            "false" | "0" | "no" => {
+                *i += 1;
+                return false;
+            }
+            _ => {}
+        }
+    }
+    default_val
 }
 
 fn next_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {

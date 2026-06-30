@@ -701,14 +701,32 @@ fn apply_swa(ckpt_dir: &Path, manifest: &CheckpointManifest, output_path: &Path)
 /// Weights are then normalized so the mean weight of present classes equals 1.0,
 /// keeping the loss magnitude stable across different β values.
 ///
+/// ## Absent-class floor
+///
+/// Absent classes (count = 0) receive a small positive floor weight
+/// (`ABSENT_CLASS_WEIGHT_FLOOR = 1e-3`) rather than `0.0`.
+///
+/// This is required because `burn`'s `CrossEntropyLoss` panics when any weight
+/// is exactly zero (it validates `weight > 0` for all entries).  A floor of
+/// `1e-3` is negligibly small compared to the normalized present-class weights
+/// (which average `1.0`), so absent classes contribute essentially nothing to
+/// the gradient while keeping the loss function well-defined regardless of the
+/// label map or dataset coverage.
+///
 /// # Special cases
-/// - `β ≈ 0.0` → uniform weights (all 1.0).
+/// - `β ≈ 0.0` → uniform weights (all 1.0 for present; floor for absent).
 /// - `β → 1.0` → approaches pure inverse-frequency weighting.
 ///
 /// # Panics
 /// Never panics — all edge cases (zero counts, zero present classes) return safe
 /// default values.
 pub fn compute_class_weights(counts: &[u64], beta: f64) -> Vec<f32> {
+    /// Minimum weight assigned to absent classes (count = 0).
+    /// Must be > 0 to satisfy `burn`'s `CrossEntropyLoss` validation.
+    /// Kept at 1e-3 so it is ~1000× smaller than a typical present-class weight
+    /// (which averages 1.0 after normalization).
+    const ABSENT_CLASS_WEIGHT_FLOOR: f32 = 1e-3;
+
     let n = counts.len();
     if n == 0 {
         return Vec::new();
@@ -721,7 +739,7 @@ pub fn compute_class_weights(counts: &[u64], beta: f64) -> Vec<f32> {
     }
 
     // Compute raw weights via effective number formula.
-    // For count[c] == 0: weight stays 0.0 (class absent from training set).
+    // For count[c] == 0: weight stays 0.0 initially; replaced by floor below.
     // For large counts: β^count underflows to 0.0, so effective_num saturates
     // at 1/(1-β) — the correct asymptotic behavior; no special handling needed.
     let one_minus_beta = 1.0 - beta;
@@ -753,7 +771,18 @@ pub fn compute_class_weights(counts: &[u64], beta: f64) -> Vec<f32> {
     }
 
     let scale = n_present as f64 / present_sum;
-    raw_weights.iter().map(|&w| (w * scale) as f32).collect()
+    raw_weights
+        .iter()
+        .map(|&w| {
+            if w == 0.0 {
+                // Absent class: replace zero with the floor so burn's
+                // CrossEntropyLoss doesn't panic on non-positive weights.
+                ABSENT_CLASS_WEIGHT_FLOOR
+            } else {
+                (w * scale) as f32
+            }
+        })
+        .collect()
 }
 
 fn write_training_summary(dir: &Path, best_miou: f64, duration_secs: f64, swa: bool) {
@@ -918,20 +947,31 @@ mod tests {
         );
     }
 
-    /// Absent class (count=0) receives weight 0.0 regardless of β.
+    /// Absent class (count=0) receives the ABSENT_CLASS_WEIGHT_FLOOR (1e-3)
+    /// rather than 0.0, so burn's CrossEntropyLoss does not panic.
     #[test]
     fn test_class_weight_absent_class_is_zero() {
         let counts = vec![1000u64, 0, 500];
         let weights = compute_class_weights(&counts, 0.999);
         assert_eq!(weights.len(), 3);
+        // Absent class must be the floor value, not 0.0.
         assert!(
-            weights[1].abs() < 1e-9,
-            "absent class should have weight 0.0, got {}",
+            weights[1] > 0.0,
+            "absent class must have positive floor weight, got {}",
             weights[1]
         );
-        // Present classes must have positive weights.
-        assert!(weights[0] > 0.0);
-        assert!(weights[2] > 0.0);
+        assert!(
+            weights[1] < 0.01,
+            "absent class floor should be small (< 0.01), got {}",
+            weights[1]
+        );
+        // Present classes must have weights much larger than the floor.
+        assert!(weights[0] > 0.1, "present class weight too small: {}", weights[0]);
+        assert!(weights[2] > 0.1, "present class weight too small: {}", weights[2]);
+        // All weights must be strictly positive (burn validation requirement).
+        for (i, &w) in weights.iter().enumerate() {
+            assert!(w > 0.0, "weight[{i}] must be > 0, got {w}");
+        }
     }
 
     #[test]

@@ -172,3 +172,31 @@ cold build).  The algorithm is now in `src/preprocessing/outlier_filter.rs`.
 5. `blocks.json` produced with `--outlier-removal` contains the four outlier fields. ✓
 6. Existing `blocks.json` files (without outlier fields) deserialize without error. ✓
 7. `cargo tree | grep wbtools_oss` returns empty. ✓
+
+---
+
+## Bugfix — 2026-06-29: `--outlier-removal true` rejected as unknown flag
+
+**Symptom:** Passing `--outlier-removal true` (explicit boolean value style) caused the
+parser to emit `preprocess-labeled: unknown flag 'true'`.
+
+**Root cause:** `--outlier-removal`, `--outlier-use-median`, and `--debug-csv` were
+implemented as pure boolean flags (no value consumed).  When a caller passed an explicit
+`true` or `false` value after the flag, the parser did not consume it, so the next
+iteration of the `while` loop tried to match `"true"` as a flag name and failed.
+
+**Fix:** Introduced a `parse_optional_bool(args, &mut i, default_val)` helper in both
+`src/cli/preprocess_cmd.rs` and `src/cli/preprocess_labeled_cmd.rs`.  The helper peeks
+at `args[i + 1]`; if it is one of `"true"`, `"1"`, `"yes"`, `"false"`, `"0"`, `"no"`,
+it consumes the token and returns the parsed value.  Otherwise it leaves `i` unchanged
+and returns `default_val`.  This makes all three boolean flags accept both invocation
+styles without breaking existing scripts that omit the value.
+
+**Files changed:**
+
+| File | Change |
+|---|---|
+| `src/cli/preprocess_cmd.rs` | `--debug-csv`, `--outlier-removal`, `--outlier-use-median` now call `parse_optional_bool`; helper added |
+| `src/cli/preprocess_labeled_cmd.rs` | Same three flags updated; helper added |
+
+**Verified:** `cargo build --features training` — `Finished` with zero errors. ✓

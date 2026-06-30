@@ -262,16 +262,80 @@ trainer to compute per-class inverse-frequency weights.
 
 ### Label Remapping (`--label-map` JSON)
 
-An optional JSON object mapping ASPRS byte codes (as string keys) to contiguous
-model class indices.  If absent, the default 8-class mapping from Stage 02 is applied:
+An optional JSON object that translates the raw classification byte stored in
+each LiDAR point into a 0-based model class index.  If absent, the default
+8-class ASPRS mapping from Stage 02 is applied.
+
+#### Key / Value Contract
+
+> **This is the most important thing to understand about label maps.  The two
+> sides of each entry mean completely different things.**
+
+| Side | What it represents | Constraints |
+|---|---|---|
+| **Key** (string) | The raw class code **as it appears in the `classification` byte of your LiDAR file** | Any integer; ASPRS codes, dataset-specific codes, or any numbering scheme your dataset uses.  Does **not** need to start at 0 or be contiguous. |
+| **Value** (integer) | The **model output slot index** — the position in the network’s output vector that represents this class during training and inference | Must form the contiguous zero-based set `{0, 1, 2, …, n-1}`.  No gaps, no skipped indices. |
+
+**Why the values must be `{0, 1, …, n-1}`:** The trainer allocates a
+class-weight vector of length `n_classes` and indexes it with the model class
+index directly.  A gap — e.g. values `{1, 2, 3}` instead of `{0, 1, 2}` — leaves
+slot 0 permanently empty (zero training points → zero weight), which causes
+`burn`’s `CrossEntropyLoss` to panic.  A hole in the middle — e.g. `{0, 1, 3}`
+— leaves slot 2 empty and causes slot 3 to be out-of-bounds.
+
+#### Examples
+
+**Default 8-class ASPRS mapping** (raw ASPRS codes → 0-based model slots):
 
 ```json
-{ "1": 7, "2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "7": 6, "9": 5 }
+{ "2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "9": 5, "7": 6, "1": 7 }
 ```
 
-Any ASPRS code not present in the map is assigned to index 7 (Unassigned).
-The remapping is applied once during `preprocess-labeled` and embedded in
-`labeled_blocks.json` — it is not re-applied at training time.
+Keys are ASPRS standard codes (Ground=2, Low Veg=3, …).  Values are compact
+model slots 0–7.  ASPRS code `1` (Unprocessed) maps to slot 7; any code absent
+from the map also falls back to slot 7 (the Unassigned index).
+
+**DALES dataset** (raw codes 1–8, zero-based model slots 0–7):
+
+```json
+{ "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6, "8": 7 }
+```
+
+DALES uses codes 1–8.  There is no code 0 in the dataset, so do **not** map
+`"0"` to anything — that would declare a model slot that is never populated
+in training data.
+
+**Non-ASPRS dataset with arbitrary codes** (e.g. codes 100, 200, 300):
+
+```json
+{ "100": 0, "200": 1, "300": 2 }
+```
+
+The keys can be any integers your dataset uses.  The values must still be
+`{0, 1, 2}`.
+
+#### Common Mistake
+
+A 1-based or identity mapping like `{"1":1, "2":2, …, "8":8}` is **wrong**.
+It declares model slot 0 but never populates it (no raw code maps to `0`),
+producing a zero-weight entry that causes a training panic.  Shift all values
+down by 1: `{"1":0, "2":1, …, "8":7}`.
+
+#### Runtime Validation
+
+At dataset load time (`LabeledBlockDataset::load`), the training pipeline
+validates that the label map values form a contiguous zero-based set.  A clear
+error is emitted if they do not:
+
+```
+label map has non-contiguous or non-zero-based model class indices: [1, 2, 3, …, 8]
+Model class indices (the VALUES in the label map JSON) must form the set {0, 1, …, n-1}.
+```
+
+Any raw code not present in the map is assigned to the Unassigned index
+(slot 7 in the default map; the highest slot in any custom map).  The remapping
+is applied once during `preprocess-labeled` and embedded in `labeled_blocks.json`
+for traceability — it is **not** re-applied at training time.
 
 ---
 

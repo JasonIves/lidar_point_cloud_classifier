@@ -86,10 +86,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 threads = Some(parse_usize(&args[i], "--threads")?);
             }
             "--debug-csv" => {
-                debug_csv = true;
+                debug_csv = parse_optional_bool(args, &mut i, true);
             }
             "--outlier-removal" => {
-                outlier_removal = true;
+                outlier_removal = parse_optional_bool(args, &mut i, true);
             }
             "--outlier-radius" => {
                 i += 1;
@@ -100,7 +100,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 outlier_elev_diff = parse_f64(&args[i], "--outlier-elev-diff")?;
             }
             "--outlier-use-median" => {
-                outlier_use_median = true;
+                outlier_use_median = parse_optional_bool(args, &mut i, true);
             }
             "--block-overlap" => {
                 i += 1;
@@ -250,6 +250,29 @@ fn print_usage() {
            --outlier-elev-diff <f64>   Residual threshold; exceeding removes point (default: 50.0)\n\
            --outlier-use-median        Use neighbourhood median instead of mean"
     );
+}
+
+/// If the next token after a boolean flag is literally `"true"` or `"false"`,
+/// consume it and return the parsed value.  Otherwise leave `i` unchanged and
+/// return `default_val`.  This lets callers use either style:
+///   `--outlier-removal`        (flag-only, sets true)
+///   `--outlier-removal true`   (explicit value)
+///   `--outlier-removal false`  (explicit disable)
+fn parse_optional_bool(args: &[String], i: &mut usize, default_val: bool) -> bool {
+    if let Some(next) = args.get(*i + 1) {
+        match next.as_str() {
+            "true" | "1" | "yes" => {
+                *i += 1;
+                return true;
+            }
+            "false" | "0" | "no" => {
+                *i += 1;
+                return false;
+            }
+            _ => {}
+        }
+    }
+    default_val
 }
 
 fn parse_f64(s: &str, flag: &str) -> Result<f64> {

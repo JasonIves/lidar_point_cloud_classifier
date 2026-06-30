@@ -134,12 +134,61 @@ impl LabeledBlockDataset {
                     ))
                 })?;
 
-            let nc = manifest
-                .label_map
-                .values()
-                .copied()
-                .max()
-                .map_or(8, |m| m as usize + 1);
+            // Derive n_classes from the number of *distinct* model class
+            // indices defined in the label map.
+            //
+            // WHY NOT max(values)+1:
+            // The previous formula used `max(label_map.values()) + 1` as an
+            // index-range upper bound.  That assumption breaks whenever any
+            // model class index in the range [0, max] is absent from the
+            // training data (e.g. raw code 0 = "never classified" in ASPRS,
+            // or any skipped code in a non-ASPRS dataset).  The absent class
+            // gets count=0 → weight=0.0 → burn's CrossEntropyLoss panics.
+            //
+            // The correct interpretation: the label map defines a finite,
+            // explicit set of output classes.  `n_classes` is simply the
+            // number of distinct values (model indices) in that set.
+            // `class_distribution` in each block only contains keys that
+            // actually appear, so the counts Vec is indexed by model class
+            // index and will naturally be 0 for indices not present in data —
+            // but now n_classes matches the declared set, not a max+1 guess.
+            //
+            // The floor weight (1e-3) in compute_class_weights handles the
+            // residual case where a declared class has no training samples.
+            //
+            // CONTRACT: label map values must form a 0-based contiguous set
+            // {0, 1, …, n-1}.  This is validated below.
+            let nc = {
+                let distinct: std::collections::BTreeSet<u8> =
+                    manifest.label_map.values().copied().collect();
+                if distinct.is_empty() {
+                    8 // safe fallback: matches TrainConfig::default().n_classes
+                } else {
+                    // Validate that values are 0-based contiguous: {0, 1, …, n-1}.
+                    // This is required because class_counts_train() uses model
+                    // class indices directly as Vec indices.  A gap (e.g. values
+                    // {1,2,3} instead of {0,1,2}) would leave slot 0 permanently
+                    // empty and cause index 3 to be out-of-bounds.
+                    let n = distinct.len();
+                    let expected: std::collections::BTreeSet<u8> =
+                        (0..n as u8).collect();
+                    if distinct != expected {
+                        let vals: Vec<u8> = distinct.into_iter().collect();
+                        return Err(ClassifierError::Pipeline(format!(
+                            "label map in '{}' has non-contiguous or non-zero-based \
+                             model class indices: {vals:?}.\n\
+                             Model class indices (the VALUES in the label map JSON) \
+                             must form the set {{0, 1, …, n-1}}.\n\
+                             Example for 8 classes: {{\"2\":0, \"3\":1, \"4\":2, \
+                             \"5\":3, \"6\":4, \"9\":5, \"7\":6, \"1\":7}}.\n\
+                             The KEYS are your raw dataset class codes (any values); \
+                             the VALUES are the 0-based model output indices.",
+                            dir.display()
+                        )));
+                    }
+                    n
+                }
+            };
 
             match validated_n_classes {
                 None => validated_n_classes = Some(nc),

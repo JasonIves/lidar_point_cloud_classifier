@@ -16,8 +16,8 @@
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc)]
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -276,28 +276,51 @@ impl PreprocessingPipeline {
             HashMap::new()
         };
 
-        // ── 5c. Pre-load border points sequentially (Stage 08) ────────────
-        // All spill files still exist at this point — no `load()` calls have
-        // happened yet — so reading neighbour spill files here is race-free.
-        // The resulting Vecs are zipped with `retained` in the parallel phase.
-        // When overlap is disabled this is a zero-cost `vec![Vec::new(); n]`.
-        let border_points_per_block: Vec<Vec<wblidar::PointRecord>> = if config.block_overlap > 0.0
-        {
-            retained
-                .iter()
-                .map(|stub| {
-                    load_border_points(
-                        &stubs_by_cell,
-                        &retained,
-                        stub,
-                        config.block_size,
-                        config.block_overlap,
-                    )
-                    .unwrap_or_default()
-                })
-                .collect()
+        // ── 5c. Spill border points to disk sequentially (Stage 08) ───────
+        //
+        // MEMORY DESIGN: Border points must NOT be held in a Vec<Vec<PointRecord>>
+        // spanning all blocks simultaneously.  With small block sizes (e.g. 5 m)
+        // a dataset can have thousands of blocks, each with hundreds of border
+        // points from up to 8 neighbours.  Accumulating all of them before the
+        // parallel phase would consume O(n_blocks × border_density) RAM — the
+        // root cause of the OOM crash.
+        //
+        // Instead, each block's border points are written to a temporary
+        // `.border` spill file (same raw binary format as `.spill` files) and
+        // only the file path is kept in memory.  The parallel closure loads and
+        // immediately drops the border data for one block at a time, bounding
+        // peak memory to:
+        //
+        //   (Rayon thread count) × (canonical_block + border_strip)
+        //
+        // rather than (all_blocks × border_strip).
+        //
+        // When overlap is disabled every entry is `None` — zero cost.
+        let border_spill_paths: Vec<Option<PathBuf>> = if config.block_overlap > 0.0 {
+            let mut paths = Vec::with_capacity(retained.len());
+            for stub in &retained {
+                let border_pts = load_border_points(
+                    &stubs_by_cell,
+                    &retained,
+                    stub,
+                    config.block_size,
+                    config.block_overlap,
+                )?;
+
+                if border_pts.is_empty() {
+                    paths.push(None);
+                } else {
+                    // Write to a uniquely named `.border` file in the output dir.
+                    let path = config
+                        .output_dir
+                        .join(format!("block_{:05}.border", stub.id));
+                    write_border_spill(&path, &border_pts)?;
+                    paths.push(Some(path));
+                }
+            }
+            paths
         } else {
-            vec![Vec::new(); retained.len()]
+            vec![None; retained.len()]
         };
 
         // ── 6. Optionally load the DTM raster ─────────────────────────────
@@ -313,14 +336,14 @@ impl PreprocessingPipeline {
             .transpose()?;
 
         // ── 7. Per-block parallel processing ─────────────────────────────
-        // Zip each stub with its pre-loaded border points so the closure can
-        // build an augmented k-d tree without touching neighbour spill files
-        // (which may have been deleted by a concurrent `load()` call).
+        // Zip each stub with its border-spill path.  The closure loads the
+        // border file on-demand, processes the block, then deletes the file.
+        // Peak memory is bounded to (thread_count × (canonical + border_strip)).
         let block_results: Vec<Result<BlockProcessResult>> = retained
             .into_par_iter()
-            .zip(border_points_per_block.into_par_iter())
+            .zip(border_spill_paths.into_par_iter())
             .with_min_len(RAYON_MIN_CHUNK)
-            .map(|(stub, border_pts)| {
+            .map(|(stub, border_path)| {
                 let dtm_ref = dtm.as_deref();
 
                 // Capture metadata before consuming the stub.
@@ -329,45 +352,61 @@ impl PreprocessingPipeline {
                 let origin_x = stub.origin_x;
                 let origin_y = stub.origin_y;
 
-                // Load point data from spill files for this block only.
+                // Load canonical point data from spill files for this block only.
                 // `block.points` is dropped at the end of this closure so
                 // peak memory stays at (thread_count × largest_block_size).
                 let block = stub.load()?;
 
-                // (a) Build augmented k-d tree.
-                //     When overlap is enabled, border_pts contains neighbour
-                //     points that fall within the overlap radius of this block's
-                //     boundary.  They are included in the spatial index so that
-                //     eigenvalue features near block edges use real neighbour
-                //     context rather than a truncated neighbourhood.
-                //     Border points are NEVER resampled or written to .feat files.
-                let index = if border_pts.is_empty() {
-                    BlockSpatialIndex::build(&block.points)
-                } else {
-                    // Merge canonical + border into a single contiguous Vec for
-                    // the index.  The canonical points come first so that their
-                    // indices are stable for the resampling step below.
-                    let mut all_pts = block.points.clone();
-                    all_pts.extend_from_slice(&border_pts);
-                    BlockSpatialIndex::build(&all_pts)
+                // (a) Load border points from the pre-written spill file (if any),
+                //     then delete the file immediately to free disk space.
+                //     When overlap is disabled, `border_path` is None and no I/O
+                //     occurs here.
+                let border_pts: Vec<PointRecord> = match border_path {
+                    Some(ref p) => {
+                        let pts = read_border_spill(p)?;
+                        let _ = fs::remove_file(p);
+                        pts
+                    }
+                    None => Vec::new(),
                 };
 
-                // (b) Density-gated sampling — now returns indices too.
-                //     Sampling is always performed on canonical block points only;
-                //     border points are context-only and must not appear in output.
+                // (b) Build augmented k-d tree.
+                //     Merge canonical + border into a single contiguous Vec once
+                //     and reuse it for both the index and feature extraction.
+                //     Border points are NEVER resampled or written to .feat files.
+                let ctx: Vec<PointRecord> = if border_pts.is_empty() {
+                    Vec::new() // no overlap: zero-copy path below
+                } else {
+                    let mut v = Vec::with_capacity(block.points.len() + border_pts.len());
+                    v.extend_from_slice(&block.points);
+                    v.extend_from_slice(&border_pts);
+                    v
+                };
+                // border_pts no longer needed — drop it to free memory before
+                // building the k-d tree (which itself allocates).
+                drop(border_pts);
+
+                let index = if ctx.is_empty() {
+                    BlockSpatialIndex::build(&block.points)
+                } else {
+                    BlockSpatialIndex::build(&ctx)
+                };
+
+                // (c) Density-gated sampling — canonical points only.
+                //     Border points are context-only and must not appear in output.
                 let (sampled, sampled_indices, oversampled) =
                     resample_block(&block.points, config.target_points, block_id);
 
                 let sampled_count = sampled.len();
 
-                // (c–e) Extract all features (multi-scale or single-scale).
-                //     When overlap is active we pass the merged canonical+border
-                //     Vec as the neighbourhood context so that eigenvalue queries
-                //     near block edges draw on real neighbour points.
-                //     When overlap is disabled we pass canonical points only —
-                //     identical to the pre-Stage-08 behaviour.
+                // (d–f) Extract all features (multi-scale or single-scale).
+                //     When overlap is active, `ctx` (canonical + border) is the
+                //     neighbourhood context so eigenvalue queries near block edges
+                //     draw on real neighbour points.
+                //     When overlap is disabled, canonical points only — identical
+                //     to the pre-Stage-08 behaviour.
                 let search_radii = config.search_radii_effective();
-                let features = if border_pts.is_empty() {
+                let features = if ctx.is_empty() {
                     extract_features(
                         &sampled,
                         &block.points,
@@ -380,10 +419,6 @@ impl PreprocessingPipeline {
                         config.min_neighbors,
                     )
                 } else {
-                    // Rebuild the merged context slice.  border_pts is small
-                    // (overlap strip only) so this allocation is cheap.
-                    let mut ctx = block.points.clone();
-                    ctx.extend_from_slice(&border_pts);
                     extract_features(
                         &sampled,
                         &ctx,
@@ -398,7 +433,7 @@ impl PreprocessingPipeline {
                 };
                 let n_features = features.first().map_or(0, Vec::len);
 
-                // (f) Serialise to .feat
+                // (g) Serialise to .feat
                 let feat_filename = format!("block_{block_id:05}.feat");
                 let feat_path = config.output_dir.join(&feat_filename);
                 write_feat_file(
@@ -411,7 +446,7 @@ impl PreprocessingPipeline {
                     &features,
                 )?;
 
-                // (g) Optional debug CSV
+                // (h) Optional debug CSV
                 if config.debug_csv {
                     let csv_path = config.output_dir.join(format!("block_{block_id:05}.csv"));
                     write_debug_csv(&csv_path, &features, &search_radii)?;
@@ -634,6 +669,83 @@ fn load_all_points(path: &Path) -> Result<Vec<PointRecord>> {
     Ok(out)
 }
 
+// ── Border-point spill I/O (Stage 08) ────────────────────────────────────────
+//
+// Border points are written to `.border` files using the same compact binary
+// layout as the main `.spill` files (31 bytes per point).  This keeps the
+// format consistent and avoids introducing a new serialisation dependency.
+//
+// Layout per point (little-endian):
+//   x(f64) y(f64) z(f64) intensity(u16) classification(u8)
+//   return_number(u8) number_of_returns(u8) scan_angle(i16) = 31 bytes
+
+/// Bytes per point in a border spill file — identical to the main spill format.
+const BORDER_PT_BYTES: usize = 31;
+
+/// Write a slice of `PointRecord`s to a `.border` spill file.
+///
+/// # Errors
+/// Returns `ClassifierError` on any I/O failure.
+fn write_border_spill(path: &Path, pts: &[PointRecord]) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    let mut buf = [0u8; BORDER_PT_BYTES];
+    for pt in pts {
+        buf[0..8].copy_from_slice(&pt.x.to_le_bytes());
+        buf[8..16].copy_from_slice(&pt.y.to_le_bytes());
+        buf[16..24].copy_from_slice(&pt.z.to_le_bytes());
+        buf[24..26].copy_from_slice(&pt.intensity.to_le_bytes());
+        buf[26] = pt.classification;
+        buf[27] = pt.return_number;
+        buf[28] = pt.number_of_returns;
+        buf[29..31].copy_from_slice(&pt.scan_angle.to_le_bytes());
+        writer.write_all(&buf)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Read a `.border` spill file back into a `Vec<PointRecord>`.
+///
+/// # Errors
+/// Returns [`ClassifierError::SpillCorrupt`] if the file size is not a
+/// multiple of `BORDER_PT_BYTES` or if any read fails.
+fn read_border_spill(path: &Path) -> Result<Vec<PointRecord>> {
+    let metadata = fs::metadata(path).map_err(|_| ClassifierError::SpillCorrupt {
+        path: path.display().to_string(),
+    })?;
+    #[allow(clippy::cast_possible_truncation)]
+    let file_bytes = metadata.len() as usize;
+    if !file_bytes.is_multiple_of(BORDER_PT_BYTES) {
+        return Err(ClassifierError::SpillCorrupt {
+            path: path.display().to_string(),
+        });
+    }
+    let n = file_bytes / BORDER_PT_BYTES;
+    let mut pts = Vec::with_capacity(n);
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; BORDER_PT_BYTES];
+    for _ in 0..n {
+        file.read_exact(&mut buf)?;
+        let corrupt = || ClassifierError::SpillCorrupt {
+            path: path.display().to_string(),
+        };
+        let pt = PointRecord {
+            x: f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
+            y: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
+            z: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
+            intensity: u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
+            classification: buf[26],
+            return_number: buf[27],
+            number_of_returns: buf[28],
+            scan_angle: i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
+            ..PointRecord::default()
+        };
+        pts.push(pt);
+    }
+    Ok(pts)
+}
+
 // ── Output serialisation helpers ──────────────────────────────────────────────
 
 /// Write a `.feat` binary block file.
@@ -830,6 +942,58 @@ mod tests {
         let cfg = crate::preprocessing::PreprocessConfig::default();
         assert_eq!(cfg.block_overlap, 0.0);
     }
+
+    // ── Border spill I/O round-trip ───────────────────────────────────────────
+
+    /// Write a set of PointRecords to a `.border` file and read them back.
+    /// All serialised fields must survive the round-trip exactly.
+    #[test]
+    fn test_border_spill_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.border");
+
+        let pts: Vec<PointRecord> = (0..20)
+            .map(|i| PointRecord {
+                x: i as f64 * 1.5,
+                y: i as f64 * 0.7,
+                z: i as f64 * 0.3,
+                intensity: (i * 1000) as u16,
+                classification: (i % 8) as u8,
+                return_number: 1,
+                number_of_returns: 2,
+                scan_angle: (i as i16) - 10,
+                ..PointRecord::default()
+            })
+            .collect();
+
+        write_border_spill(&path, &pts).unwrap();
+        let recovered = read_border_spill(&path).unwrap();
+
+        assert_eq!(recovered.len(), pts.len(), "point count must match");
+        for (a, b) in pts.iter().zip(recovered.iter()) {
+            assert!((a.x - b.x).abs() < 1e-12, "x mismatch");
+            assert!((a.y - b.y).abs() < 1e-12, "y mismatch");
+            assert!((a.z - b.z).abs() < 1e-12, "z mismatch");
+            assert_eq!(a.intensity, b.intensity, "intensity mismatch");
+            assert_eq!(a.classification, b.classification, "classification mismatch");
+            assert_eq!(a.return_number, b.return_number, "return_number mismatch");
+            assert_eq!(
+                a.number_of_returns, b.number_of_returns,
+                "number_of_returns mismatch"
+            );
+            assert_eq!(a.scan_angle, b.scan_angle, "scan_angle mismatch");
+        }
+    }
+
+    /// An empty border spill file round-trips to an empty Vec.
+    #[test]
+    fn test_border_spill_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.border");
+        write_border_spill(&path, &[]).unwrap();
+        let recovered = read_border_spill(&path).unwrap();
+        assert!(recovered.is_empty(), "empty write → empty read");
+    }
 }
 
 // ── Stage 08: border-point loader ────────────────────────────────────────────
@@ -839,8 +1003,8 @@ mod tests {
 ///
 /// This function is called **sequentially** before the Rayon parallel phase so
 /// that all spill files are guaranteed to exist (no concurrent `load()` calls
-/// have deleted them yet).  The returned `Vec<PointRecord>` is then zipped with
-/// the stub in the parallel closure and used to augment the k-d tree context.
+/// have deleted them yet).  The returned `Vec<PointRecord>` is written to a
+/// `.border` spill file by the caller; it is not held in memory across blocks.
 ///
 /// Points that belong to the target block itself are not included — only
 /// genuine cross-boundary neighbours are returned.
