@@ -50,6 +50,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 i += 1;
                 cfg.batch_size = parse_usize(&args[i], "--batch-size")?;
             }
+            "--forward-batch-size" => {
+                i += 1;
+                cfg.forward_batch_size = parse_usize(&args[i], "--forward-batch-size")?;
+            }
             "--learning-rate" => {
                 i += 1;
                 cfg.learning_rate = parse_f64(&args[i], "--learning-rate")?;
@@ -72,9 +76,6 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--use-feature-tnet" => {
                 cfg.use_feature_tnet = true;
-            }
-            "--no-batch-norm" => {
-                cfg.use_batch_norm = false;
             }
             "--no-class-weights" => {
                 cfg.use_class_weights = false;
@@ -135,6 +136,11 @@ pub fn run(args: &[String]) -> Result<()> {
     if cfg.batch_size == 0 {
         return Err(ClassifierError::Pipeline(
             "--batch-size must be >= 1".into(),
+        ));
+    }
+    if cfg.forward_batch_size == 0 {
+        return Err(ClassifierError::Pipeline(
+            "--forward-batch-size must be >= 1".into(),
         ));
     }
     if cfg.learning_rate <= 0.0 || !cfg.learning_rate.is_finite() {
@@ -220,14 +226,15 @@ fn print_usage() {
          Optional:\n\
            --n-classes         <u8>     Output classes (default: 8)\n\
            --epochs            <usize>  Training epochs (default: 50)\n\
-           --batch-size        <usize>  Gradient accumulation batch (default: 16)\n\
+           --batch-size        <usize>  Effective batch: blocks per optimizer step (default: 16)\n\
+           --forward-batch-size <usize> Blocks per batched forward — effective BatchNorm\n\
+                                        batch size; micro-batched then accumulated (default: 8)\n\
            --learning-rate     <f64>    Initial AdamW LR (default: 1e-3)\n\
            --weight-decay      <f32>    AdamW weight decay (default: 1e-4)\n\
            --val-split         <f64>    Val macro-tile fraction (default: 0.20)\n\
            --val-tile-blocks   <path>   JSON file of explicit val block IDs\n\
            --seed              <u64>    Split/shuffle seed (default: 42)\n\
            --use-feature-tnet          Enable STN64d (default: off)\n\
-           --no-batch-norm             Disable BatchNorm (default: on)\n\
            --no-class-weights          Disable class-weighted loss (default: on)\n\
            --class-weight-beta <f64>    β for effective-number weighting, range [0.0,1.0)\n\
                                         0.0=uniform, 0.999=default (strong), 0.9999≈inverse-freq\n\

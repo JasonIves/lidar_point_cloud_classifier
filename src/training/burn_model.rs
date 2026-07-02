@@ -116,6 +116,42 @@ impl<B: Backend> Stn3d<B> {
         let eye = identity_2d::<B>(3, &device);
         g + eye // [3, 3]
     }
+
+    /// Batched forward pass: `xyz` shape `[B, N, 3]` → `T` shape `[B, 3, 3]`.
+    ///
+    /// Identical maths to [`Stn3d::forward`] but with a leading batch dimension so
+    /// BatchNorm normalizes across all `B·N` points (a genuine cross-block batch,
+    /// Stage 18) while the global max-pool stays *per sample* (over `N` only).
+    pub fn forward_batched(&self, xyz: Tensor<B, 3>) -> Tensor<B, 3> {
+        let device = xyz.device();
+        let b = xyz.dims()[0];
+
+        let h = self.enc0.forward(xyz);
+        let h = apply_bn3d(h, &self.bn_enc0);
+        let h = h.clamp_min(0.0);
+
+        let h = self.enc1.forward(h);
+        let h = apply_bn3d(h, &self.bn_enc1);
+        let h = h.clamp_min(0.0);
+
+        let h = self.enc2.forward(h);
+        let h = apply_bn3d(h, &self.bn_enc2);
+        let h = h.clamp_min(0.0);
+
+        // Per-sample global max pool over N: [B, N, 1024] → transpose → [B, 1024, N]
+        // → max over last dim → [B, 1024, 1] → transpose → [B, 1, 1024].
+        let g = h.transpose().max_dim(2).transpose(); // [B, 1, 1024]
+
+        let g = self.fc0.forward(g);
+        let g = g.clamp_min(0.0);
+        let g = self.fc1.forward(g);
+        let g = g.clamp_min(0.0);
+        let g = self.fc2.forward(g); // [B, 1, 9]
+        let g = g.reshape([b, 3, 3]); // [B, 3, 3]
+
+        let eye = identity_2d::<B>(3, &device).reshape([1, 3, 3]);
+        g + eye // broadcast [1, 3, 3] over [B, 3, 3]
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +227,38 @@ impl<B: Backend> Stn64d<B> {
         let g = g.reshape([64, 64]);
 
         let eye = identity_2d::<B>(64, &device);
+        g + eye
+    }
+
+    /// Batched forward pass: `feat` shape `[B, N, 64]` → `T` shape `[B, 64, 64]`.
+    ///
+    /// Batched analogue of [`Stn64d::forward`]; see [`Stn3d::forward_batched`].
+    pub fn forward_batched(&self, feat: Tensor<B, 3>) -> Tensor<B, 3> {
+        let device = feat.device();
+        let b = feat.dims()[0];
+
+        let h = self.enc0.forward(feat);
+        let h = apply_bn3d(h, &self.bn_enc0);
+        let h = h.clamp_min(0.0);
+
+        let h = self.enc1.forward(h);
+        let h = apply_bn3d(h, &self.bn_enc1);
+        let h = h.clamp_min(0.0);
+
+        let h = self.enc2.forward(h);
+        let h = apply_bn3d(h, &self.bn_enc2);
+        let h = h.clamp_min(0.0);
+
+        let g = h.transpose().max_dim(2).transpose(); // [B, 1, 1024]
+
+        let g = self.fc0.forward(g);
+        let g = g.clamp_min(0.0);
+        let g = self.fc1.forward(g);
+        let g = g.clamp_min(0.0);
+        let g = self.fc2.forward(g); // [B, 1, 4096]
+        let g = g.reshape([b, 64, 64]);
+
+        let eye = identity_2d::<B>(64, &device).reshape([1, 64, 64]);
         g + eye
     }
 }
@@ -341,6 +409,71 @@ impl<B: Backend> BurnPointNet<B> {
         self.proj.forward(h) // [N, n_classes]
     }
 
+    /// Batched forward pass (Stage 18).
+    ///
+    /// # Shapes
+    /// - `input`:  `[B, N, n_features_in]` (B blocks, N sampled points each)
+    /// - output: `[B, N, n_classes]`   (raw logits, no softmax)
+    ///
+    /// Every BatchNorm normalizes across the whole `B·N` micro-batch (so its
+    /// running statistics become representative of the block *population*), while
+    /// the global max-pool remains strictly per-block (over `N`).  The weights are
+    /// identical to the single-block [`BurnPointNet::forward`] path, so the
+    /// deployed single-block ndarray inference stays consistent with training.
+    pub fn forward_batched(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [_b, n, n_feat] = input.dims();
+
+        // ── Input T-Net (STN3d) ────────────────────────────────────────────
+        let xyz = input.clone().narrow(2, 0, 3); // [B, N, 3]
+        let t1 = self.stn3d.forward_batched(xyz.clone()); // [B, 3, 3]
+        let xyz_new = xyz.matmul(t1); // [B, N, 3] @ [B, 3, 3] → [B, N, 3]
+        let rest = input.narrow(2, 3, n_feat - 3); // [B, N, n_feat-3]
+        let input = Tensor::cat(vec![xyz_new, rest], 2); // [B, N, n_feat]
+
+        // ── Encoder Layer 0 (save as local_feat) ──────────────────────────
+        let local_feat = {
+            let h = self.enc0.forward(input); // [B, N, 64]
+            let h = apply_bn3d(h, &self.bn_enc0);
+            h.clamp_min(0.0)
+        };
+
+        // ── Feature T-Net (optional) ──────────────────────────────────────
+        let local_feat = if let Some(stn64d) = &self.stn64d {
+            let t2 = stn64d.forward_batched(local_feat.clone()); // [B, 64, 64]
+            local_feat.matmul(t2) // [B, N, 64] @ [B, 64, 64] → [B, N, 64]
+        } else {
+            local_feat
+        };
+
+        // ── Encoder Layers 1+ ─────────────────────────────────────────────
+        let h = self.enc1.forward(local_feat.clone()); // [B, N, 128]
+        let h = apply_bn3d(h, &self.bn_enc1);
+        let h = h.clamp_min(0.0);
+
+        let h = self.enc2.forward(h); // [B, N, 256]
+        let h = apply_bn3d(h, &self.bn_enc2);
+        let h = h.clamp_min(0.0);
+
+        // ── Per-sample Global Max Pool ─────────────────────────────────────
+        // [B, N, 256] → transpose → [B, 256, N] → max over last dim (N) →
+        // [B, 256, 1] → transpose → [B, 1, 256] → broadcast to [B, N, 256].
+        let global = h.transpose().max_dim(2).transpose().repeat_dim(1, n); // [B, N, 256]
+
+        // ── Segmentation Concat ───────────────────────────────────────────
+        let combined = Tensor::cat(vec![local_feat, global], 2); // [B, N, 320]
+
+        // ── Decoder ───────────────────────────────────────────────────────
+        let h = self.dec0.forward(combined); // [B, N, 256]
+        let h = apply_bn3d(h, &self.bn_dec0);
+        let h = h.clamp_min(0.0);
+
+        let h = self.dec1.forward(h); // [B, N, 128]
+        let h = apply_bn3d(h, &self.bn_dec1);
+        let h = h.clamp_min(0.0);
+
+        self.proj.forward(h) // [B, N, n_classes]
+    }
+
     /// Return a `Vec<usize>` of per-point class indices.
     pub fn classify(&self, input: Tensor<B, 2>) -> Vec<usize> {
         let logits = self.forward(input); // [N, n_classes]
@@ -380,6 +513,22 @@ pub fn features_to_tensor<B: Backend>(
     Tensor::from_floats(td, device)
 }
 
+/// Convert a flat `Vec<f32>` with shape `[batch, n_points, n_features]` (row
+/// major: block-major, then point, then feature) into a burn `Tensor<B, 3>`.
+///
+/// Used by the Stage 18 batched training forward, which stacks several spatial
+/// blocks into one micro-batch so BatchNorm sees a genuine cross-block batch.
+pub fn features_to_tensor_batched<B: Backend>(
+    flat: Vec<f32>,
+    batch: usize,
+    n_points: usize,
+    n_features: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    let td = TensorData::new(flat, vec![batch, n_points, n_features]);
+    Tensor::from_floats(td, device)
+}
+
 /// Convert a `Vec<u8>` of labels into a burn int tensor `Tensor<B, 1, Int>`.
 pub fn labels_to_tensor<B: Backend>(
     labels: &[u8],
@@ -400,6 +549,16 @@ fn apply_bn2d<B: Backend>(x: Tensor<B, 2>, bn: &nn::BatchNorm<B, 1>) -> Tensor<B
     let x3 = x.reshape([n, c, 1]); // [N, C, 1]
     let x3 = bn.forward(x3); // [N, C, 1]
     x3.reshape([n, c]) // [N, C]
+}
+
+/// Apply `BatchNorm<B, 1>` to a batched 3D tensor `[B, N, C]` by reshaping to
+/// `[B·N, C, 1]`, so BatchNorm normalizes each channel across all `B·N` samples
+/// of the micro-batch (Stage 18).  Restores the `[B, N, C]` shape afterwards.
+fn apply_bn3d<B: Backend>(x: Tensor<B, 3>, bn: &nn::BatchNorm<B, 1>) -> Tensor<B, 3> {
+    let [b, n, c] = x.dims();
+    let x3 = x.reshape([b * n, c, 1]); // [B·N, C, 1]
+    let x3 = bn.forward(x3); // [B·N, C, 1]
+    x3.reshape([b, n, c]) // [B, N, C]
 }
 
 /// Create a `k×k` identity matrix as a burn tensor.
@@ -547,6 +706,205 @@ mod tests {
         assert!(
             max_abs < 1e3,
             "Stage 17: inference logits should be bounded; got max |logit| {max_abs}"
+        );
+    }
+
+    // ── Stage 18: train/eval BatchNorm statistics-gap mechanism test ─────────
+
+    /// Empirical confirmation for Stage 18.
+    ///
+    /// Demonstrates that the train-mode (batch-statistic) BatchNorm output and
+    /// the inference-mode (`.valid()`, running-statistic) output for the *same*
+    /// input **diverge** when the training blocks are heterogeneous (each block
+    /// has a different per-feature distribution), and **agree** when the blocks
+    /// share one distribution.
+    ///
+    /// This isolates the cause of the poor validation metrics to exactly the
+    /// per-block-vs-global BatchNorm statistics mismatch: with an effective
+    /// BatchNorm batch size of one block, training normalizes each block by its
+    /// own statistics, while `.valid()` (and deployment) normalize every block by
+    /// a single global running average — so heterogeneous blocks are systematically
+    /// mis-normalized at inference.
+    #[test]
+    fn test_batchnorm_train_eval_gap_depends_on_block_heterogeneity() {
+        use burn::backend::Autodiff;
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::AutodiffBackend;
+
+        type Ad = Autodiff<NdArray>;
+        let device = Default::default();
+        let n = 128usize;
+
+        // Deterministic block generator: fixed content pattern, shifted by a
+        // per-block `offset` and scaled by `scale` so we can control how much
+        // the block's feature distribution differs from the others.
+        let make_block = |offset: f32, scale: f32| -> Vec<f32> {
+            (0..(n * N_FEATURES))
+                .map(|i| (((i * 31 + 7) % 97) as f32 / 97.0) * scale + offset)
+                .collect()
+        };
+
+        // Mean absolute difference between train-mode and eval-mode logits for a
+        // held-out block, after populating running stats with `offsets`.
+        let train_eval_logit_gap = |offsets: &[f32], scales: &[f32], held_out: f32| -> f32 {
+            let cfg = default_cfg();
+            let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
+
+            // Populate running statistics with the training blocks.  Enough
+            // passes that the EMA (momentum 0.1) fully converges — 0.9^150 ≈ 1e-7 —
+            // so that in the *homogeneous* case the running statistics equal the
+            // block's own batch statistics and the train/eval gap collapses to ~0.
+            // Any residual gap in the heterogeneous case is then attributable
+            // purely to per-block-vs-global statistics mismatch, not EMA lag.
+            for _ in 0..30 {
+                for (&off, &sc) in offsets.iter().zip(scales.iter()) {
+                    let input =
+                        features_to_tensor::<Ad>(make_block(off, sc), n, N_FEATURES, &device);
+                    let _ = model.forward(input);
+                }
+            }
+
+            // Held-out block (its own distribution).
+            let held_flat = make_block(held_out, 1.0);
+
+            // Eval-mode (running-stat) logits FIRST so the running stats are not
+            // perturbed by the held-out block before we capture them.
+            let val_model = model.valid();
+            let eval_in = features_to_tensor::<<Ad as AutodiffBackend>::InnerBackend>(
+                held_flat.clone(),
+                n,
+                N_FEATURES,
+                &device,
+            );
+            let eval_logits: Vec<f32> = val_model.forward(eval_in).into_data().to_vec().unwrap();
+
+            // Train-mode (batch-stat) logits on the same held-out block.
+            let train_in = features_to_tensor::<Ad>(held_flat, n, N_FEATURES, &device);
+            let train_logits: Vec<f32> = model.forward(train_in).into_data().to_vec().unwrap();
+
+            let sum: f32 = eval_logits
+                .iter()
+                .zip(train_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum();
+            sum / eval_logits.len() as f32
+        };
+
+        // Heterogeneous blocks: widely varying offsets; held-out far from the mean.
+        let hetero_offsets = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let hetero_scales = [1.0, 1.5, 0.5, 2.0, 0.8];
+        let hetero_gap = train_eval_logit_gap(&hetero_offsets, &hetero_scales, 0.0);
+
+        // Homogeneous blocks: identical distribution; held-out matches it.
+        let homo_offsets = [0.0, 0.0, 0.0, 0.0, 0.0];
+        let homo_scales = [1.0, 1.0, 1.0, 1.0, 1.0];
+        let homo_gap = train_eval_logit_gap(&homo_offsets, &homo_scales, 0.0);
+
+        eprintln!(
+            "[stage18] train/eval BN logit gap — heterogeneous={hetero_gap:.4}  homogeneous={homo_gap:.4}"
+        );
+
+        // Homogeneous: train-mode and eval-mode must nearly agree.
+        assert!(
+            homo_gap < 0.5,
+            "homogeneous blocks should give matching train/eval BN outputs, got gap {homo_gap}"
+        );
+        // Heterogeneous: the gap must be substantially larger — this is the
+        // train/eval BatchNorm statistics mismatch driving the bad val metrics.
+        assert!(
+            hetero_gap > homo_gap * 3.0 + 0.5,
+            "heterogeneous blocks should widen the train/eval BN gap (hetero={hetero_gap}, homo={homo_gap})"
+        );
+    }
+
+    // ── Stage 18: batched forward correctness ────────────────────────────────
+
+    /// The batched forward must (a) produce the correct `[B, N, n_classes]`
+    /// shape, and (b) when every block in the batch is identical, produce
+    /// identical per-block outputs across the batch dimension.  The latter
+    /// confirms the per-sample global max-pool does not leak across blocks and
+    /// that the batched BatchNorm path is wired correctly.
+    #[test]
+    fn test_forward_batched_identical_blocks_are_consistent() {
+        use burn::backend::Autodiff;
+
+        type Ad = Autodiff<NdArray>;
+        let device = Default::default();
+        let cfg = default_cfg();
+        let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
+
+        let n = 96usize;
+        let b = 4usize;
+
+        // One block's features, replicated across the batch.
+        let single: Vec<f32> = (0..(n * N_FEATURES))
+            .map(|i| ((i * 17 + 3) % 91) as f32 / 91.0)
+            .collect();
+        let mut batch_flat = Vec::with_capacity(b * n * N_FEATURES);
+        for _ in 0..b {
+            batch_flat.extend_from_slice(&single);
+        }
+
+        let input = features_to_tensor_batched::<Ad>(batch_flat, b, n, N_FEATURES, &device);
+        let out = model.forward_batched(input); // [b, n, n_classes]
+        assert_eq!(out.dims(), [b, n, cfg.n_classes]);
+
+        let flat: Vec<f32> = out.into_data().to_vec::<f32>().unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "batched outputs must all be finite"
+        );
+
+        // Every batch row must equal batch row 0 (identical inputs → identical
+        // outputs; no cross-block pooling leakage).
+        let per_block = n * cfg.n_classes;
+        for bi in 1..b {
+            for k in 0..per_block {
+                let a = flat[k];
+                let c = flat[bi * per_block + k];
+                assert!(
+                    (a - c).abs() < 1e-4,
+                    "batched forward row {bi} elem {k} diverged: {a} vs {c}"
+                );
+            }
+        }
+    }
+
+    /// Batched forward over a genuine multi-block batch produces finite, bounded
+    /// logits of the right shape when the blocks have *different* distributions —
+    /// the real training scenario (BatchNorm normalizes across the whole batch).
+    #[test]
+    fn test_forward_batched_heterogeneous_blocks_bounded() {
+        use burn::backend::Autodiff;
+
+        type Ad = Autodiff<NdArray>;
+        let device = Default::default();
+        let cfg = default_cfg();
+        let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
+
+        let n = 64usize;
+        let b = 3usize;
+        let offsets = [0.0f32, 3.0, 6.0];
+        let mut batch_flat = Vec::with_capacity(b * n * N_FEATURES);
+        for &off in &offsets {
+            for i in 0..(n * N_FEATURES) {
+                batch_flat.push(((i * 13 + 5) % 83) as f32 / 83.0 + off);
+            }
+        }
+
+        let input = features_to_tensor_batched::<Ad>(batch_flat, b, n, N_FEATURES, &device);
+        let out = model.forward_batched(input);
+        assert_eq!(out.dims(), [b, n, cfg.n_classes]);
+
+        let flat: Vec<f32> = out.into_data().to_vec::<f32>().unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "batched heterogeneous outputs must all be finite"
+        );
+        let max_abs = flat.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e3,
+            "batched logits should be bounded; got {max_abs}"
         );
     }
 }

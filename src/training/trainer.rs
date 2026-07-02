@@ -27,8 +27,9 @@ use std::time::Instant;
 use burn::{
     module::AutodiffModule,
     nn::loss::CrossEntropyLossConfig,
+    nn::BatchNorm,
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
-    tensor::backend::AutodiffBackend,
+    tensor::{backend::AutodiffBackend, backend::Backend, Tensor},
 };
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -39,7 +40,7 @@ use crate::model::pointnet::PointNetConfig;
 use crate::model::weights::load_model;
 use crate::training::{
     bridge::save_model_from_burn,
-    burn_model::{features_to_tensor, labels_to_tensor, BurnPointNet},
+    burn_model::{features_to_tensor, features_to_tensor_batched, labels_to_tensor, BurnPointNet},
     dataset::LabeledBlockDataset,
     metrics::{append_metrics_csv, EpochMetrics, MetricsAccumulator},
     scheduler::CosineScheduler,
@@ -54,7 +55,13 @@ use crate::training::{
 pub struct TrainConfig {
     pub n_classes: usize,
     pub epochs: usize,
+    /// Effective batch: number of blocks contributing to one optimizer step.
     pub batch_size: usize,
+    /// Number of blocks stacked into a single batched forward pass — the
+    /// *effective BatchNorm batch size* (Stage 18).  When `forward_batch_size <
+    /// batch_size`, the chunk is split into micro-batches of `forward_batch_size`
+    /// blocks and their gradients are accumulated (averaged) into one step.
+    pub forward_batch_size: usize,
     pub learning_rate: f64,
     pub weight_decay: f32,
     pub val_split: f64,
@@ -89,6 +96,7 @@ impl Default for TrainConfig {
             n_classes: 8,
             epochs: 50,
             batch_size: 16,
+            forward_batch_size: 8,
             learning_rate: 1e-3,
             weight_decay: 1e-4,
             val_split: 0.20,
@@ -262,29 +270,69 @@ where
         for chunk in shuffled.chunks(config.batch_size) {
             let mut accumulator = GradientsAccumulator::<BurnPointNet<B>>::new();
             let mut chunk_loss = 0.0f64;
+            let mut n_micro = 0usize;
 
-            for &block_id in chunk {
-                let block = match dataset.load_block(block_id) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("[trainer] skip block {block_id}: {e}");
+            // Stage 18: split the effective batch into micro-batches of up to
+            // `forward_batch_size` blocks.  Each micro-batch is a real batched
+            // forward `[b, N, C]`, so BatchNorm normalizes across a genuine
+            // cross-block batch (not one block at a time).  We scale each
+            // micro-batch loss by `1/num_micro` so the accumulated gradient is the
+            // *mean* over the chunk — standard mini-batch-with-accumulation.
+            let fb = config.forward_batch_size.max(1);
+            let num_micro = chunk.len().div_ceil(fb).max(1);
+
+            for micro in chunk.chunks(fb) {
+                // Stack all blocks in this micro-batch that share the same point
+                // count and feature width into one `[b, N, C]` tensor.  Blocks are
+                // resampled to a common point count upstream, so mismatches are not
+                // expected; we guard defensively rather than panic.
+                let mut batch_flat: Vec<f32> = Vec::new();
+                let mut batch_labels: Vec<u8> = Vec::new();
+                let mut n_ref = 0usize;
+                let mut nfeat_ref = 0usize;
+                let mut count = 0usize;
+
+                for &block_id in micro {
+                    let block = match dataset.load_block(block_id) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[trainer] skip block {block_id}: {e}");
+                            continue;
+                        }
+                    };
+                    let n = block.features.nrows();
+                    let nf = block.features.ncols();
+                    if count == 0 {
+                        n_ref = n;
+                        nfeat_ref = nf;
+                    } else if n != n_ref || nf != nfeat_ref {
+                        eprintln!(
+                            "[trainer] skip block {block_id}: dims {n}x{nf} != batch {n_ref}x{nfeat_ref}"
+                        );
                         continue;
                     }
-                };
+                    let raw: Vec<f32> = block.features.into_raw_vec_and_offset().0;
+                    batch_flat.extend_from_slice(&raw);
+                    batch_labels.extend_from_slice(&block.labels);
+                    count += 1;
+                }
 
-                let n = block.features.nrows();
-                let n_features_block = block.features.ncols();
-                let raw_floats: Vec<f32> = block.features.into_raw_vec_and_offset().0;
-                let feat_tensor = features_to_tensor::<B>(raw_floats, n, n_features_block, device);
-                let targets = labels_to_tensor::<B>(&block.labels, device);
+                if count == 0 {
+                    continue;
+                }
 
-                // Forward
-                let logits = model.forward(feat_tensor); // [N, n_classes]
+                let feat_tensor =
+                    features_to_tensor_batched::<B>(batch_flat, count, n_ref, nfeat_ref, device);
+                let targets = labels_to_tensor::<B>(&batch_labels, device);
 
-                // Loss
-                let loss = loss_fn.forward(logits, targets); // [1]
-                                                             // into_data() forces a device sync — the first point at which
-                                                             // queued GPU kernels (and their buffer allocations) must execute.
+                // Batched forward: [count, N, n_classes] → flatten to [count*N, nc].
+                let logits = model.forward_batched(feat_tensor);
+                let nc = logits.dims()[2];
+                let logits2d = logits.reshape([count * n_ref, nc]);
+
+                let loss = loss_fn.forward(logits2d, targets); // [1]
+                                                               // into_data() forces a device sync — the first point at which
+                                                               // queued GPU kernels (and their buffers) must execute.
                 let loss_val = loss
                     .clone()
                     .into_data()
@@ -294,28 +342,28 @@ where
                     .copied()
                     .map_or(0.0_f64, f64::from);
                 chunk_loss += loss_val;
+                n_micro += 1;
 
-                // Backward + accumulate gradients
-                let grads_raw = loss.backward();
+                // Scale so accumulated gradients average over the chunk's
+                // micro-batches, then backward + accumulate.
+                let grads_raw = loss.div_scalar(num_micro as f32).backward();
                 let grads_params = GradientsParams::from_grads(grads_raw, &model);
                 accumulator.accumulate(&model, grads_params);
             }
 
-            if !chunk.is_empty() {
+            if n_micro > 0 {
                 let lr = scheduler.lr(global_step);
                 let grads = accumulator.grads();
                 model = optim.step(lr, model, grads);
 
-                // Note: the training loop is memory-flat without any explicit
-                // sync — `loss.backward()` consumes the autodiff graph every step
-                // and deterministically frees its retained activation buffers.
-                // Validation (below) forwards on the inner backend via
-                // `model.valid()`, so it allocates no autodiff graph either.
+                // The training loop is memory-flat without any explicit sync —
+                // `loss.backward()` consumes each micro-batch's autodiff graph and
+                // deterministically frees its retained activations.  Validation
+                // (below) forwards on the inner backend via `model.valid()`, so it
+                // allocates no autodiff graph either.
 
-                // Divide by block count (not point count): all blocks are
-                // resampled to `target_points`, so block count and point count
-                // scale identically.  Revisit if variable-size blocks are added.
-                epoch_loss_sum += chunk_loss / chunk.len() as f64;
+                // Report the mean per-micro-batch loss for this step.
+                epoch_loss_sum += chunk_loss / n_micro as f64;
                 n_steps += 1;
                 global_step += 1;
             }
@@ -443,13 +491,30 @@ where
     // so each forward allocates no autodiff graph and VRAM stays bounded across
     // all validation blocks.
     //
-    // KNOWN LIMITATION (see stage-17-batchnorm-running-stats.md): `.valid()` uses
-    // running-statistic (inference-mode) BatchNorm, whose trained running
-    // statistics are currently pathological and produce a logit explosion
-    // (val_loss ~1e5, mIoU ~random).  Root-causing that BatchNorm defect is
-    // deferred to Stage 17; this stage only restores the bounded-VRAM baseline.
+    // Stage 17 (resolved) removed the degenerate post-pool T-Net BatchNorm that
+    // caused the ~1e5 inference logit explosion.  The *remaining* train/eval gap
+    // — validation loss ~10× train loss and low mIoU with no over-fit curve — is
+    // the per-block-vs-global BatchNorm statistics mismatch analysed in
+    // docs/stages/stage-18-batchnorm-batched-forward.md: with an effective
+    // BatchNorm batch size of one block, training normalizes each block by its
+    // own statistics while `.valid()` normalizes every block by a single global
+    // running average.  The opt-in `WB_BN_DIAG=1` diagnostic below exposes that
+    // gap on real data (running-stat vs batch-stat val_loss + BN stat ranges).
+    //
+    // The diagnostic is off by default and bounded to the first few val blocks so
+    // the train-mode forward-without-backward stays negligible w.r.t. the Stage 16
+    // VRAM budget, emitting only a handful of stderr lines (no per-point logging,
+    // per AGENTS.md).
+    const DIAG_MAX_BLOCKS: usize = 3;
+
     let val_model = model.valid();
     let mut acc = MetricsAccumulator::new(n_classes);
+
+    let bn_diag = std::env::var("WB_BN_DIAG").is_ok_and(|v| v == "1");
+    if bn_diag {
+        log_bn_running_stats(model);
+    }
+    let mut diag_blocks_done = 0usize;
 
     for &block_id in val_ids {
         let block = match dataset.load_block(block_id) {
@@ -463,6 +528,14 @@ where
         let n = block.features.nrows();
         let n_features_block = block.features.ncols();
         let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
+
+        // Keep a copy of the raw features for the opt-in batch-stat forward only
+        // while the diagnostic is active and under its block budget.
+        let flat_for_diag = if bn_diag && diag_blocks_done < DIAG_MAX_BLOCKS {
+            Some(flat.clone())
+        } else {
+            None
+        };
 
         let feat_tensor = features_to_tensor::<B::InnerBackend>(flat, n, n_features_block, device);
         let logits = val_model.forward(feat_tensor); // [N, n_classes]
@@ -486,9 +559,57 @@ where
         acc.add_loss_weighted(loss_weighted);
 
         acc.accumulate(&preds, &block.labels);
+
+        // Stage 18 opt-in diagnostic: recompute this block's val_loss under
+        // train-mode (batch-statistic) BatchNorm and compare against the
+        // running-stat loss above.  A large `running-stat − batch-stat` delta on
+        // real data confirms the per-block-vs-global BatchNorm statistics gap.
+        if let Some(diag_flat) = flat_for_diag {
+            let train_feat = features_to_tensor::<B>(diag_flat, n, n_features_block, device);
+            let train_logits = model.forward(train_feat); // train-mode (batch-stat) BN
+            let train_flat: Vec<f32> = train_logits.into_data().to_vec::<f32>().unwrap_or_default();
+            let loss_batch_stat = cross_entropy_from_logits(&train_flat, &block.labels, n, nc);
+            eprintln!(
+                "[bn_diag] block {block_id}: val_loss running-stat={loss_unweighted:.4}  batch-stat={loss_batch_stat:.4}  delta={:.4}",
+                loss_unweighted - loss_batch_stat
+            );
+            diag_blocks_done += 1;
+        }
     }
 
     Ok(acc.compute(epoch, train_loss))
+}
+
+/// Log the min/mean/max of each main encoder/decoder BatchNorm layer's running
+/// mean and variance.  Opt-in Stage 18 diagnostic (`WB_BN_DIAG=1`); called at
+/// most once per validation pass and emits five stderr lines.
+fn log_bn_running_stats<B: AutodiffBackend>(model: &BurnPointNet<B>) {
+    let layers: [(&str, &BatchNorm<B, 1>); 5] = [
+        ("bn_enc0", &model.bn_enc0),
+        ("bn_enc1", &model.bn_enc1),
+        ("bn_enc2", &model.bn_enc2),
+        ("bn_dec0", &model.bn_dec0),
+        ("bn_dec1", &model.bn_dec1),
+    ];
+    for (name, bn) in layers {
+        let (mmin, mmean, mmax) = tensor_stats::<B>(&bn.running_mean.value());
+        let (vmin, vmean, vmax) = tensor_stats::<B>(&bn.running_var.value());
+        eprintln!(
+            "[bn_diag] {name}: running_mean[min/mean/max]={mmin:.4}/{mmean:.4}/{mmax:.4}  running_var[min/mean/max]={vmin:.4}/{vmean:.4}/{vmax:.4}"
+        );
+    }
+}
+
+/// Return `(min, mean, max)` of a 1-D burn tensor.  Diagnostic helper only.
+fn tensor_stats<B: Backend>(t: &Tensor<B, 1>) -> (f32, f32, f32) {
+    let v: Vec<f32> = t.clone().into_data().to_vec::<f32>().unwrap_or_default();
+    if v.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let min = v.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    (min, mean, max)
 }
 
 /// Compute mean cross-entropy loss from raw logits and labels (no burn required).
