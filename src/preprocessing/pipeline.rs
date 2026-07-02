@@ -975,7 +975,10 @@ mod tests {
             assert!((a.y - b.y).abs() < 1e-12, "y mismatch");
             assert!((a.z - b.z).abs() < 1e-12, "z mismatch");
             assert_eq!(a.intensity, b.intensity, "intensity mismatch");
-            assert_eq!(a.classification, b.classification, "classification mismatch");
+            assert_eq!(
+                a.classification, b.classification,
+                "classification mismatch"
+            );
             assert_eq!(a.return_number, b.return_number, "return_number mismatch");
             assert_eq!(
                 a.number_of_returns, b.number_of_returns,

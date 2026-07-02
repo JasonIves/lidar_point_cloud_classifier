@@ -3085,6 +3085,7 @@ dependencies = [
  "thiserror 1.0.69",
  "wblidar",
  "wbraster",
+ "wgpu",
 ]
 
 [[package]]

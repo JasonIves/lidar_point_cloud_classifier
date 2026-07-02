@@ -93,12 +93,21 @@ impl<B: Backend> Stn3d<B> {
         // transpose back → [1, 1024].
         let g = h.transpose().max_dim(1).transpose(); // [1, 1024]
 
+        // Stage 17: BatchNorm is intentionally NOT applied to the post-pool FC
+        // layers.  After the global max-pool above, `g` is a single pooled
+        // sample of shape [1, C].  burn's batch-statistic BatchNorm then sees
+        // batch_size = 1, computes a per-sample variance of 0, and drives
+        // `running_var` → 0 via its EMA update.  At inference (`model.valid()`
+        // and the deployed ndarray path) that near-zero running variance divides
+        // by ~sqrt(eps), producing the logit explosion documented in
+        // docs/stages/stage-17-batchnorm-running-stats.md.  BatchNorm on a
+        // genuine batch-of-1 descriptor is degenerate; removing it makes
+        // train-mode and inference-mode agree.  `bn_fc0`/`bn_fc1` are retained as
+        // (unused) fields solely to preserve the `.wbmodel` weight layout.
         let g = self.fc0.forward(g);
-        let g = apply_bn2d(g, &self.bn_fc0);
         let g = g.clamp_min(0.0);
 
         let g = self.fc1.forward(g);
-        let g = apply_bn2d(g, &self.bn_fc1);
         let g = g.clamp_min(0.0);
 
         let g = self.fc2.forward(g); // [1, 9]
@@ -168,12 +177,14 @@ impl<B: Backend> Stn64d<B> {
         // last dim → [1024, 1] → transpose → [1, 1024].
         let g = h.transpose().max_dim(1).transpose(); // [1, 1024]
 
+        // Stage 17: BatchNorm intentionally omitted on the post-pool FC layers
+        // (batch-of-1 pooled descriptor → degenerate running stats → inference
+        // logit explosion).  See Stn3d::forward and
+        // docs/stages/stage-17-batchnorm-running-stats.md.
         let g = self.fc0.forward(g);
-        let g = apply_bn2d(g, &self.bn_fc0);
         let g = g.clamp_min(0.0);
 
         let g = self.fc1.forward(g);
-        let g = apply_bn2d(g, &self.bn_fc1);
         let g = g.clamp_min(0.0);
 
         let g = self.fc2.forward(g); // [1, 4096]
@@ -455,5 +466,87 @@ mod tests {
 
         let out = model.forward(input);
         assert_eq!(out.dims(), [n, cfg.n_classes]);
+    }
+
+    // ── Stage 17: BatchNorm running-statistic regression tests ───────────────
+
+    /// Root-cause isolation: a `BatchNorm<B, 1>` fed a single pooled sample
+    /// (`[1, C, 1]`) computes a per-sample variance of 0 in training mode, so its
+    /// EMA-updated `running_var` decays 1.0 → 0 (momentum 0.1 → ×0.9 per step).
+    /// At inference this near-zero variance divides by ~sqrt(eps) and explodes.
+    /// This documents *why* Stage 17 omits BatchNorm on the post-pool FC layers.
+    #[test]
+    fn test_batchnorm_batch1_running_var_decays_toward_zero() {
+        use burn::backend::Autodiff;
+
+        type Ad = Autodiff<NdArray>;
+        let device = Default::default();
+        let bn = BatchNormConfig::new(8).init::<Ad, 1>(&device);
+
+        // Feed 15 distinct single-sample [1, 8, 1] tensors in training mode.
+        for step in 0..15 {
+            let vals: Vec<f32> = (0..8).map(|c| (step + c) as f32 * 0.1).collect();
+            let x = Tensor::<Ad, 3>::from_floats(TensorData::new(vals, vec![1, 8, 1]), &device);
+            let _ = bn.forward(x);
+        }
+
+        let running_var: Vec<f32> = bn.running_var.value().into_data().to_vec::<f32>().unwrap();
+        let max_var = running_var.iter().copied().fold(0.0f32, f32::max);
+        // 0.9^15 ≈ 0.206 — far below the initial 1.0, confirming the decay that
+        // makes inference-mode BatchNorm blow up on batch-of-1 pooled vectors.
+        assert!(
+            max_var < 0.5,
+            "batch-1 running_var should decay toward 0, got max {max_var}"
+        );
+    }
+
+    /// Regression guard: after several training-mode forwards populate the
+    /// BatchNorm running statistics, the inference-mode (`.valid()`) forward must
+    /// produce finite, bounded logits.  Before the Stage 17 fix, the post-pool
+    /// T-Net FC BatchNorm layers drove `running_var` → 0, so `.valid()` produced a
+    /// logit explosion (values ~1e5+, `val_loss` ~1.6e5).  With those layers'
+    /// BatchNorm removed, the output stays sane.
+    #[test]
+    fn test_valid_inference_logits_bounded_after_training() {
+        use burn::backend::Autodiff;
+        use burn::module::AutodiffModule;
+        use burn::tensor::backend::AutodiffBackend;
+
+        type Ad = Autodiff<NdArray>;
+        let device = Default::default();
+        let cfg = default_cfg();
+        let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
+
+        let n = 256usize;
+        // Run several training-mode forwards to populate running statistics.
+        for step in 0..8 {
+            let flat: Vec<f32> = (0..(n * N_FEATURES))
+                .map(|i| ((i + step * 7) % 97) as f32 / 97.0)
+                .collect();
+            let input = features_to_tensor::<Ad>(flat, n, N_FEATURES, &device);
+            let _ = model.forward(input);
+        }
+
+        // Inference-mode forward on the inner (non-autodiff) backend.
+        let val_model = model.valid();
+        let flat: Vec<f32> = (0..(n * N_FEATURES))
+            .map(|i| (i % 89) as f32 / 89.0)
+            .collect();
+        let input = features_to_tensor::<<Ad as AutodiffBackend>::InnerBackend>(
+            flat, n, N_FEATURES, &device,
+        );
+        let logits = val_model.forward(input);
+        let out: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap();
+
+        assert_eq!(out.len(), n * cfg.n_classes);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "inference logits must all be finite"
+        );
+        let max_abs = out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e3,
+            "Stage 17: inference logits should be bounded; got max |logit| {max_abs}"
+        );
     }
 }

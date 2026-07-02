@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use burn::{
+    module::AutodiffModule,
     nn::loss::CrossEntropyLossConfig,
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
     tensor::backend::AutodiffBackend,
@@ -282,6 +283,8 @@ where
 
                 // Loss
                 let loss = loss_fn.forward(logits, targets); // [1]
+                                                             // into_data() forces a device sync — the first point at which
+                                                             // queued GPU kernels (and their buffer allocations) must execute.
                 let loss_val = loss
                     .clone()
                     .into_data()
@@ -302,6 +305,13 @@ where
                 let lr = scheduler.lr(global_step);
                 let grads = accumulator.grads();
                 model = optim.step(lr, model, grads);
+
+                // Note: the training loop is memory-flat without any explicit
+                // sync — `loss.backward()` consumes the autodiff graph every step
+                // and deterministically frees its retained activation buffers.
+                // Validation (below) forwards on the inner backend via
+                // `model.valid()`, so it allocates no autodiff graph either.
+
                 // Divide by block count (not point count): all blocks are
                 // resampled to `target_points`, so block count and point count
                 // scale identically.  Revisit if variable-size blocks are added.
@@ -424,14 +434,21 @@ fn validate_epoch<B: AutodiffBackend>(
 where
     B::InnerBackend: burn::tensor::backend::Backend<Device = B::Device>,
 {
-    // Clone the model so the original's BN running statistics are not
-    // contaminated by validation-batch statistics.
-    // The clone runs in TRAINING mode (batch statistics), which avoids the
-    // BatchNorm distribution-shift problem that occurs when validation blocks
-    // come from spatially disjoint macro-tiles with different feature
-    // distributions.  Running statistics built from training blocks would
-    // normalise validation activations incorrectly, causing logit explosion.
-    let val_model = model.clone();
+    // Stage 16 memory fix: validation runs on the *inner* (inference) backend
+    // via `model.valid()`, NOT the autodiff backend.  Forwarding on the autodiff
+    // backend without a matching `.backward()` accumulates an autodiff graph plus
+    // BatchNorm running-state update nodes that burn 0.16 never reclaims (immune
+    // to `sync` and to per-block model cloning), exhausting VRAM partway through
+    // validation.  `model.valid()` converts the module to `B::InnerBackend` once,
+    // so each forward allocates no autodiff graph and VRAM stays bounded across
+    // all validation blocks.
+    //
+    // KNOWN LIMITATION (see stage-17-batchnorm-running-stats.md): `.valid()` uses
+    // running-statistic (inference-mode) BatchNorm, whose trained running
+    // statistics are currently pathological and produce a logit explosion
+    // (val_loss ~1e5, mIoU ~random).  Root-causing that BatchNorm defect is
+    // deferred to Stage 17; this stage only restores the bounded-VRAM baseline.
+    let val_model = model.valid();
     let mut acc = MetricsAccumulator::new(n_classes);
 
     for &block_id in val_ids {
@@ -447,9 +464,7 @@ where
         let n_features_block = block.features.ncols();
         let flat: Vec<f32> = block.features.into_raw_vec_and_offset().0;
 
-        // Use autodiff tensors so BN runs with per-batch statistics.
-        // No .backward() is ever called, so no gradient computation occurs.
-        let feat_tensor = features_to_tensor::<B>(flat, n, n_features_block, device);
+        let feat_tensor = features_to_tensor::<B::InnerBackend>(flat, n, n_features_block, device);
         let logits = val_model.forward(feat_tensor); // [N, n_classes]
         let nc = logits.dims()[1];
         let flat_out: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap_or_default();
@@ -966,8 +981,16 @@ mod tests {
             weights[1]
         );
         // Present classes must have weights much larger than the floor.
-        assert!(weights[0] > 0.1, "present class weight too small: {}", weights[0]);
-        assert!(weights[2] > 0.1, "present class weight too small: {}", weights[2]);
+        assert!(
+            weights[0] > 0.1,
+            "present class weight too small: {}",
+            weights[0]
+        );
+        assert!(
+            weights[2] > 0.1,
+            "present class weight too small: {}",
+            weights[2]
+        );
         // All weights must be strictly positive (burn validation requirement).
         for (i, &w) in weights.iter().enumerate() {
             assert!(w > 0.0, "weight[{i}] must be > 0, got {w}");

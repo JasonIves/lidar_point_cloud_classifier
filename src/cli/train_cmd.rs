@@ -9,15 +9,12 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use burn::backend::{Autodiff, NdArray};
-
 use crate::error::{ClassifierError, Result};
 use crate::training::{
+    backend::{self, DevicePreference},
     dataset::LabeledBlockDataset,
-    trainer::{train, TrainConfig},
+    trainer::TrainConfig,
 };
-
-type TrainBackend = Autodiff<NdArray>;
 
 pub fn run(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -28,6 +25,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut cfg = TrainConfig::default();
     let mut data_dirs: Vec<PathBuf> = Vec::new();
     let mut val_tile_blocks_path: Option<PathBuf> = None;
+    let mut device_pref = DevicePreference::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -107,6 +105,10 @@ pub fn run(args: &[String]) -> Result<()> {
             "--threads" => {
                 i += 1;
                 cfg.n_threads = Some(parse_usize(&args[i], "--threads")?);
+            }
+            "--device" => {
+                i += 1;
+                device_pref = DevicePreference::parse(&args[i])?;
             }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -201,9 +203,8 @@ pub fn run(args: &[String]) -> Result<()> {
         cfg.metrics_out = metrics_dir.join("metrics.csv");
     }
 
-    let device = burn::backend::ndarray::NdArrayDevice::default();
-
-    train::<TrainBackend>(&dataset, &cfg, &device)?;
+    // Dispatch to the selected backend (GPU or CPU) via runtime detection.
+    backend::select_and_train(&dataset, &cfg, device_pref)?;
 
     Ok(())
 }
@@ -235,7 +236,8 @@ fn print_usage() {
            --keep-best-n       <usize>  Max retained checkpoints (default: 5)\n\
            --swa                        Apply Stochastic Weight Averaging (default: off)\n\
            --metrics-out       <path>   Per-epoch metrics CSV\n\
-           --threads           <usize>  Rayon thread pool size"
+           --threads           <usize>  Rayon thread pool size\n\
+           --device            <auto|cpu|gpu>  Compute device (default: auto)"
     );
 }
 

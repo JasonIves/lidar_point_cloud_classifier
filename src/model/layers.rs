@@ -255,12 +255,21 @@ impl TNet {
         let g = global_max_pool(&h.view()); // [1024]
 
         // ── FC decoder ────────────────────────────────────────────────────
+        // Stage 17: BatchNorm is intentionally NOT applied to the post-pool FC
+        // layers.  The pooled global descriptor `g` is a single sample, so the
+        // batch-statistic BatchNorm used during training normalises it to `beta`
+        // (variance of one sample = 0) while driving its running variance → 0.
+        // The stored running variance then divides by ~sqrt(eps) here, producing
+        // the inference logit explosion documented in
+        // docs/stages/stage-17-batchnorm-running-stats.md.  Skipping BN keeps the
+        // deployed forward consistent with the (fixed) training twin and remains
+        // safe for checkpoints whose `bn_fc0`/`bn_fc1` running stats are already
+        // degenerate.  `self.bn_fc0`/`self.bn_fc1` are kept only for `.wbmodel`
+        // layout compatibility.
         let g = self.fc0.forward_1d(&g)?;
-        let g = apply_bn1d(g, self.bn_fc0.as_ref())?;
         let g = relu_1d(&g);
 
         let g = self.fc1.forward_1d(&g)?;
-        let g = apply_bn1d(g, self.bn_fc1.as_ref())?;
         let g = relu_1d(&g);
 
         let g = self.fc2.forward_1d(&g)?;
@@ -302,13 +311,10 @@ pub(crate) fn apply_bn2d(x: Array2<f32>, bn: Option<&BatchNorm1d>) -> Result<Arr
     }
 }
 
-/// Apply an optional `BatchNorm1d` to a 1-D vector (no-op when `bn` is `None`).
-pub(crate) fn apply_bn1d(x: Array1<f32>, bn: Option<&BatchNorm1d>) -> Result<Array1<f32>> {
-    match bn {
-        Some(b) => b.forward_1d(x),
-        None => Ok(x),
-    }
-}
+// Note: `apply_bn1d` (the 1-D BatchNorm helper) was removed in Stage 17.  Its
+// only caller was the post-pool T-Net FC decoder, where BatchNorm is now
+// intentionally omitted (see `TNet::forward`).  `BatchNorm1d::forward_1d`
+// remains available for callers that operate on a genuine multi-sample axis.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

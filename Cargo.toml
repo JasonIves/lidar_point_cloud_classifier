@@ -5,7 +5,13 @@ edition = "2021"
 description = "Whitebox Next Gen LiDAR point-cloud classifier — Stage 01/02/03"
 
 [features]
-training = ["dep:burn"]
+# `training` always includes GPU support (burn wgpu backend) with runtime
+# fallback to CPU NdArray when no GPU adapter is found.  Per AGENTS.md:
+# "If a GPU is available, it may be utilized for acceleration; if it is
+# absent, the tool must fallback gracefully and run efficiently on the CPU."
+training = ["dep:burn", "burn/wgpu", "dep:wgpu"]
+# `gpu` is now an alias for `training` (kept for backwards compatibility).
+gpu = ["training"]
 
 [[bin]]
 name = "wb_lidar_classify"
@@ -55,6 +61,12 @@ ndarray = "0.16"
 # Training framework — optional; only compiled when `--features training`
 burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
 
+# GPU compute backend — optional; only compiled when `--features gpu`.
+# Used solely for runtime GPU adapter detection (`gpu_is_available`). wgpu is
+# already a transitive dependency of burn-wgpu, so this adds zero additional
+# compile cost.
+wgpu = { version = "23", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -62,7 +74,10 @@ tempfile = "3"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Must be "unwind" (not "abort") so that `std::panic::catch_unwind` in
+# `src/training/backend.rs` can intercept wgpu VRAM-exhaustion panics and
+# fall back to the CPU backend.  See Stage 09, DoD #7.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

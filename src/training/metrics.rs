@@ -397,12 +397,6 @@ mod tests {
 
     #[test]
     fn test_spatial_split_fraction() {
-        use crate::preprocessing::labeled_pipeline::{
-            LabeledBlockManifest, LabeledBlockMeta, SpatialTileGrid,
-        };
-        use crate::preprocessing::pipeline::BlockMeta;
-        use std::collections::HashMap;
-
         // 16 macro-tiles (4x4 grid), val_split = 0.25 → expect ~4 val tiles
         let target_val = (16.0_f64 * 0.25).round() as usize;
         assert_eq!(target_val, 4);

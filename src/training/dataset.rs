@@ -170,8 +170,7 @@ impl LabeledBlockDataset {
                     // {1,2,3} instead of {0,1,2}) would leave slot 0 permanently
                     // empty and cause index 3 to be out-of-bounds.
                     let n = distinct.len();
-                    let expected: std::collections::BTreeSet<u8> =
-                        (0..n as u8).collect();
+                    let expected: std::collections::BTreeSet<u8> = (0..n as u8).collect();
                     if distinct != expected {
                         let vals: Vec<u8> = distinct.into_iter().collect();
                         return Err(ClassifierError::Pipeline(format!(
@@ -312,6 +311,21 @@ impl LabeledBlockDataset {
     /// Return the feature count per point (7 + 5 × n_radii).
     pub fn n_features(&self) -> usize {
         self.n_features_inner
+    }
+
+    /// Return the largest sampled block size recorded in the loaded manifests.
+    ///
+    /// GPU pre-flight and CubeCL memory-pool sizing need a representative upper
+    /// bound for single-block tensor shapes. The manifest already records the
+    /// post-resampling `sampled_point_count` for every block, so use that
+    /// instead of relying solely on the historical 5120-point default.
+    pub fn max_sampled_points_per_block(&self) -> usize {
+        self.dirs
+            .iter()
+            .flat_map(|entry| entry.manifest.blocks.iter())
+            .map(|block| block.meta.sampled_point_count)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Compute per-class point counts from the **training** blocks only.
@@ -580,6 +594,35 @@ mod tests {
         let (train, val) = spatial_split(&manifest, 0.25, 42);
         assert_eq!(val.len(), 4, "expected 4 val blocks, got {}", val.len());
         assert_eq!(train.len(), 12);
+    }
+
+    #[test]
+    fn test_max_sampled_points_per_block_uses_manifest_metadata() {
+        let mut blocks_a = vec![make_lbm(1, 0), make_lbm(2, 0)];
+        blocks_a[0].meta.sampled_point_count = 2048;
+        blocks_a[1].meta.sampled_point_count = 4096;
+
+        let mut blocks_b = vec![make_lbm(3, 1)];
+        blocks_b[0].meta.sampled_point_count = 8192;
+
+        let dataset = LabeledBlockDataset {
+            dirs: vec![
+                DirEntry {
+                    path: PathBuf::from("a"),
+                    manifest: dummy_manifest(blocks_a),
+                },
+                DirEntry {
+                    path: PathBuf::from("b"),
+                    manifest: dummy_manifest(blocks_b),
+                },
+            ],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+        };
+
+        assert_eq!(dataset.max_sampled_points_per_block(), 8192);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
