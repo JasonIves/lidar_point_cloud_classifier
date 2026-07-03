@@ -10,15 +10,6 @@
 //! while Stage 02's `layers::Linear` stores it as `[d_output, d_input]`.
 //! The bridge transposes the extracted tensors to reconcile this difference.
 
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::doc_markdown
-)]
-
 use burn::{
     module::Module,
     nn::{self, BatchNormConfig, LinearConfig},
@@ -32,7 +23,7 @@ use crate::model::pointnet::PointNetConfig;
 // Input T-Net (STN3d) — fixed dims [3→64→128→1024] encoder, [1024→512→256→9] FC
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Input spatial transformer network (STN3d).
+/// Input spatial transformer network (`STN3d`).
 ///
 /// Learns a 3×3 transform applied to the xyz coordinates of each point.
 #[derive(Module, Debug)]
@@ -120,7 +111,7 @@ impl<B: Backend> Stn3d<B> {
     /// Batched forward pass: `xyz` shape `[B, N, 3]` → `T` shape `[B, 3, 3]`.
     ///
     /// Identical maths to [`Stn3d::forward`] but with a leading batch dimension so
-    /// BatchNorm normalizes across all `B·N` points (a genuine cross-block batch,
+    /// `BatchNorm` normalizes across all `B·N` points (a genuine cross-block batch,
     /// Stage 18) while the global max-pool stays *per sample* (over `N` only).
     pub fn forward_batched(&self, xyz: Tensor<B, 3>) -> Tensor<B, 3> {
         let device = xyz.device();
@@ -158,7 +149,7 @@ impl<B: Backend> Stn3d<B> {
 // Feature T-Net (STN64d) — fixed dims [64→64→128→1024] encoder, [1024→512→256→4096] FC
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Feature spatial transformer network (STN64d).
+/// Feature spatial transformer network (`STN64d`).
 ///
 /// Learns a 64×64 transform applied to the intermediate local features.
 #[derive(Module, Debug)]
@@ -269,7 +260,7 @@ impl<B: Backend> Stn64d<B> {
 
 /// Training twin of `PointNetClassifier` from Stage 02.
 ///
-/// Architecture: PointNet segmentation backbone (Qi et al. 2017).
+/// Architecture: `PointNet` segmentation backbone (Qi et al. 2017).
 #[derive(Module, Debug)]
 pub struct BurnPointNet<B: Backend> {
     // Input T-Net (STN3d) — always present for valid training
@@ -301,6 +292,11 @@ impl<B: Backend> BurnPointNet<B> {
     ///
     /// # Errors
     /// Returns an error if the config dims are invalid (e.g. fewer than 3 encoder dims).
+    ///
+    /// # Panics
+    /// Never panics: the `dd.last().unwrap()` call below is guarded by the
+    /// `cfg.decoder_dims.len() < 2` check just above, so `dd` always has at
+    /// least one element by the time `.last()` is called.
     pub fn new(cfg: &PointNetConfig, device: &B::Device) -> Result<Self> {
         if cfg.encoder_dims.len() < 3 {
             return Err(ClassifierError::Pipeline(
@@ -346,7 +342,7 @@ impl<B: Backend> BurnPointNet<B> {
     /// Forward pass.
     ///
     /// # Shapes
-    /// - `input`:  `[N, n_features_in]` (N sampled points, n_features features)
+    /// - `input`:  `[N, n_features_in]` (N sampled points, `n_features` features)
     /// - output: `[N, n_classes]`   (raw logits, no softmax)
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let n = input.dims()[0];
@@ -415,7 +411,7 @@ impl<B: Backend> BurnPointNet<B> {
     /// - `input`:  `[B, N, n_features_in]` (B blocks, N sampled points each)
     /// - output: `[B, N, n_classes]`   (raw logits, no softmax)
     ///
-    /// Every BatchNorm normalizes across the whole `B·N` micro-batch (so its
+    /// Every `BatchNorm` normalizes across the whole `B·N` micro-batch (so its
     /// running statistics become representative of the block *population*), while
     /// the global max-pool remains strictly per-block (over `N`).  The weights are
     /// identical to the single-block [`BurnPointNet::forward`] path, so the
@@ -517,7 +513,7 @@ pub fn features_to_tensor<B: Backend>(
 /// major: block-major, then point, then feature) into a burn `Tensor<B, 3>`.
 ///
 /// Used by the Stage 18 batched training forward, which stacks several spatial
-/// blocks into one micro-batch so BatchNorm sees a genuine cross-block batch.
+/// blocks into one micro-batch so `BatchNorm` sees a genuine cross-block batch.
 pub fn features_to_tensor_batched<B: Backend>(
     flat: Vec<f32>,
     batch: usize,
@@ -552,7 +548,7 @@ fn apply_bn2d<B: Backend>(x: Tensor<B, 2>, bn: &nn::BatchNorm<B, 1>) -> Tensor<B
 }
 
 /// Apply `BatchNorm<B, 1>` to a batched 3D tensor `[B, N, C]` by reshaping to
-/// `[B·N, C, 1]`, so BatchNorm normalizes each channel across all `B·N` samples
+/// `[B·N, C, 1]`, so `BatchNorm` normalizes each channel across all `B·N` samples
 /// of the micro-batch (Stage 18).  Restores the `[B, N, C]` shape afterwards.
 fn apply_bn3d<B: Backend>(x: Tensor<B, 3>, bn: &nn::BatchNorm<B, 1>) -> Tensor<B, 3> {
     let [b, n, c] = x.dims();

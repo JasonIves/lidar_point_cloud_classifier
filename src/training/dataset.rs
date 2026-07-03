@@ -1,7 +1,7 @@
 //! Labeled block dataset — loads `.feat` + `.lbl` pairs and manages the
 //! spatially-disjoint train/val split.
 //!
-//! Supports **multiple input directories** (one per preprocessed LiDAR file).
+//! Supports **multiple input directories** (one per preprocessed `LiDAR` file).
 //! Block IDs within a single directory are `row * grid_cols + col` and can
 //! collide across directories.  The dataset encodes a per-directory index into
 //! the high 32 bits of each `GlobalBlockId` to guarantee global uniqueness
@@ -10,30 +10,20 @@
 //!
 //! See `docs/stages/stage-05-multi-directory-dataset.md` for full design rationale.
 
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    clippy::must_use_candidate,
-    clippy::missing_errors_doc,
-    clippy::doc_markdown,
-    clippy::too_many_lines,
-    clippy::manual_is_multiple_of
-)]
-
 use std::collections::{HashMap, HashSet};
+
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ndarray::Array2;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
 use crate::preprocessing::{
-    n_features_for_radii, FEAT_MAGIC, FEAT_VERSION, N_EIGEN_FEATURES_PER_RADIUS, N_FEATURES,
-    N_SCALAR_FEATURES,
+    n_features_for_radii, validate_block_filename, FEAT_MAGIC, FEAT_VERSION,
+    MAX_FEAT_PAYLOAD_BYTES, N_EIGEN_FEATURES_PER_RADIUS, N_FEATURES, N_SCALAR_FEATURES,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +52,7 @@ fn decode_global_id(gid: u64) -> (usize, u64) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A loaded block: feature matrix + label vector.
+#[derive(Debug)]
 pub struct LoadedBlock {
     /// Feature matrix: `[n_points, N_FEATURES]`.
     pub features: Array2<f32>,
@@ -71,9 +62,85 @@ pub struct LoadedBlock {
 }
 
 /// One preprocessed-LiDAR-file directory: path + parsed manifest.
+#[derive(Debug)]
 struct DirEntry {
     path: PathBuf,
     manifest: LabeledBlockManifest,
+    /// Stage 21 (Performance): local block ID → index into `manifest.blocks`,
+    /// built once at `load()` time so `load_block()` no longer needs an O(n)
+    /// linear scan on every call.
+    block_index: HashMap<u64, usize>,
+}
+
+/// Stage 27 (Block Caching, audit finding 5.2): opt-in, byte-budget-bounded
+/// in-memory cache of already-decoded blocks, scoped to one
+/// `LabeledBlockDataset` (i.e. one training run) — not a process-`static`.
+///
+/// Follows the `whitebox_next_gen::memory_store` idiom (a plain
+/// `HashMap<K, Arc<V>>` behind a `Mutex`, no external caching crate, no
+/// eviction policy) investigated in Stage 26. When the configured byte
+/// budget would be exceeded by an additional block, the cache simply
+/// declines to insert it (the block is transparently re-read from disk on
+/// its next request) and logs exactly one informative warning the first
+/// time this happens — never an error.
+#[derive(Debug)]
+struct BlockCache {
+    entries: HashMap<u64, Arc<LoadedBlock>>,
+    bytes_used: usize,
+    max_bytes: usize,
+    /// Set to `true` after the first time an insert was skipped due to the
+    /// budget being exceeded, so the `[cache] ... budget exceeded` warning
+    /// is only ever emitted once per training run.
+    warned_budget_exceeded: bool,
+}
+
+impl BlockCache {
+    fn new(max_mb: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes_used: 0,
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            warned_budget_exceeded: false,
+        }
+    }
+
+    /// Exact in-memory footprint of a loaded block: `n_points × n_features`
+    /// `f32` feature bytes plus `n_points` `u8` label bytes.
+    fn block_bytes(block: &LoadedBlock) -> usize {
+        let n_points = block.features.nrows();
+        let n_features = block.features.ncols();
+        n_points.saturating_mul(n_features).saturating_mul(4) + n_points
+    }
+
+    /// Attempt to insert a freshly-loaded block. Best-effort: silently
+    /// declines (no error, no panic) if the budget would be exceeded,
+    /// logging exactly one warning the first time that happens.
+    fn try_insert(&mut self, block: Arc<LoadedBlock>) {
+        let bytes = Self::block_bytes(&block);
+        if self.bytes_used.saturating_add(bytes) <= self.max_bytes {
+            self.bytes_used += bytes;
+            self.entries.insert(block.block_id, block);
+        } else if !self.warned_budget_exceeded {
+            self.warned_budget_exceeded = true;
+            eprintln!(
+                "[cache] block cache budget ({} MB) exceeded — further blocks \
+                 will be re-read from disk instead of cached for the remainder \
+                 of this run",
+                self.max_bytes / (1024 * 1024)
+            );
+        }
+    }
+}
+
+/// Clone a cached block's data into a fresh, independently-owned
+/// `LoadedBlock`. `Array2<f32>`/`Vec<u8>` clones are cheap relative to the
+/// disk read + `.feat`/`.lbl` parse they replace.
+fn clone_loaded_block(block: &LoadedBlock) -> LoadedBlock {
+    LoadedBlock {
+        features: block.features.clone(),
+        labels: block.labels.clone(),
+        block_id: block.block_id,
+    }
 }
 
 /// Manages the `.feat` / `.lbl` dataset across one or more preprocessing
@@ -82,6 +149,7 @@ struct DirEntry {
 /// Block IDs returned in `train_ids` and `val_ids` are **composite
 /// `GlobalBlockId`** values (`dir_index << 32 | local_block_id`).  Pass them
 /// directly to [`load_block`]; do not interpret the raw bits externally.
+#[derive(Debug)]
 pub struct LabeledBlockDataset {
     dirs: Vec<DirEntry>,
     /// Validated common class count across all directories.
@@ -91,6 +159,14 @@ pub struct LabeledBlockDataset {
     n_features_inner: usize,
     pub train_ids: Vec<u64>,
     pub val_ids: Vec<u64>,
+    /// Stage 21 (Performance): cached copy of `train_ids` as a `HashSet` so
+    /// `class_counts_train()` no longer rebuilds it on every call.
+    train_set: HashSet<u64>,
+    /// Stage 27 (Block Caching, audit finding 5.2): opt-in in-memory block
+    /// cache, installed via `with_block_cache()`. `None` (the default after
+    /// `load()`) disables caching entirely — `load_block()` behaves exactly
+    /// as it did before Stage 27.
+    cache: Option<Mutex<BlockCache>>,
 }
 
 impl LabeledBlockDataset {
@@ -105,6 +181,14 @@ impl LabeledBlockDataset {
     /// # Errors
     /// Returns an error if any manifest cannot be read, parsed, or if the
     /// `n_classes` values are inconsistent across directories.
+    // Stage 24 (Code Quality Cleanup, item 4.1): this constructor validates
+    // and merges N independent manifests (class-index contiguity, n_classes
+    // agreement, n_features agreement) and builds the train/val split in one
+    // pass — splitting it further would scatter tightly-coupled validation
+    // state across extra functions for no real benefit. The `usize as u64`
+    // casts below are bounded block/point counts, so precision loss/
+    // truncation is inconsequential.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn load(
         data_dirs: &[PathBuf],
         val_split: f64,
@@ -202,9 +286,17 @@ impl LabeledBlockDataset {
                 _ => {}
             }
 
+            let block_index: HashMap<u64, usize> = manifest
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.meta.id, i))
+                .collect();
+
             dirs.push(DirEntry {
                 path: dir.clone(),
                 manifest,
+                block_index,
             });
         }
 
@@ -294,31 +386,51 @@ impl LabeledBlockDataset {
             );
         }
 
+        let train_set: HashSet<u64> = train_ids.iter().copied().collect();
+
         Ok(Self {
             dirs,
             n_classes_inner,
             n_features_inner,
             train_ids,
             val_ids,
+            train_set,
+            cache: None,
         })
     }
 
+    /// Opt into an in-memory block cache bounded by `max_mb` megabytes.
+    ///
+    /// `None` disables caching — the default after [`load`](Self::load), and
+    /// exactly matches pre-Stage-27 behavior (every `load_block()` call reads
+    /// from disk). When enabled, blocks are cached on a best-effort,
+    /// byte-budget-bounded basis: see `BlockCache` for the eviction-free,
+    /// budget-exceeded-warns-once design rationale.
+    #[must_use]
+    pub fn with_block_cache(mut self, max_mb: Option<usize>) -> Self {
+        self.cache = max_mb.map(|mb| Mutex::new(BlockCache::new(mb)));
+        self
+    }
+
     /// Return the validated common class count across all loaded directories.
+    #[must_use]
     pub fn n_classes(&self) -> usize {
         self.n_classes_inner
     }
 
-    /// Return the feature count per point (7 + 5 × n_radii).
+    /// Return the feature count per point (`7 + 5 × n_radii`).
+    #[must_use]
     pub fn n_features(&self) -> usize {
         self.n_features_inner
     }
 
     /// Return the largest sampled block size recorded in the loaded manifests.
     ///
-    /// GPU pre-flight and CubeCL memory-pool sizing need a representative upper
-    /// bound for single-block tensor shapes. The manifest already records the
-    /// post-resampling `sampled_point_count` for every block, so use that
-    /// instead of relying solely on the historical 5120-point default.
+    /// GPU pre-flight and `CubeCL` memory-pool sizing need a representative
+    /// upper bound for single-block tensor shapes. The manifest already
+    /// records the post-resampling `sampled_point_count` for every block, so
+    /// use that instead of relying solely on the historical 5120-point default.
+    #[must_use]
     pub fn max_sampled_points_per_block(&self) -> usize {
         self.dirs
             .iter()
@@ -330,14 +442,16 @@ impl LabeledBlockDataset {
 
     /// Compute per-class point counts from the **training** blocks only.
     /// Returns a `Vec<u64>` of length `n_classes()`.
+    #[must_use]
     pub fn class_counts_train(&self) -> Vec<u64> {
         let n = self.n_classes_inner;
-        let train_set: HashSet<u64> = self.train_ids.iter().copied().collect();
+        // Stage 21 (Performance): use the HashSet cached at load() time
+        // instead of rebuilding it on every call.
         let mut counts = vec![0u64; n];
         for (dir_idx, entry) in self.dirs.iter().enumerate() {
             for b in &entry.manifest.blocks {
                 let gid = make_global_id(dir_idx, b.meta.id);
-                if !train_set.contains(&gid) {
+                if !self.train_set.contains(&gid) {
                     continue;
                 }
                 for (k, &v) in &b.class_distribution {
@@ -357,10 +471,28 @@ impl LabeledBlockDataset {
     /// `block_id` must be a `GlobalBlockId` as returned by `train_ids` or
     /// `val_ids` — do not pass raw local block IDs here.
     ///
+    /// Stage 27 (Block Caching, audit finding 5.2): if an in-memory block
+    /// cache is installed (via [`with_block_cache`](Self::with_block_cache)),
+    /// this checks it first and returns a cheap in-memory clone on a hit
+    /// (no disk I/O). On a miss, it falls through to the original disk-read
+    /// path unchanged, then makes a best-effort attempt to populate the
+    /// cache for subsequent calls. A poisoned cache mutex is treated as
+    /// "caching unavailable" (silently falls back to disk) rather than
+    /// propagated as an error, since caching is purely a performance
+    /// optimization, never a correctness requirement.
+    ///
     /// # Errors
     /// Returns an error if the `.feat` or `.lbl` file cannot be read, or if
     /// the composite ID refers to an out-of-range directory.
     pub fn load_block(&self, block_id: u64) -> Result<LoadedBlock> {
+        if let Some(mutex) = &self.cache {
+            if let Ok(guard) = mutex.lock() {
+                if let Some(cached) = guard.entries.get(&block_id) {
+                    return Ok(clone_loaded_block(cached));
+                }
+            }
+        }
+
         let (dir_idx, local_id) = decode_global_id(block_id);
 
         let entry = self.dirs.get(dir_idx).ok_or_else(|| {
@@ -371,17 +503,21 @@ impl LabeledBlockDataset {
             ))
         })?;
 
+        // Stage 21 (Performance): O(1) HashMap lookup instead of an O(n)
+        // linear scan through entry.manifest.blocks on every call.
         let bm = entry
-            .manifest
-            .blocks
-            .iter()
-            .find(|b| b.meta.id == local_id)
+            .block_index
+            .get(&local_id)
+            .and_then(|&i| entry.manifest.blocks.get(i))
             .ok_or_else(|| {
                 ClassifierError::Pipeline(format!(
                     "block {local_id} not found in manifest for '{}'",
                     entry.path.display()
                 ))
             })?;
+
+        validate_block_filename(&bm.meta.file)?;
+        validate_block_filename(&bm.lbl_file)?;
 
         let feat_path = entry.path.join(&bm.meta.file);
         let features = load_feat_file(&feat_path)?;
@@ -390,11 +526,22 @@ impl LabeledBlockDataset {
         let n_points = features.nrows();
         let labels = load_lbl_file(&lbl_path, n_points)?;
 
-        Ok(LoadedBlock {
+        let loaded = LoadedBlock {
             features,
             labels,
             block_id,
-        })
+        };
+
+        // Stage 27 (Block Caching, audit finding 5.2): best-effort cache
+        // insert. As above, a poisoned mutex is silently treated as
+        // "caching unavailable" rather than propagated as an error.
+        if let Some(mutex) = &self.cache {
+            if let Ok(mut guard) = mutex.lock() {
+                guard.try_insert(Arc::new(clone_loaded_block(&loaded)));
+            }
+        }
+
+        Ok(loaded)
     }
 }
 
@@ -403,6 +550,15 @@ impl LabeledBlockDataset {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Assign blocks to train or validation set using macro-tile stride selection.
+// Stage 24 (Code Quality Cleanup, item 4.1): `n_tiles`/`target_val`/`offset`
+// are all small, bounded counts (number of macro-tiles, never anywhere near
+// f64/usize precision limits), so the truncating/sign-losing casts here are
+// inconsequential.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn spatial_split(
     manifest: &LabeledBlockManifest,
     val_split: f64,
@@ -488,7 +644,7 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
     }
     // Accept any positive n_features (multi-scale or legacy 12).
     if n_features == 0
-        || !matches!(n_features, f if (f - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS == 0)
+        || !matches!(n_features, f if (f - N_SCALAR_FEATURES).is_multiple_of(N_EIGEN_FEATURES_PER_RADIUS))
     {
         return Err(ClassifierError::Pipeline(format!(
             "feat: n_features={n_features} is not a valid value (expected 7 + 5×N)"
@@ -496,18 +652,49 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
     }
 
     // ── Data ─────────────────────────────────────────────────────────────
-    let n_f32 = n_points * n_features;
-    let mut buf = vec![0u8; n_f32 * 4];
+    // Stage 20 (Security Hardening): use checked arithmetic throughout the
+    // size computation and enforce an upper bound *before* allocating, so a
+    // corrupted or maliciously-crafted header (e.g. n_points ≈ u32::MAX)
+    // cannot drive a multi-gigabyte allocation attempt.
+    let n_f32 = n_points.checked_mul(n_features).ok_or_else(|| {
+        ClassifierError::Pipeline(format!(
+            "feat '{}': n_points × n_features overflows usize (n_points={n_points}, n_features={n_features})",
+            path.display()
+        ))
+    })?;
+    let payload_bytes = n_f32.checked_mul(4).ok_or_else(|| {
+        ClassifierError::Pipeline(format!(
+            "feat '{}': data payload size overflows usize",
+            path.display()
+        ))
+    })?;
+    if payload_bytes > MAX_FEAT_PAYLOAD_BYTES {
+        return Err(ClassifierError::Pipeline(format!(
+            "feat '{}': data payload of {payload_bytes} bytes exceeds the {MAX_FEAT_PAYLOAD_BYTES}-byte \
+             safety cap (n_points={n_points}, n_features={n_features}); refusing to allocate",
+            path.display()
+        )));
+    }
+
+    let mut buf = vec![0u8; payload_bytes];
     f.read_exact(&mut buf)
         .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
 
-    // chunks_exact(4) guarantees each chunk is exactly 4 bytes; the try_into
-    // cannot fail, but we use an array copy instead of try_into to avoid any
-    // unwrap() in production code.
-    let floats: Vec<f32> = buf
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    // Stage 21 (Performance): zero-copy byte→f32 reinterpretation via
+    // `bytemuck::try_cast_slice` instead of a manual per-element
+    // `chunks_exact(4).map(from_le_bytes)` loop. `try_cast_slice` (rather
+    // than the panicking `cast_slice`) preserves the project-wide
+    // no-panics rule: on the (practically unreachable, since a `Vec<u8>`'s
+    // heap allocation is always suitably aligned for `f32` on every
+    // supported platform) misalignment case, fall back to the original
+    // manual conversion instead of erroring or panicking.
+    let floats: Vec<f32> = match bytemuck::try_cast_slice::<u8, f32>(&buf) {
+        Ok(slice) => slice.to_vec(),
+        Err(_) => buf
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+    };
 
     Array2::from_shape_vec((n_points, n_features), floats)
         .map_err(|e| ClassifierError::Pipeline(format!("feat reshape: {e}")))
@@ -517,6 +704,23 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
 fn load_lbl_file(path: &Path, n_points: usize) -> Result<Vec<u8>> {
     let mut f = File::open(path)
         .map_err(|e| ClassifierError::Pipeline(format!("lbl open {}: {e}", path.display())))?;
+
+    // Stage 20 (Security Hardening): validate the file is at least large
+    // enough before reading, so a truncated `.lbl` produces a clear
+    // validation error rather than a generic "unexpected end of file" I/O
+    // error from read_exact.
+    let actual_len = f
+        .metadata()
+        .map_err(|e| ClassifierError::Pipeline(format!("lbl metadata {}: {e}", path.display())))?
+        .len();
+    let expected_len = n_points as u64;
+    if actual_len < expected_len {
+        return Err(ClassifierError::Pipeline(format!(
+            "lbl '{}' is truncated: expected {expected_len} bytes, found {actual_len}",
+            path.display()
+        )));
+    }
+
     let mut buf = vec![0u8; n_points];
     f.read_exact(&mut buf)
         .map_err(|e| ClassifierError::Pipeline(format!("lbl read: {e}")))?;
@@ -605,32 +809,454 @@ mod tests {
         let mut blocks_b = vec![make_lbm(3, 1)];
         blocks_b[0].meta.sampled_point_count = 8192;
 
+        let manifest_a = dummy_manifest(blocks_a);
+        let manifest_b = dummy_manifest(blocks_b);
+        let block_index_a = build_block_index(&manifest_a);
+        let block_index_b = build_block_index(&manifest_b);
+
         let dataset = LabeledBlockDataset {
             dirs: vec![
                 DirEntry {
                     path: PathBuf::from("a"),
-                    manifest: dummy_manifest(blocks_a),
+                    manifest: manifest_a,
+                    block_index: block_index_a,
                 },
                 DirEntry {
                     path: PathBuf::from("b"),
-                    manifest: dummy_manifest(blocks_b),
+                    manifest: manifest_b,
+                    block_index: block_index_b,
                 },
             ],
             n_classes_inner: 8,
             n_features_inner: N_FEATURES,
             train_ids: Vec::new(),
             val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
         };
 
         assert_eq!(dataset.max_sampled_points_per_block(), 8192);
     }
 
+    /// Stage 21 (Performance): the `HashMap`-backed `load_block()` lookup
+    /// must find an existing block ID and return `None` (via the outer
+    /// `Option` chain) for a missing one, matching the pre-optimization
+    /// linear-scan semantics exactly.
+    #[test]
+    fn test_block_index_hit_and_miss() {
+        let blocks = vec![make_lbm(10, 0), make_lbm(20, 0), make_lbm(30, 1)];
+        let manifest = dummy_manifest(blocks);
+        let index = build_block_index(&manifest);
+
+        // Hit: existing local block ID resolves to the correct manifest entry.
+        let found = index.get(&20).and_then(|&i| manifest.blocks.get(i));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().meta.id, 20);
+
+        // Miss: a local ID never present in the manifest resolves to None.
+        assert!(!index.contains_key(&999));
+    }
+
+    #[test]
+    fn test_load_feat_file_rejects_oversized_header_before_allocating() {
+        // Stage 20 (Security Hardening): a corrupted/malicious header whose
+        // n_points × n_features × 4 exceeds MAX_FEAT_PAYLOAD_BYTES must be
+        // rejected with a clear error *before* any large allocation is
+        // attempted. We only need to write the 4-byte magic + 33-byte header
+        // — load_feat_file must fail during header validation, never reaching
+        // the point where it tries to read/allocate the (nonexistent) payload.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("oversized.feat");
+
+        let n_points: u32 = 100_000_000;
+        let n_features: u32 = 12; // valid: 7 + 5×1
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION);
+        bytes.extend_from_slice(&n_points.to_le_bytes());
+        bytes.extend_from_slice(&n_features.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // block_id
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_x
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_y
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let result = load_feat_file(&path);
+        assert!(result.is_err(), "oversized header must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("safety cap"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_lbl_file_rejects_truncated_file() {
+        // Stage 20 (Security Hardening): a `.lbl` file shorter than the
+        // requested n_points must be rejected with a clear "truncated"
+        // error instead of a generic I/O read error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.lbl");
+        std::fs::write(&path, [0u8, 1u8, 2u8]).expect("write fixture");
+
+        let result = load_lbl_file(&path, 10);
+        assert!(result.is_err(), "truncated lbl must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("truncated"), "unexpected error message: {msg}");
+    }
+
+    // ── Stage 25 (Testing Gaps, item 6.2): error-path coverage ────────────────
+
+    #[test]
+    fn test_load_rejects_empty_data_dirs() {
+        let result = LabeledBlockDataset::load(&[], 0.2, None, 0);
+        assert!(result.is_err(), "empty data_dirs must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at least one --data-dir"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_missing_manifest() {
+        // A tempdir that exists but has no labeled_blocks.json inside it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.2, None, 0);
+        assert!(result.is_err(), "missing manifest must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cannot open"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_corrupt_manifest_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("labeled_blocks.json"), b"{ not valid json ")
+            .expect("write fixture");
+        let result = LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.2, None, 0);
+        assert!(result.is_err(), "corrupt manifest JSON must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("parse error"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_non_contiguous_label_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut label_map = HM::new();
+        // Values {1, 2} are not 0-based contiguous ({0, 1, ...}).
+        label_map.insert("5".to_string(), 1u8);
+        label_map.insert("6".to_string(), 2u8);
+        let mut manifest = dummy_manifest(vec![make_lbm(0, 0)]);
+        manifest.label_map = label_map;
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write fixture");
+
+        let result = LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.2, None, 0);
+        assert!(result.is_err(), "non-contiguous label map must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("non-contiguous"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_n_classes_mismatch_across_dirs() {
+        let dir0 = tempfile::tempdir().expect("tempdir 0");
+        let dir1 = tempfile::tempdir().expect("tempdir 1");
+
+        let mut label_map_2 = HM::new();
+        label_map_2.insert("a".to_string(), 0u8);
+        label_map_2.insert("b".to_string(), 1u8);
+        let mut manifest0 = dummy_manifest(vec![make_lbm(0, 0)]);
+        manifest0.label_map = label_map_2;
+
+        let mut label_map_3 = HM::new();
+        label_map_3.insert("a".to_string(), 0u8);
+        label_map_3.insert("b".to_string(), 1u8);
+        label_map_3.insert("c".to_string(), 2u8);
+        let mut manifest1 = dummy_manifest(vec![make_lbm(0, 0)]);
+        manifest1.label_map = label_map_3;
+
+        std::fs::write(
+            dir0.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest0).expect("serialize manifest0"),
+        )
+        .expect("write fixture 0");
+        std::fs::write(
+            dir1.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest1).expect("serialize manifest1"),
+        )
+        .expect("write fixture 1");
+
+        let result = LabeledBlockDataset::load(
+            &[dir0.path().to_path_buf(), dir1.path().to_path_buf()],
+            0.2,
+            None,
+            0,
+        );
+        assert!(result.is_err(), "n_classes mismatch must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("n_classes mismatch"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_feat_file_rejects_bad_magic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad_magic.feat");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NOPE"); // wrong 4-byte magic
+        bytes.push(FEAT_VERSION);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_points
+        bytes.extend_from_slice(&12u32.to_le_bytes()); // n_features
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // block_id
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_x
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_y
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let result = load_feat_file(&path);
+        assert!(result.is_err(), "bad magic must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("bad magic"), "unexpected error message: {msg}");
+    }
+
+    #[test]
+    fn test_load_feat_file_rejects_unsupported_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad_version.feat");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION.wrapping_add(1)); // unsupported version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_points
+        bytes.extend_from_slice(&12u32.to_le_bytes()); // n_features
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // block_id
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_x
+        bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_y
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let result = load_feat_file(&path);
+        assert!(result.is_err(), "unsupported version must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsupported version"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_block_rejects_out_of_range_dir_index() {
+        let manifest = dummy_manifest(vec![make_lbm(0, 0)]);
+        let block_index = build_block_index(&manifest);
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        };
+
+        // dir index 5 does not exist (only 1 directory loaded).
+        let result = dataset.load_block(make_global_id(5, 0));
+        assert!(
+            result.is_err(),
+            "out-of-range directory index must be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("out of range"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_block_rejects_missing_local_id() {
+        let manifest = dummy_manifest(vec![make_lbm(10, 0)]);
+        let block_index = build_block_index(&manifest);
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        };
+
+        // Local block id 999 is absent from the manifest.
+        let result = dataset.load_block(make_global_id(0, 999));
+        assert!(result.is_err(), "missing local block id must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not found in manifest"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    // ── Stage 27 (Block Caching, audit finding 5.2): cache behavior ───────────
+
+    #[test]
+    fn test_block_cache_hit_avoids_disk_reread() {
+        // Build a single-directory dataset on disk with one real block, load
+        // it once with caching enabled (populating the cache), then delete
+        // the underlying .feat/.lbl files. A second load_block() call must
+        // still succeed by serving from the cache instead of touching disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block_id = 0u64;
+        let n_points = 4usize;
+        let n_features = N_FEATURES;
+
+        // Write a minimal valid .feat file.
+        let feat_path = dir.path().join("block_00000.feat");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION);
+        bytes.extend_from_slice(&(n_points as u32).to_le_bytes());
+        bytes.extend_from_slice(&(n_features as u32).to_le_bytes());
+        bytes.extend_from_slice(&block_id.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        for _ in 0..(n_points * n_features) {
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        std::fs::write(&feat_path, &bytes).expect("write feat fixture");
+
+        // Write a minimal valid .lbl file.
+        let lbl_path = dir.path().join("block_00000.lbl");
+        std::fs::write(&lbl_path, vec![0u8; n_points]).expect("write lbl fixture");
+
+        let mut lbm = make_lbm(block_id, 0);
+        lbm.meta.file = "block_00000.feat".to_string();
+        lbm.lbl_file = "block_00000.lbl".to_string();
+        let manifest = dummy_manifest(vec![lbm]);
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest fixture");
+
+        let dataset = LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.2, None, 0)
+            .expect("load dataset")
+            .with_block_cache(Some(64));
+
+        let gid = make_global_id(0, block_id);
+
+        // First load: cache miss, reads from disk, populates cache.
+        let first = dataset.load_block(gid).expect("first load_block");
+        assert_eq!(first.features.nrows(), n_points);
+
+        // Delete the on-disk files so a second disk read would fail.
+        std::fs::remove_file(&feat_path).expect("remove feat fixture");
+        std::fs::remove_file(&lbl_path).expect("remove lbl fixture");
+
+        // Second load: must succeed via the cache, not disk.
+        let second = dataset
+            .load_block(gid)
+            .expect("second load_block must hit cache, not disk");
+        assert_eq!(second.features.nrows(), n_points);
+        assert_eq!(second.labels.len(), n_points);
+    }
+
+    #[test]
+    fn test_block_cache_budget_exceeded_falls_back_gracefully() {
+        // A cache budget of 0 MB can never fit even the smallest block, so
+        // every insert attempt must silently decline (never error) and the
+        // one-time warning path (warned_budget_exceeded) must engage without
+        // panicking. load_block() must still succeed by falling back to disk
+        // on every call.
+        let block = LoadedBlock {
+            features: Array2::from_elem((4, N_FEATURES), 1.0f32),
+            labels: vec![0u8; 4],
+            block_id: 0,
+        };
+        let mut cache = BlockCache::new(0);
+        assert!(!cache.warned_budget_exceeded);
+
+        cache.try_insert(Arc::new(clone_loaded_block(&block)));
+        assert!(
+            cache.warned_budget_exceeded,
+            "budget of 0 MB must immediately exceed on first insert attempt"
+        );
+        assert!(
+            cache.entries.is_empty(),
+            "an over-budget insert must not actually store the block"
+        );
+
+        // A second over-budget insert must not panic and must not re-warn
+        // (warned_budget_exceeded stays true; try_insert() has no visible
+        // side effect to assert on for the "only warns once" behavior beyond
+        // not panicking, since eprintln! output isn't captured here).
+        let block2 = LoadedBlock {
+            features: Array2::from_elem((4, N_FEATURES), 2.0f32),
+            labels: vec![1u8; 4],
+            block_id: 1,
+        };
+        cache.try_insert(Arc::new(clone_loaded_block(&block2)));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_with_block_cache_none_disables_caching() {
+        // with_block_cache(None) must leave the dataset's cache field unset,
+        // exactly matching pre-Stage-27 behavior (load_block() always reads
+        // from disk, never touching any cache).
+        let manifest = dummy_manifest(vec![make_lbm(0, 0)]);
+        let block_index = build_block_index(&manifest);
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        }
+        .with_block_cache(None);
+
+        assert!(dataset.cache.is_none());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
     use crate::preprocessing::labeled_pipeline::{
         LabeledBlockManifest, LabeledBlockMeta, SpatialTileGrid,
     };
     use crate::preprocessing::pipeline::BlockMeta;
     use std::collections::HashMap as HM;
+
+    /// Test-only mirror of the `HashMap` construction done in `load()`.
+    fn build_block_index(manifest: &LabeledBlockManifest) -> HashMap<u64, usize> {
+        manifest
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.meta.id, i))
+            .collect()
+    }
 
     fn make_lbm(id: u64, macro_tile_id: u32) -> LabeledBlockMeta {
         LabeledBlockMeta {

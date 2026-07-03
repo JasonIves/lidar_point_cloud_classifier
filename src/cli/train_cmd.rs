@@ -31,48 +31,52 @@ pub fn run(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--data-dir" => {
-                i += 1;
-                data_dirs.push(PathBuf::from(&args[i]));
+                data_dirs.push(PathBuf::from(next_value(args, &mut i, "--data-dir")?));
             }
             "--output-model" => {
-                i += 1;
-                cfg.output_model = PathBuf::from(&args[i]);
+                cfg.output_model = PathBuf::from(next_value(args, &mut i, "--output-model")?);
             }
             "--n-classes" => {
-                i += 1;
-                cfg.n_classes = parse_usize(&args[i], "--n-classes")?;
+                cfg.n_classes =
+                    parse_usize(next_value(args, &mut i, "--n-classes")?, "--n-classes")?;
             }
             "--epochs" => {
-                i += 1;
-                cfg.epochs = parse_usize(&args[i], "--epochs")?;
+                cfg.epochs = parse_usize(next_value(args, &mut i, "--epochs")?, "--epochs")?;
             }
             "--batch-size" => {
-                i += 1;
-                cfg.batch_size = parse_usize(&args[i], "--batch-size")?;
+                cfg.batch_size =
+                    parse_usize(next_value(args, &mut i, "--batch-size")?, "--batch-size")?;
             }
             "--forward-batch-size" => {
-                i += 1;
-                cfg.forward_batch_size = parse_usize(&args[i], "--forward-batch-size")?;
+                cfg.forward_batch_size = parse_usize(
+                    next_value(args, &mut i, "--forward-batch-size")?,
+                    "--forward-batch-size",
+                )?;
             }
             "--learning-rate" => {
-                i += 1;
-                cfg.learning_rate = parse_f64(&args[i], "--learning-rate")?;
+                cfg.learning_rate = parse_f64(
+                    next_value(args, &mut i, "--learning-rate")?,
+                    "--learning-rate",
+                )?;
             }
             "--weight-decay" => {
-                i += 1;
-                cfg.weight_decay = parse_f32(&args[i], "--weight-decay")?;
+                cfg.weight_decay = parse_f32(
+                    next_value(args, &mut i, "--weight-decay")?,
+                    "--weight-decay",
+                )?;
             }
             "--val-split" => {
-                i += 1;
-                cfg.val_split = parse_f64(&args[i], "--val-split")?;
+                cfg.val_split = parse_f64(next_value(args, &mut i, "--val-split")?, "--val-split")?;
             }
             "--val-tile-blocks" => {
-                i += 1;
-                val_tile_blocks_path = Some(PathBuf::from(&args[i]));
+                val_tile_blocks_path = Some(PathBuf::from(next_value(
+                    args,
+                    &mut i,
+                    "--val-tile-blocks",
+                )?));
             }
             "--seed" => {
-                i += 1;
-                cfg.seed = parse_u64(&args[i], "--seed")?;
+                cfg.seed = parse_u64(next_value(args, &mut i, "--seed")?, "--seed")?;
             }
             "--use-feature-tnet" => {
                 cfg.use_feature_tnet = true;
@@ -81,35 +85,63 @@ pub fn run(args: &[String]) -> Result<()> {
                 cfg.use_class_weights = false;
             }
             "--class-weight-beta" => {
-                i += 1;
-                cfg.class_weight_beta = parse_f64(&args[i], "--class-weight-beta")?;
+                cfg.class_weight_beta = parse_f64(
+                    next_value(args, &mut i, "--class-weight-beta")?,
+                    "--class-weight-beta",
+                )?;
             }
             "--checkpoint-dir" => {
-                i += 1;
-                cfg.checkpoint_dir = Some(PathBuf::from(&args[i]));
+                cfg.checkpoint_dir =
+                    Some(PathBuf::from(next_value(args, &mut i, "--checkpoint-dir")?));
             }
             "--checkpoint-every" => {
-                i += 1;
-                cfg.checkpoint_every = parse_usize(&args[i], "--checkpoint-every")?;
+                cfg.checkpoint_every = parse_usize(
+                    next_value(args, &mut i, "--checkpoint-every")?,
+                    "--checkpoint-every",
+                )?;
             }
             "--keep-best-n" => {
-                i += 1;
-                cfg.keep_best_n = parse_usize(&args[i], "--keep-best-n")?;
+                cfg.keep_best_n =
+                    parse_usize(next_value(args, &mut i, "--keep-best-n")?, "--keep-best-n")?;
             }
             "--swa" => {
                 cfg.swa = true;
             }
             "--metrics-out" => {
-                i += 1;
-                cfg.metrics_out = PathBuf::from(&args[i]);
+                cfg.metrics_out = PathBuf::from(next_value(args, &mut i, "--metrics-out")?);
             }
             "--threads" => {
-                i += 1;
-                cfg.n_threads = Some(parse_usize(&args[i], "--threads")?);
+                cfg.n_threads = Some(parse_usize(
+                    next_value(args, &mut i, "--threads")?,
+                    "--threads",
+                )?);
             }
             "--device" => {
-                i += 1;
-                device_pref = DevicePreference::parse(&args[i])?;
+                device_pref = DevicePreference::parse(next_value(args, &mut i, "--device")?)?;
+            }
+            "--early-stopping-patience" => {
+                cfg.early_stopping_patience = Some(parse_usize(
+                    next_value(args, &mut i, "--early-stopping-patience")?,
+                    "--early-stopping-patience",
+                )?);
+            }
+            "--warmup-steps" => {
+                cfg.warmup_steps = parse_usize(
+                    next_value(args, &mut i, "--warmup-steps")?,
+                    "--warmup-steps",
+                )?;
+            }
+            "--grad-clip-norm" => {
+                cfg.grad_clip_norm = Some(parse_f32(
+                    next_value(args, &mut i, "--grad-clip-norm")?,
+                    "--grad-clip-norm",
+                )?);
+            }
+            "--cache-blocks-max-mb" => {
+                cfg.cache_blocks_max_mb = Some(parse_usize(
+                    next_value(args, &mut i, "--cache-blocks-max-mb")?,
+                    "--cache-blocks-max-mb",
+                )?);
             }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -180,6 +212,26 @@ pub fn run(args: &[String]) -> Result<()> {
                 .into(),
         ));
     }
+    // Stage 22 (Training Loop Enhancements): --grad-clip-norm, if provided,
+    // must be a positive finite number (a zero or negative max-norm clip
+    // threshold is meaningless).
+    if let Some(g) = cfg.grad_clip_norm {
+        if g <= 0.0 || !g.is_finite() {
+            return Err(ClassifierError::Pipeline(
+                "--grad-clip-norm must be a positive finite number".into(),
+            ));
+        }
+    }
+    // Stage 27 (Block Caching, audit finding 5.2): --cache-blocks-max-mb, if
+    // provided, must be a nonzero budget (a 0 MB budget can never cache
+    // anything and is almost certainly a user mistake).
+    if let Some(mb) = cfg.cache_blocks_max_mb {
+        if mb == 0 {
+            return Err(ClassifierError::Pipeline(
+                "--cache-blocks-max-mb must be >= 1".into(),
+            ));
+        }
+    }
 
     // Load explicit val-tile-blocks override if provided.
     let val_tile_ids: Option<HashSet<u64>> = if let Some(ref p) = val_tile_blocks_path {
@@ -192,8 +244,12 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     // Load dataset — accepts one or more preprocessing directories.
+    // Stage 27 (Block Caching, audit finding 5.2): .with_block_cache(None)
+    // (the default, when --cache-blocks-max-mb is not passed) is a no-op —
+    // load_block() behaves exactly as it did before Stage 27.
     let dataset =
-        LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?;
+        LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?
+            .with_block_cache(cfg.cache_blocks_max_mb);
 
     cfg.val_tile_block_ids = val_tile_ids;
 
@@ -244,8 +300,29 @@ fn print_usage() {
            --swa                        Apply Stochastic Weight Averaging (default: off)\n\
            --metrics-out       <path>   Per-epoch metrics CSV\n\
            --threads           <usize>  Rayon thread pool size\n\
-           --device            <auto|cpu|gpu>  Compute device (default: auto)"
+           --device            <auto|cpu|gpu>  Compute device (default: auto)\n\
+           --early-stopping-patience <usize>  Stop after N epochs with no val_mIoU\n\
+                                        improvement (default: disabled)\n\
+           --warmup-steps      <usize>  Linear LR warmup steps before cosine\n\
+                                        annealing begins (default: 0, disabled)\n\
+           --grad-clip-norm    <f32>    Per-tensor L2-norm gradient clip threshold\n\
+                                        (default: disabled)\n\
+           --cache-blocks-max-mb <usize>  Enable in-memory block caching bounded to\n\
+                                        this many megabytes (default: disabled)"
     );
+}
+
+/// If the flag at `args[*i]` requires a value, bounds-check and consume the
+/// next token.  Returns a clear `ClassifierError::Pipeline` instead of
+/// panicking (via unchecked indexing) if the flag is the last argument.
+///
+/// Stage 20 (Security Hardening) — mirrors the pattern already used in
+/// `preprocess_cmd.rs`.
+fn next_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
+    *i += 1;
+    args.get(*i)
+        .map(String::as_str)
+        .ok_or_else(|| ClassifierError::Pipeline(format!("flag '{flag}' requires a value")))
 }
 
 fn parse_f64(s: &str, flag: &str) -> Result<f64> {
@@ -263,4 +340,27 @@ fn parse_usize(s: &str, flag: &str) -> Result<usize> {
 fn parse_u64(s: &str, flag: &str) -> Result<u64> {
     s.parse()
         .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid u64 '{s}'")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stage 20 (Security Hardening) — a flag with no trailing value must
+    // return a clear error instead of panicking via unchecked indexing.
+    #[test]
+    fn test_trailing_flag_without_value_errors_not_panics() {
+        let args: Vec<String> = vec!["--data-dir".to_string()];
+        let mut i = 0usize;
+        let result = next_value(&args, &mut i, "--data-dir");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_with_trailing_flag_returns_error() {
+        // The full run() path with a dangling flag must error, not panic.
+        let args: Vec<String> = vec!["--epochs".to_string()];
+        let result = run(&args);
+        assert!(result.is_err());
+    }
 }

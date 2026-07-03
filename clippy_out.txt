@@ -1,0 +1,113 @@
+warning: use of deprecated trait `wide::CmpNe`: use inherit function instead
+warning: unused import: `CmpNe`
+warning: `wbraster` (lib) generated 2 warnings
+warning: binding's name is too similar to existing binding
+warning: strict comparison of `f32` or `f64`
+warning: strict comparison of `f32` or `f64`
+warning: strict comparison of `f32` or `f64`
+warning: strict comparison of `f32` or `f64`
+warning: strict comparison of `f32` or `f64`
+warning: strict comparison of `f32` or `f64`
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: this argument is passed by value, but not consumed in the function body
+warning: this argument is passed by value, but not consumed in the function body
+warning: casting `usize` to `u8` may truncate the value
+warning: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+warning: casting `i32` to `f32` may cause a loss of precision (`i32` is 32 bits wide, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `i32` to `f32` may cause a loss of precision (`i32` is 32 bits wide, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `i32` to `f32` may cause a loss of precision (`i32` is 32 bits wide, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `i32` to `f32` may cause a loss of precision (`i32` is 32 bits wide, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: useless conversion to the same type: `std::io::Error`
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: useless conversion to the same type: `std::io::Error`
+warning: useless conversion to the same type: `std::io::Error`
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: casting `usize` to `f64` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f64`'s mantissa is only 52 bits wide)
+warning: casting `usize` to `f64` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f64`'s mantissa is only 52 bits wide)
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: strict comparison of `f32` or `f64` arrays
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casting `i32` to `u16` may lose the sign of the value
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: it is more concise to loop over references to containers instead of using explicit iteration methods
+warning: items after a test module
+warning: strict comparison of `f32` or `f64`
+warning: adding items after statements is confusing, since items exist from the start of the scope
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: strict comparison of `f32` or `f64`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: casting `i32` to `u16` may truncate the value
+warning: casting `i32` to `u16` may lose the sign of the value
+warning: casting `i32` to `u8` may lose the sign of the value
+warning: casting `i32` to `i16` may truncate the value
+warning: field assignment outside of initializer for an instance created with Default::default()
+warning: casts from `i32` to `f64` can be expressed infallibly using `From`
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: manual implementation of `midpoint` which can overflow
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `i32` to `f32` may cause a loss of precision (`i32` is 32 bits wide, but `f32`'s mantissa is only 23 bits wide)
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: casting `u64` to `u32` may truncate the value
+warning: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+warning: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+warning: casting `f64` to `f32` may truncate the value
+warning: casting `f64` to `usize` may truncate the value
+warning: casting `f64` to `usize` may lose the sign of the value
+warning: manual implementation of `midpoint` which can overflow
+warning: manual implementation of `midpoint` which can overflow
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: casting `usize` to `f32` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f32`'s mantissa is only 23 bits wide)
+warning: item in documentation is missing backticks
+warning: item in documentation is missing backticks
+warning: calling `NdArrayDevice::default()` is more clear than this expression
+warning: used `cloned` where `copied` could be used instead
+warning: `lidar_point_cloud_classifier` (lib test) generated 109 warnings (run `cargo clippy --fix --lib -p lidar_point_cloud_classifier --tests -- ` to apply 52 suggestions)

@@ -1,22 +1,5 @@
-//! Training loop — gradient accumulation over spatial blocks, AdamW optimizer,
+//! Training loop — gradient accumulation over spatial blocks, `AdamW` optimizer,
 //! cosine annealing LR, checkpoint management, and optional SWA.
-
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::doc_markdown,
-    clippy::struct_excessive_bools,
-    clippy::too_many_lines,
-    clippy::trivially_copy_pass_by_ref,
-    clippy::redundant_clone,
-    clippy::unnecessary_wraps,
-    clippy::too_many_arguments,
-    clippy::similar_names,
-    clippy::must_use_candidate
-)]
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -33,9 +16,12 @@ use burn::{
 };
 use rand::prelude::*;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ClassifierError, Result};
+use crate::model::layers::{BatchNorm1d, WeightAveraging};
+
 use crate::model::pointnet::PointNetConfig;
 use crate::model::weights::load_model;
 use crate::training::{
@@ -51,6 +37,15 @@ use crate::training::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Training hyper-parameters.
+// Stage 24 (Code Quality Cleanup, item 4.1): this public config struct
+// naturally accumulates several independent `bool` toggles
+// (`use_feature_tnet`, `use_batch_norm`, `use_class_weights`, `swa`) that
+// each control an orthogonal training behavior. Converting to a bitflags
+// or newtype-per-flag encoding would be a breaking API change rippling
+// through the CLI, tests, and every call site that constructs a
+// `TrainConfig` by name — named bool fields remain more readable here than
+// the suggested alternative for a config struct with this shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct TrainConfig {
     pub n_classes: usize,
@@ -58,7 +53,7 @@ pub struct TrainConfig {
     /// Effective batch: number of blocks contributing to one optimizer step.
     pub batch_size: usize,
     /// Number of blocks stacked into a single batched forward pass — the
-    /// *effective BatchNorm batch size* (Stage 18).  When `forward_batch_size <
+    /// *effective `BatchNorm` batch size* (Stage 18).  When `forward_batch_size <
     /// batch_size`, the chunk is split into micro-batches of `forward_batch_size`
     /// blocks and their gradients are accumulated (averaged) into one step.
     pub forward_batch_size: usize,
@@ -76,7 +71,7 @@ pub struct TrainConfig {
     /// - `0.0`  → uniform weights (all classes weighted equally).
     /// - `→1.0` → approaches pure inverse-frequency weighting.
     /// - `0.999` (default) → strong minority-class emphasis suitable for severely
-    ///   imbalanced LiDAR datasets without the extreme weight ratios of pure
+    ///   imbalanced `LiDAR` datasets without the extreme weight ratios of pure
     ///   inverse-frequency.
     ///
     /// Only used when `use_class_weights = true`.
@@ -88,6 +83,25 @@ pub struct TrainConfig {
     pub metrics_out: PathBuf,
     pub output_model: PathBuf,
     pub n_threads: Option<usize>,
+    /// Stage 22 (Training Loop Enhancements): number of consecutive epochs
+    /// without a new best `val_mIoU` after which training stops early.
+    /// `None` (default) disables early stopping entirely.
+    pub early_stopping_patience: Option<usize>,
+    /// Stage 22 (Training Loop Enhancements): number of initial global steps
+    /// over which the LR ramps linearly from `0` to `learning_rate` before
+    /// cosine annealing begins. `0` (default) disables warmup.
+    pub warmup_steps: usize,
+    /// Stage 22 (Training Loop Enhancements): optional per-parameter-tensor
+    /// L2-norm gradient clip threshold, applied by burn's built-in
+    /// `GradientClippingConfig::Norm` inside the `AdamW` optimizer step.
+    /// `None` (default) disables gradient clipping.
+    pub grad_clip_norm: Option<f32>,
+    /// Stage 27 (Block Caching, audit finding 5.2): optional in-memory block
+    /// cache budget in megabytes, applied via
+    /// `LabeledBlockDataset::with_block_cache`. `None` (default) disables
+    /// caching entirely — every `load_block()` call reads from disk, exactly
+    /// matching pre-Stage-27 behavior.
+    pub cache_blocks_max_mb: Option<usize>,
 }
 
 impl Default for TrainConfig {
@@ -113,6 +127,10 @@ impl Default for TrainConfig {
             metrics_out: PathBuf::from("metrics.csv"),
             output_model: PathBuf::from("model.wbmodel"),
             n_threads: None,
+            early_stopping_patience: None,
+            warmup_steps: 0,
+            grad_clip_norm: None,
+            cache_blocks_max_mb: None,
         }
     }
 }
@@ -182,6 +200,20 @@ impl CheckpointManifest {
 ///
 /// # Errors
 /// Propagates any I/O or processing error.
+// Stage 24 (Code Quality Cleanup, item 4.1): this is the main training-loop
+// entry point coordinating model construction, the optimizer, LR scheduler,
+// per-epoch/per-chunk/per-micro-batch nested loops, checkpointing, early
+// stopping, and final model selection — splitting it into smaller functions
+// would fragment tightly-coupled local state (`model`, `optim`, `scheduler`,
+// `global_step`, `best_miou`, …) across many call boundaries for no
+// behavioral benefit. Numeric casts below (`usize`/`u64` → `u8`/`f32`/`f64`)
+// are all either bounded-range class/index conversions or progress/loss
+// reporting values where the precision loss is expected and harmless.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 pub fn train<B: AutodiffBackend>(
     dataset: &LabeledBlockDataset,
     config: &TrainConfig,
@@ -214,8 +246,15 @@ where
     let mut model: BurnPointNet<B> = BurnPointNet::new(&net_cfg, device)?;
 
     // ── Optimizer ─────────────────────────────────────────────────────────
+    // Stage 22 (Training Loop Enhancements, item 1.7): optional per-tensor
+    // L2-norm gradient clipping via burn's built-in `GradientClippingConfig`.
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay)
+        .with_grad_clipping(
+            config
+                .grad_clip_norm
+                .map(burn::grad_clipping::GradientClippingConfig::Norm),
+        )
         .init::<B, BurnPointNet<B>>();
 
     // ── Class weights ─────────────────────────────────────────────────────
@@ -243,7 +282,8 @@ where
     // ── LR scheduler ─────────────────────────────────────────────────────
     let n_train = dataset.train_ids.len();
     let total_steps = config.epochs * n_train.div_ceil(config.batch_size);
-    let scheduler = CosineScheduler::new(config.learning_rate, 1e-6, total_steps);
+    let scheduler =
+        CosineScheduler::with_warmup(config.learning_rate, 1e-6, total_steps, config.warmup_steps);
 
     // ── Checkpoint dir ────────────────────────────────────────────────────
     let ckpt_dir: Option<PathBuf> = config.checkpoint_dir.clone().inspect(|d| {
@@ -256,6 +296,13 @@ where
     let mut global_step = 0usize;
     let mut best_miou = 0.0f64;
     let mut best_ckpt_path: Option<PathBuf> = None;
+
+    // Stage 22 (Training Loop Enhancements, item 1.5): early-stopping state,
+    // tracked independently of the checkpoint-cadence-gated `best_miou` above
+    // so early stopping behaves identically regardless of
+    // `--checkpoint-every`.
+    let mut es_best_miou = 0.0f64;
+    let mut es_epochs_without_improvement = 0usize;
 
     // ── Training epochs ───────────────────────────────────────────────────
     for epoch in 0..config.epochs {
@@ -292,14 +339,25 @@ where
                 let mut nfeat_ref = 0usize;
                 let mut count = 0usize;
 
-                for &block_id in micro {
-                    let block = match dataset.load_block(block_id) {
-                        Ok(b) => b,
+                // Stage 22 (Training Loop Enhancements, item 1.3): load all
+                // blocks in this micro-batch concurrently via Rayon — each
+                // `LabeledBlockDataset::load_block` call is a pure, read-only,
+                // `&self`-only disk read + byte→f32 conversion, safe to run in
+                // parallel across blocks (same justification as Stage 21 item
+                // 2.3). Batch assembly below (dims validation, `batch_flat`/
+                // `batch_labels` mutation) stays single-threaded.
+                let loaded: Vec<Option<_>> = micro
+                    .par_iter()
+                    .map(|&block_id| match dataset.load_block(block_id) {
+                        Ok(b) => Some(b),
                         Err(e) => {
                             eprintln!("[trainer] skip block {block_id}: {e}");
-                            continue;
+                            None
                         }
-                    };
+                    })
+                    .collect();
+
+                for block in loaded.into_iter().flatten() {
                     let n = block.features.nrows();
                     let nf = block.features.ncols();
                     if count == 0 {
@@ -307,7 +365,8 @@ where
                         nfeat_ref = nf;
                     } else if n != n_ref || nf != nfeat_ref {
                         eprintln!(
-                            "[trainer] skip block {block_id}: dims {n}x{nf} != batch {n_ref}x{nfeat_ref}"
+                            "[trainer] skip block {}: dims {n}x{nf} != batch {n_ref}x{nfeat_ref}",
+                            block.block_id
                         );
                         continue;
                     }
@@ -422,6 +481,28 @@ where
                 best_miou = val_metrics.miou;
             }
         }
+
+        // ── Early stopping (Stage 22, item 1.5) ──────────────────────────
+        // Tracked independently of the checkpoint-cadence-gated `best_miou`
+        // above, so early stopping triggers identically regardless of
+        // `--checkpoint-every`. A no-op when `early_stopping_patience` is
+        // `None` (the default), preserving pre-Stage-22 behavior exactly.
+        let should_stop = early_stopping_step(
+            val_metrics.miou,
+            &mut es_best_miou,
+            &mut es_epochs_without_improvement,
+            config.early_stopping_patience,
+        );
+        if should_stop {
+            eprintln!(
+                "[trainer] early stopping at epoch {}/{} — no improvement in val_mIoU for {} epochs (best={:.4})",
+                epoch + 1,
+                config.epochs,
+                es_epochs_without_improvement,
+                es_best_miou
+            );
+            break;
+        }
     }
 
     // ── Final model selection (best val_mIoU) ─────────────────────────────
@@ -469,6 +550,19 @@ where
 // Validation pass
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Stage 24 (Code Quality Cleanup, item 4.1): this validation entry point
+// naturally needs one parameter per piece of epoch/model/dataset state it
+// reports on; grouping them into a struct would only move the same fields
+// one level of indirection away without reducing coupling. The function
+// never actually returns `Err` today (`Result` is kept for API consistency
+// with every other pipeline-stage function here, and to allow a future
+// validation-time error path — e.g. a corrupt block — to be added without
+// changing the call signature at every call site).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::unnecessary_wraps,
+    clippy::cast_possible_truncation
+)]
 fn validate_epoch<B: AutodiffBackend>(
     model: &BurnPointNet<B>,
     dataset: &LabeledBlockDataset,
@@ -567,8 +661,10 @@ where
         if let Some(diag_flat) = flat_for_diag {
             let train_feat = features_to_tensor::<B>(diag_flat, n, n_features_block, device);
             let train_logits = model.forward(train_feat); // train-mode (batch-stat) BN
-            let train_flat: Vec<f32> = train_logits.into_data().to_vec::<f32>().unwrap_or_default();
-            let loss_batch_stat = cross_entropy_from_logits(&train_flat, &block.labels, n, nc);
+            let diag_logits_flat: Vec<f32> =
+                train_logits.into_data().to_vec::<f32>().unwrap_or_default();
+            let loss_batch_stat =
+                cross_entropy_from_logits(&diag_logits_flat, &block.labels, n, nc);
             eprintln!(
                 "[bn_diag] block {block_id}: val_loss running-stat={loss_unweighted:.4}  batch-stat={loss_batch_stat:.4}  delta={:.4}",
                 loss_unweighted - loss_batch_stat
@@ -580,7 +676,7 @@ where
     Ok(acc.compute(epoch, train_loss))
 }
 
-/// Log the min/mean/max of each main encoder/decoder BatchNorm layer's running
+/// Log the min/mean/max of each main encoder/decoder `BatchNorm` layer's running
 /// mean and variance.  Opt-in Stage 18 diagnostic (`WB_BN_DIAG=1`); called at
 /// most once per validation pass and emits five stderr lines.
 fn log_bn_running_stats<B: AutodiffBackend>(model: &BurnPointNet<B>) {
@@ -601,6 +697,7 @@ fn log_bn_running_stats<B: AutodiffBackend>(model: &BurnPointNet<B>) {
 }
 
 /// Return `(min, mean, max)` of a 1-D burn tensor.  Diagnostic helper only.
+#[allow(clippy::cast_precision_loss)]
 fn tensor_stats<B: Backend>(t: &Tensor<B, 1>) -> (f32, f32, f32) {
     let v: Vec<f32> = t.clone().into_data().to_vec::<f32>().unwrap_or_default();
     if v.is_empty() {
@@ -613,6 +710,7 @@ fn tensor_stats<B: Backend>(t: &Tensor<B, 1>) -> (f32, f32, f32) {
 }
 
 /// Compute mean cross-entropy loss from raw logits and labels (no burn required).
+#[allow(clippy::cast_precision_loss)]
 fn cross_entropy_from_logits(logits: &[f32], labels: &[u8], n: usize, nc: usize) -> f64 {
     let mut loss = 0.0f64;
     for i in 0..n {
@@ -672,7 +770,44 @@ fn cross_entropy_from_logits_weighted(
 // SWA
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Accumulate an optional `BatchNorm1d` pair via the `WeightAveraging` trait.
+/// A no-op when either side is `None` (models without T-Nets/that layer).
+fn accum_bn_opt(base_bn: &mut Option<BatchNorm1d>, other_bn: Option<&BatchNorm1d>) {
+    if let (Some(bb), Some(mb)) = (base_bn, other_bn) {
+        bb.accumulate(mb);
+    }
+}
+
+/// Finalize (divide by `n`) an optional `BatchNorm1d` via `WeightAveraging`.
+/// A no-op when `bn` is `None`.
+fn finalize_bn_opt(bn: &mut Option<BatchNorm1d>, n: f32) {
+    if let Some(bb) = bn {
+        bb.finalize(n);
+    }
+}
+
 /// Average the weights of all retained checkpoints and save to `output_path`.
+///
+/// Stage 22 (Training Loop Enhancements, item 2.5): checkpoints are streamed
+/// one at a time — only the running sum (`base`) and the currently-processed
+/// checkpoint (`m`) are resident in memory at any point, bounding memory to
+/// O(2 models) regardless of `keep_best_n`, instead of loading every retained
+/// checkpoint simultaneously. This reorders the code structure (a
+/// per-checkpoint outer loop instead of a per-layer outer loop) but NOT the
+/// underlying floating-point addition order: both the old and new code
+/// accumulate against `base` as the running sum in checkpoint-list order —
+/// i.e. `((base + m1) + m2) + ... + mN` either way — so the averaged output
+/// weights are numerically identical to the pre-refactor implementation.
+// Stage 24 (Code Quality Cleanup, item 4.1/4.3): this function's length
+// comes from explicitly walking every layer of the model (both T-Nets,
+// encoder, decoder, class projection) twice — once to accumulate, once to
+// finalize — which is the most transparent way to express "average every
+// parameter tensor"; the per-layer `accumulate`/`finalize` calls below
+// (via the `WeightAveraging` trait, replacing the previous macro-based
+// implementation) keep each individual step trivial even though the total
+// function remains long. `n_checkpoints as f32` is a small, bounded
+// checkpoint count, so the precision loss is inconsequential.
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn apply_swa(ckpt_dir: &Path, manifest: &CheckpointManifest, output_path: &Path) -> Result<()> {
     if manifest.checkpoints.is_empty() {
         return Err(ClassifierError::Pipeline(
@@ -680,147 +815,137 @@ fn apply_swa(ckpt_dir: &Path, manifest: &CheckpointManifest, output_path: &Path)
         ));
     }
 
-    eprintln!("[swa] averaging {} checkpoints", manifest.checkpoints.len());
+    let n_checkpoints = manifest.checkpoints.len();
+    eprintln!("[swa] averaging {n_checkpoints} checkpoints (streamed)");
 
-    // Load all models.
-    let models: Vec<_> = manifest
-        .checkpoints
-        .iter()
-        .map(|e| {
-            let p = ckpt_dir.join(&e.file);
-            load_model(&p)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let n = n_checkpoints as f32;
+    let first_path = ckpt_dir.join(&manifest.checkpoints[0].file);
+    let mut base = load_model(&first_path)?;
 
-    let n = models.len() as f32;
-    let mut base = models[0].clone();
-    let other_models = &models[1..];
-
-    // ── Helper: accumulate one Linear layer's weight+bias into `base_lin` ──
-    // Defined as a macro so it can be reused without fighting the borrow checker.
-    macro_rules! accum_linear {
-        ($base_lin:expr, $other_lin:expr) => {
-            $base_lin.weight = (&$base_lin.weight + &$other_lin.weight).to_owned();
-            $base_lin.bias = (&$base_lin.bias + &$other_lin.bias).to_owned();
-        };
-    }
-    macro_rules! divide_linear {
-        ($lin:expr) => {
-            $lin.weight /= n;
-            $lin.bias /= n;
-        };
-    }
-    macro_rules! accum_bn {
-        ($base_bn:expr, $other_bn:expr) => {
-            if let (Some(ref mut bb), Some(ref mb)) = ($base_bn, $other_bn) {
-                bb.gamma = (&bb.gamma + &mb.gamma).to_owned();
-                bb.beta = (&bb.beta + &mb.beta).to_owned();
-                bb.mean = (&bb.mean + &mb.mean).to_owned();
-                bb.var = (&bb.var + &mb.var).to_owned();
-            }
-        };
-    }
-    macro_rules! divide_bn {
-        ($bn:expr) => {
-            if let Some(ref mut bb) = $bn {
-                bb.gamma /= n;
-                bb.beta /= n;
-                bb.mean /= n;
-                bb.var /= n;
-            }
-        };
-    }
-
-    // ── Average all parameters using ndarray arithmetic ────────────────────
-    // Encoder layers
-    for i in 0..base.encoder_layers.len() {
-        for m in other_models {
-            accum_linear!(base.encoder_layers[i].0, m.encoder_layers[i].0);
-            accum_bn!(&mut base.encoder_layers[i].1, &m.encoder_layers[i].1);
-        }
-        divide_linear!(base.encoder_layers[i].0);
-        divide_bn!(base.encoder_layers[i].1);
-    }
-    // Decoder layers
-    for i in 0..base.decoder_layers.len() {
-        for m in other_models {
-            accum_linear!(base.decoder_layers[i].0, m.decoder_layers[i].0);
-            accum_bn!(&mut base.decoder_layers[i].1, &m.decoder_layers[i].1);
-        }
-        divide_linear!(base.decoder_layers[i].0);
-        divide_bn!(base.decoder_layers[i].1);
-    }
-    // Class projection (no BN)
-    for m in other_models {
-        accum_linear!(base.class_proj, m.class_proj);
-    }
-    divide_linear!(base.class_proj);
-
-    // ── T-Net layers ───────────────────────────────────────────────────────
+    // ── Stream-accumulate remaining checkpoints into `base` ────────────────
     // The T-Net (STN3d / STN64d) is trained jointly with all other layers
     // under the same gradient signal.  Excluding it from SWA would produce a
     // composite model where the averaged backbone expects the canonical
     // representation produced by the averaged T-Net, but receives instead the
-    // representation from a single checkpoint's T-Net — a mismatch.
-    //
-    // Both `input_tnet` and `feature_tnet` are `Option<TNet>`; the averaging
-    // block is gated so models without T-Nets are handled correctly.
-    for m in other_models {
-        if let (Some(ref mut bt), Some(ref mt)) = (&mut base.input_tnet, &m.input_tnet) {
-            accum_linear!(bt.enc0, mt.enc0);
-            accum_linear!(bt.enc1, mt.enc1);
-            accum_linear!(bt.enc2, mt.enc2);
-            accum_bn!(&mut bt.bn_enc0, &mt.bn_enc0);
-            accum_bn!(&mut bt.bn_enc1, &mt.bn_enc1);
-            accum_bn!(&mut bt.bn_enc2, &mt.bn_enc2);
-            accum_linear!(bt.fc0, mt.fc0);
-            accum_linear!(bt.fc1, mt.fc1);
-            accum_linear!(bt.fc2, mt.fc2);
-            accum_bn!(&mut bt.bn_fc0, &mt.bn_fc0);
-            accum_bn!(&mut bt.bn_fc1, &mt.bn_fc1);
+    // representation from a single checkpoint's T-Net — a mismatch. Both
+    // `input_tnet` and `feature_tnet` are `Option<TNet>`; the averaging block
+    // is gated so models without T-Nets are handled correctly.
+    for entry in &manifest.checkpoints[1..] {
+        let p = ckpt_dir.join(&entry.file);
+        let m = load_model(&p)?;
+
+        for i in 0..base.encoder_layers.len() {
+            base.encoder_layers[i].0.accumulate(&m.encoder_layers[i].0);
+            accum_bn_opt(
+                &mut base.encoder_layers[i].1,
+                m.encoder_layers[i].1.as_ref(),
+            );
         }
-        if let (Some(ref mut bt), Some(ref mt)) = (&mut base.feature_tnet, &m.feature_tnet) {
-            accum_linear!(bt.enc0, mt.enc0);
-            accum_linear!(bt.enc1, mt.enc1);
-            accum_linear!(bt.enc2, mt.enc2);
-            accum_bn!(&mut bt.bn_enc0, &mt.bn_enc0);
-            accum_bn!(&mut bt.bn_enc1, &mt.bn_enc1);
-            accum_bn!(&mut bt.bn_enc2, &mt.bn_enc2);
-            accum_linear!(bt.fc0, mt.fc0);
-            accum_linear!(bt.fc1, mt.fc1);
-            accum_linear!(bt.fc2, mt.fc2);
-            accum_bn!(&mut bt.bn_fc0, &mt.bn_fc0);
-            accum_bn!(&mut bt.bn_fc1, &mt.bn_fc1);
+        for i in 0..base.decoder_layers.len() {
+            base.decoder_layers[i].0.accumulate(&m.decoder_layers[i].0);
+            accum_bn_opt(
+                &mut base.decoder_layers[i].1,
+                m.decoder_layers[i].1.as_ref(),
+            );
         }
+        base.class_proj.accumulate(&m.class_proj);
+
+        if let (Some(bt), Some(mt)) = (&mut base.input_tnet, &m.input_tnet) {
+            bt.enc0.accumulate(&mt.enc0);
+            bt.enc1.accumulate(&mt.enc1);
+            bt.enc2.accumulate(&mt.enc2);
+            accum_bn_opt(&mut bt.bn_enc0, mt.bn_enc0.as_ref());
+            accum_bn_opt(&mut bt.bn_enc1, mt.bn_enc1.as_ref());
+            accum_bn_opt(&mut bt.bn_enc2, mt.bn_enc2.as_ref());
+            bt.fc0.accumulate(&mt.fc0);
+            bt.fc1.accumulate(&mt.fc1);
+            bt.fc2.accumulate(&mt.fc2);
+            accum_bn_opt(&mut bt.bn_fc0, mt.bn_fc0.as_ref());
+            accum_bn_opt(&mut bt.bn_fc1, mt.bn_fc1.as_ref());
+        }
+        if let (Some(bt), Some(mt)) = (&mut base.feature_tnet, &m.feature_tnet) {
+            bt.enc0.accumulate(&mt.enc0);
+            bt.enc1.accumulate(&mt.enc1);
+            bt.enc2.accumulate(&mt.enc2);
+            accum_bn_opt(&mut bt.bn_enc0, mt.bn_enc0.as_ref());
+            accum_bn_opt(&mut bt.bn_enc1, mt.bn_enc1.as_ref());
+            accum_bn_opt(&mut bt.bn_enc2, mt.bn_enc2.as_ref());
+            bt.fc0.accumulate(&mt.fc0);
+            bt.fc1.accumulate(&mt.fc1);
+            bt.fc2.accumulate(&mt.fc2);
+            accum_bn_opt(&mut bt.bn_fc0, mt.bn_fc0.as_ref());
+            accum_bn_opt(&mut bt.bn_fc1, mt.bn_fc1.as_ref());
+        }
+        // `m` drops here, at the end of this loop iteration — memory
+        // footprint stays bounded to `base` plus at most one other model.
     }
-    if let Some(ref mut bt) = base.input_tnet {
-        divide_linear!(bt.enc0);
-        divide_linear!(bt.enc1);
-        divide_linear!(bt.enc2);
-        divide_bn!(bt.bn_enc0);
-        divide_bn!(bt.bn_enc1);
-        divide_bn!(bt.bn_enc2);
-        divide_linear!(bt.fc0);
-        divide_linear!(bt.fc1);
-        divide_linear!(bt.fc2);
-        divide_bn!(bt.bn_fc0);
-        divide_bn!(bt.bn_fc1);
+
+    // ── Divide every accumulated field by `n` ──────────────────────────────
+    for i in 0..base.encoder_layers.len() {
+        base.encoder_layers[i].0.finalize(n);
+        finalize_bn_opt(&mut base.encoder_layers[i].1, n);
     }
-    if let Some(ref mut bt) = base.feature_tnet {
-        divide_linear!(bt.enc0);
-        divide_linear!(bt.enc1);
-        divide_linear!(bt.enc2);
-        divide_bn!(bt.bn_enc0);
-        divide_bn!(bt.bn_enc1);
-        divide_bn!(bt.bn_enc2);
-        divide_linear!(bt.fc0);
-        divide_linear!(bt.fc1);
-        divide_linear!(bt.fc2);
-        divide_bn!(bt.bn_fc0);
-        divide_bn!(bt.bn_fc1);
+    for i in 0..base.decoder_layers.len() {
+        base.decoder_layers[i].0.finalize(n);
+        finalize_bn_opt(&mut base.decoder_layers[i].1, n);
+    }
+    base.class_proj.finalize(n);
+    if let Some(bt) = &mut base.input_tnet {
+        bt.enc0.finalize(n);
+        bt.enc1.finalize(n);
+        bt.enc2.finalize(n);
+        finalize_bn_opt(&mut bt.bn_enc0, n);
+        finalize_bn_opt(&mut bt.bn_enc1, n);
+        finalize_bn_opt(&mut bt.bn_enc2, n);
+        bt.fc0.finalize(n);
+        bt.fc1.finalize(n);
+        bt.fc2.finalize(n);
+        finalize_bn_opt(&mut bt.bn_fc0, n);
+        finalize_bn_opt(&mut bt.bn_fc1, n);
+    }
+    if let Some(bt) = &mut base.feature_tnet {
+        bt.enc0.finalize(n);
+        bt.enc1.finalize(n);
+        bt.enc2.finalize(n);
+        finalize_bn_opt(&mut bt.bn_enc0, n);
+        finalize_bn_opt(&mut bt.bn_enc1, n);
+        finalize_bn_opt(&mut bt.bn_enc2, n);
+        bt.fc0.finalize(n);
+        bt.fc1.finalize(n);
+        bt.fc2.finalize(n);
+        finalize_bn_opt(&mut bt.bn_fc0, n);
+        finalize_bn_opt(&mut bt.bn_fc1, n);
     }
 
     crate::model::weights::save_model(output_path, &base)
+}
+
+/// Stage 22 (Training Loop Enhancements, item 1.5): update early-stopping
+/// state given the current epoch's `val_mIoU`, and report whether training
+/// should stop.
+///
+/// `es_best_miou`/`es_epochs_without_improvement` are tracked independently
+/// of the checkpoint-cadence-gated `best_miou` in `train()`, so early
+/// stopping behaves identically regardless of `--checkpoint-every`.
+///
+/// Returns `true` iff `patience` is `Some(p)` and `p` consecutive epochs have
+/// passed without a new best `val_mIoU`. Always returns `false` when
+/// `patience` is `None` (early stopping disabled), which also means the
+/// counters are still updated but never checked — a harmless no-op that
+/// preserves pre-Stage-22 behavior exactly.
+fn early_stopping_step(
+    val_miou: f64,
+    es_best_miou: &mut f64,
+    es_epochs_without_improvement: &mut usize,
+    patience: Option<usize>,
+) -> bool {
+    if val_miou > *es_best_miou {
+        *es_best_miou = val_miou;
+        *es_epochs_without_improvement = 0;
+    } else {
+        *es_epochs_without_improvement += 1;
+    }
+    patience.is_some_and(|p| *es_epochs_without_improvement >= p)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -856,6 +981,8 @@ fn apply_swa(ckpt_dir: &Path, manifest: &CheckpointManifest, output_path: &Path)
 /// # Panics
 /// Never panics — all edge cases (zero counts, zero present classes) return safe
 /// default values.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub fn compute_class_weights(counts: &[u64], beta: f64) -> Vec<f32> {
     /// Minimum weight assigned to absent classes (count = 0).
     /// Must be > 0 to satisfy `burn`'s `CrossEntropyLoss` validation.
@@ -1116,6 +1243,66 @@ mod tests {
         for (i, &w) in weights.iter().enumerate() {
             assert!(w > 0.0, "weight[{i}] must be > 0, got {w}");
         }
+    }
+
+    /// Stage 22 (Training Loop Enhancements, item 1.5) — early stopping
+    /// counter/reset logic, tested in isolation from the full training loop.
+    #[test]
+    fn test_early_stopping_step_triggers_after_patience() {
+        let mut best = 0.0f64;
+        let mut no_improve = 0usize;
+
+        // Epoch 1: mIoU improves to 0.5 → resets counter, does not stop.
+        assert!(!early_stopping_step(
+            0.5,
+            &mut best,
+            &mut no_improve,
+            Some(2)
+        ));
+        assert_eq!(no_improve, 0);
+        assert!((best - 0.5).abs() < 1e-12);
+
+        // Epoch 2: mIoU stagnates at 0.4 (no improvement) → counter=1, no stop yet.
+        assert!(!early_stopping_step(
+            0.4,
+            &mut best,
+            &mut no_improve,
+            Some(2)
+        ));
+        assert_eq!(no_improve, 1);
+
+        // Epoch 3: mIoU stagnates again → counter=2 == patience → should stop.
+        assert!(early_stopping_step(
+            0.3,
+            &mut best,
+            &mut no_improve,
+            Some(2)
+        ));
+        assert_eq!(no_improve, 2);
+
+        // A new best mIoU resets the counter even after it had grown.
+        assert!(!early_stopping_step(
+            0.6,
+            &mut best,
+            &mut no_improve,
+            Some(2)
+        ));
+        assert_eq!(no_improve, 0);
+        assert!((best - 0.6).abs() < 1e-12);
+    }
+
+    /// `patience = None` must never trigger a stop, regardless of how many
+    /// epochs pass without improvement — this is the default, backward
+    /// compatible behavior.
+    #[test]
+    fn test_early_stopping_step_disabled_never_stops() {
+        let mut best = 0.0f64;
+        let mut no_improve = 0usize;
+        for _ in 0..10 {
+            assert!(!early_stopping_step(0.1, &mut best, &mut no_improve, None));
+        }
+        // Counter still increments internally (harmless), but no stop signal.
+        assert!(no_improve >= 9);
     }
 
     #[test]

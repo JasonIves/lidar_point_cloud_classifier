@@ -47,6 +47,42 @@ pub const N_FEATURES: usize = n_features_for_radii(1); // = 12
 /// are spilled to temporary raw-point files.
 pub const SPILL_HIGH_WATER_BYTES: usize = 512 * 1024 * 1024; // 512 MB
 
+/// Maximum allowed size (in bytes) of a single `.feat` file's f32 data
+/// payload (`n_points * n_features * 4`). Guards against attempting a
+/// multi-gigabyte allocation from a corrupted or maliciously-crafted
+/// header (Stage 20 — see `docs/stages/stage-20-security-hardening.md`).
+///
+/// 512 MB comfortably covers any realistic block: even 1M points ×
+/// 100 features × 4 bytes/f32 = ~400 MB.
+pub const MAX_FEAT_PAYLOAD_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path-traversal validation (Stage 20 — Security Hardening)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reject manifest-supplied file names that could escape the dataset
+/// directory via path traversal (`..`) or an embedded path separator.
+///
+/// Manifests are expected to carry bare file names (e.g. `block_00042.feat`)
+/// that are joined directly to a trusted base directory. A manifest that has
+/// been hand-edited or corrupted could otherwise smuggle in `../../etc/passwd`
+/// or an absolute path, causing arbitrary file reads.
+///
+/// Shared by `training::dataset` and `model::inference` so both load paths
+/// enforce the same rule from a single canonical implementation.
+///
+/// # Errors
+/// Returns an error if `name` contains `..`, `/`, or `\`.
+pub fn validate_block_filename(name: &str) -> crate::error::Result<()> {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err(crate::error::ClassifierError::Pipeline(format!(
+            "manifest file name '{name}' is not a valid bare file name \
+             (path separators and '..' are rejected — Stage 20 security hardening)"
+        )));
+    }
+    Ok(())
+}
+
 /// Compute the flat block ID from grid coordinates.
 ///
 /// This is the single canonical formula used by every pipeline stage that
@@ -177,5 +213,34 @@ impl PreprocessConfig {
         };
         radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         radii
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stage 20 (Security Hardening) -- validate_block_filename must reject
+    // path-traversal sequences and embedded path separators, and accept
+    // ordinary bare file names.
+    #[test]
+    fn test_validate_block_filename_rejects_parent_traversal() {
+        assert!(validate_block_filename("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_block_filename_rejects_forward_slash() {
+        assert!(validate_block_filename("a/b.feat").is_err());
+    }
+
+    #[test]
+    fn test_validate_block_filename_rejects_backslash() {
+        let name = "a".to_string() + "\\" + "b.feat";
+        assert!(validate_block_filename(&name).is_err());
+    }
+
+    #[test]
+    fn test_validate_block_filename_accepts_bare_name() {
+        assert!(validate_block_filename("block_00042.feat").is_ok());
     }
 }

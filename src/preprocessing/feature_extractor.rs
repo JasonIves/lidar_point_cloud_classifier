@@ -24,6 +24,7 @@
 //! fall back to `[0.0; 5]`.
 
 use nalgebra::{linalg::SymmetricEigen, Matrix3};
+use rayon::prelude::*;
 use wblidar::PointRecord;
 
 use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, DtmView};
@@ -71,9 +72,18 @@ pub fn extract_features(
     let n_radii = search_radii.len().max(1);
     let row_len = 7 + 5 * n_radii;
 
+    // Stage 21 (Performance): parallelize the per-point feature-extraction
+    // loop with Rayon. Each point's k-d tree radius query and eigenvalue
+    // decomposition are independent, read-only operations over shared
+    // `&BlockSpatialIndex` / `&[PointRecord]` data (no interior mutability),
+    // so this is a safe, embarrassingly-parallel workload per AGENTS.md's
+    // guidance. `into_par_iter().zip(pts.par_iter())` on these
+    // `IndexedParallelIterator`s guarantees the output Vec preserves the
+    // same one-row-per-input-point ordering as the original sequential
+    // implementation.
     scalar
-        .into_iter()
-        .zip(pts.iter())
+        .into_par_iter()
+        .zip(pts.par_iter())
         .map(|(s, pt)| {
             let center = [pt.x, pt.y, pt.z];
             let mut row = Vec::with_capacity(row_len);

@@ -38,52 +38,56 @@ pub fn run(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--input" => {
-                i += 1;
-                input = Some(PathBuf::from(&args[i]));
+                input = Some(PathBuf::from(next_value(args, &mut i, "--input")?));
             }
             "--output" => {
-                i += 1;
-                output = Some(PathBuf::from(&args[i]));
+                output = Some(PathBuf::from(next_value(args, &mut i, "--output")?));
             }
             "--block-size" => {
-                i += 1;
-                block_size = parse_f64(&args[i], "--block-size")?;
+                block_size = parse_f64(next_value(args, &mut i, "--block-size")?, "--block-size")?;
             }
             "--target-points" => {
-                i += 1;
-                target_points = parse_usize(&args[i], "--target-points")?;
+                target_points = parse_usize(
+                    next_value(args, &mut i, "--target-points")?,
+                    "--target-points",
+                )?;
             }
             "--min-density" => {
-                i += 1;
-                min_density = parse_f64(&args[i], "--min-density")?;
+                min_density =
+                    parse_f64(next_value(args, &mut i, "--min-density")?, "--min-density")?;
             }
             "--search-radius" => {
-                i += 1;
-                search_radius = parse_f64(&args[i], "--search-radius")?;
+                search_radius = parse_f64(
+                    next_value(args, &mut i, "--search-radius")?,
+                    "--search-radius",
+                )?;
             }
             "--search-radii" => {
-                i += 1;
-                search_radii = parse_radii(&args[i], "--search-radii")?;
+                search_radii = parse_radii(
+                    next_value(args, &mut i, "--search-radii")?,
+                    "--search-radii",
+                )?;
             }
             "--min-neighbors" => {
-                i += 1;
-                min_neighbors = parse_usize(&args[i], "--min-neighbors")?;
+                min_neighbors = parse_usize(
+                    next_value(args, &mut i, "--min-neighbors")?,
+                    "--min-neighbors",
+                )?;
             }
             "--hag-model" => {
-                i += 1;
-                hag_model = Some(PathBuf::from(&args[i]));
+                hag_model = Some(PathBuf::from(next_value(args, &mut i, "--hag-model")?));
             }
             "--label-map" => {
-                i += 1;
-                label_map_path = Some(PathBuf::from(&args[i]));
+                label_map_path = Some(PathBuf::from(next_value(args, &mut i, "--label-map")?));
             }
             "--tile-grid" => {
-                i += 1;
-                tile_grid = parse_usize(&args[i], "--tile-grid")?;
+                tile_grid = parse_usize(next_value(args, &mut i, "--tile-grid")?, "--tile-grid")?;
             }
             "--threads" => {
-                i += 1;
-                threads = Some(parse_usize(&args[i], "--threads")?);
+                threads = Some(parse_usize(
+                    next_value(args, &mut i, "--threads")?,
+                    "--threads",
+                )?);
             }
             "--debug-csv" => {
                 debug_csv = parse_optional_bool(args, &mut i, true);
@@ -92,19 +96,25 @@ pub fn run(args: &[String]) -> Result<()> {
                 outlier_removal = parse_optional_bool(args, &mut i, true);
             }
             "--outlier-radius" => {
-                i += 1;
-                outlier_radius = parse_f64(&args[i], "--outlier-radius")?;
+                outlier_radius = parse_f64(
+                    next_value(args, &mut i, "--outlier-radius")?,
+                    "--outlier-radius",
+                )?;
             }
             "--outlier-elev-diff" => {
-                i += 1;
-                outlier_elev_diff = parse_f64(&args[i], "--outlier-elev-diff")?;
+                outlier_elev_diff = parse_f64(
+                    next_value(args, &mut i, "--outlier-elev-diff")?,
+                    "--outlier-elev-diff",
+                )?;
             }
             "--outlier-use-median" => {
                 outlier_use_median = parse_optional_bool(args, &mut i, true);
             }
             "--block-overlap" => {
-                i += 1;
-                block_overlap = parse_f64(&args[i], "--block-overlap")?;
+                block_overlap = parse_f64(
+                    next_value(args, &mut i, "--block-overlap")?,
+                    "--block-overlap",
+                )?;
             }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -275,6 +285,19 @@ fn parse_optional_bool(args: &[String], i: &mut usize, default_val: bool) -> boo
     default_val
 }
 
+/// If the flag at `args[*i]` requires a value, bounds-check and consume the
+/// next token.  Returns a clear `ClassifierError::Pipeline` instead of
+/// panicking (via unchecked indexing) if the flag is the last argument.
+///
+/// Stage 20 (Security Hardening) — mirrors the pattern already used in
+/// `preprocess_cmd.rs`.
+fn next_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
+    *i += 1;
+    args.get(*i)
+        .map(String::as_str)
+        .ok_or_else(|| ClassifierError::Pipeline(format!("flag '{flag}' requires a value")))
+}
+
 fn parse_f64(s: &str, flag: &str) -> Result<f64> {
     s.parse()
         .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid f64 '{s}'")))
@@ -293,4 +316,27 @@ fn parse_radii(s: &str, flag: &str) -> Result<Vec<f64>> {
                 .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid radius '{v}'")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stage 20 (Security Hardening) — a flag with no trailing value must
+    // return a clear error instead of panicking via unchecked indexing.
+    #[test]
+    fn test_trailing_flag_without_value_errors_not_panics() {
+        let args: Vec<String> = vec!["--input".to_string()];
+        let mut i = 0usize;
+        let result = next_value(&args, &mut i, "--input");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_with_trailing_flag_returns_error() {
+        // The full run() path with a dangling flag must error, not panic.
+        let args: Vec<String> = vec!["--block-size".to_string()];
+        let result = run(&args);
+        assert!(result.is_err());
+    }
 }

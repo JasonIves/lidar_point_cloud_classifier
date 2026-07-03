@@ -80,64 +80,79 @@ pub fn save_model_from_burn<B: AutodiffBackend>(
 // TNet extraction — matches the flat-field layout of `model::layers::TNet`
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn extract_tnet3d<B: AutodiffBackend>(stn: &Stn3d<B>, use_bn: bool) -> Result<TNet> {
+// Stage 24 (Code Quality Cleanup, item 4.2): `Stn3d<B>` and `Stn64d<B>` share
+// identical field names (`enc0`/`enc1`/`enc2`/`bn_enc0..2`/`fc0..2`/`bn_fc0..1`);
+// the only differences between the former `extract_tnet3d`/`extract_tnet64d`
+// were the `k` constant (3 vs 64) and the struct type. This shared helper
+// takes each field by reference so both thin wrappers below can call it
+// without duplicating the 11-field extraction logic.
+#[allow(clippy::too_many_arguments)]
+fn extract_tnet_generic<B: AutodiffBackend>(
+    k: usize,
+    enc0: &burn::nn::Linear<B>,
+    bn_enc0: &burn::nn::BatchNorm<B, 1>,
+    enc1: &burn::nn::Linear<B>,
+    bn_enc1: &burn::nn::BatchNorm<B, 1>,
+    enc2: &burn::nn::Linear<B>,
+    bn_enc2: &burn::nn::BatchNorm<B, 1>,
+    fc0: &burn::nn::Linear<B>,
+    fc1: &burn::nn::Linear<B>,
+    fc2: &burn::nn::Linear<B>,
+    bn_fc0: &burn::nn::BatchNorm<B, 1>,
+    bn_fc1: &burn::nn::BatchNorm<B, 1>,
+    use_bn: bool,
+) -> Result<TNet> {
     let bn = |layer: &burn::nn::BatchNorm<B, 1>| extract_bn::<B>(layer);
     Ok(TNet {
-        k: 3,
-        enc0: extract_linear::<B>(&stn.enc0)?,
-        enc1: extract_linear::<B>(&stn.enc1)?,
-        enc2: extract_linear::<B>(&stn.enc2)?,
-        bn_enc0: if use_bn {
-            Some(bn(&stn.bn_enc0)?)
-        } else {
-            None
-        },
-        bn_enc1: if use_bn {
-            Some(bn(&stn.bn_enc1)?)
-        } else {
-            None
-        },
-        bn_enc2: if use_bn {
-            Some(bn(&stn.bn_enc2)?)
-        } else {
-            None
-        },
-        fc0: extract_linear::<B>(&stn.fc0)?,
-        fc1: extract_linear::<B>(&stn.fc1)?,
-        fc2: extract_linear::<B>(&stn.fc2)?,
-        bn_fc0: if use_bn { Some(bn(&stn.bn_fc0)?) } else { None },
-        bn_fc1: if use_bn { Some(bn(&stn.bn_fc1)?) } else { None },
+        k,
+        enc0: extract_linear::<B>(enc0)?,
+        enc1: extract_linear::<B>(enc1)?,
+        enc2: extract_linear::<B>(enc2)?,
+        bn_enc0: if use_bn { Some(bn(bn_enc0)?) } else { None },
+        bn_enc1: if use_bn { Some(bn(bn_enc1)?) } else { None },
+        bn_enc2: if use_bn { Some(bn(bn_enc2)?) } else { None },
+        fc0: extract_linear::<B>(fc0)?,
+        fc1: extract_linear::<B>(fc1)?,
+        fc2: extract_linear::<B>(fc2)?,
+        bn_fc0: if use_bn { Some(bn(bn_fc0)?) } else { None },
+        bn_fc1: if use_bn { Some(bn(bn_fc1)?) } else { None },
     })
 }
 
+fn extract_tnet3d<B: AutodiffBackend>(stn: &Stn3d<B>, use_bn: bool) -> Result<TNet> {
+    extract_tnet_generic::<B>(
+        3,
+        &stn.enc0,
+        &stn.bn_enc0,
+        &stn.enc1,
+        &stn.bn_enc1,
+        &stn.enc2,
+        &stn.bn_enc2,
+        &stn.fc0,
+        &stn.fc1,
+        &stn.fc2,
+        &stn.bn_fc0,
+        &stn.bn_fc1,
+        use_bn,
+    )
+}
+
 fn extract_tnet64d<B: AutodiffBackend>(stn: &Stn64d<B>, use_bn: bool) -> Result<TNet> {
-    let bn = |layer: &burn::nn::BatchNorm<B, 1>| extract_bn::<B>(layer);
-    Ok(TNet {
-        k: 64,
-        enc0: extract_linear::<B>(&stn.enc0)?,
-        enc1: extract_linear::<B>(&stn.enc1)?,
-        enc2: extract_linear::<B>(&stn.enc2)?,
-        bn_enc0: if use_bn {
-            Some(bn(&stn.bn_enc0)?)
-        } else {
-            None
-        },
-        bn_enc1: if use_bn {
-            Some(bn(&stn.bn_enc1)?)
-        } else {
-            None
-        },
-        bn_enc2: if use_bn {
-            Some(bn(&stn.bn_enc2)?)
-        } else {
-            None
-        },
-        fc0: extract_linear::<B>(&stn.fc0)?,
-        fc1: extract_linear::<B>(&stn.fc1)?,
-        fc2: extract_linear::<B>(&stn.fc2)?,
-        bn_fc0: if use_bn { Some(bn(&stn.bn_fc0)?) } else { None },
-        bn_fc1: if use_bn { Some(bn(&stn.bn_fc1)?) } else { None },
-    })
+    extract_tnet_generic::<B>(
+        64,
+        &stn.enc0,
+        &stn.bn_enc0,
+        &stn.enc1,
+        &stn.bn_enc1,
+        &stn.enc2,
+        &stn.bn_enc2,
+        &stn.fc0,
+        &stn.fc1,
+        &stn.fc2,
+        &stn.bn_fc0,
+        &stn.bn_fc1,
+        use_bn,
+    )
 }
 
 fn extract_pair<B: AutodiffBackend>(
@@ -160,13 +175,16 @@ fn extract_linear<B: AutodiffBackend>(layer: &burn::nn::Linear<B>) -> Result<Lin
     let [d_in, d_out] = w_burn.dims();
     // Layout contract: burn 0.16 stores Linear weights as [d_input, d_output].
     // We transpose to [d_output, d_input] to match Stage 02's convention.
-    // If this assertion fires after a burn version bump, verify the weight
-    // layout in the new version before adjusting the transpose direction.
-    assert!(
-        d_in > 0 && d_out > 0,
-        "burn Linear weight has unexpected zero dimension: [{d_in}, {d_out}] — \
-         verify burn weight layout convention has not changed"
-    );
+    // Stage 20 (Security Hardening): this was previously an assert!(), which
+    // would panic in production if a burn version bump ever changed the
+    // weight layout convention. A malformed/zero-dimension weight is now
+    // surfaced as a normal Result error instead of crashing the process.
+    if d_in == 0 || d_out == 0 {
+        return Err(ClassifierError::Pipeline(format!(
+            "burn Linear weight has unexpected zero dimension: [{d_in}, {d_out}] — \
+             verify burn weight layout convention has not changed"
+        )));
+    }
 
     let w_data: Vec<f32> = w_burn
         .transpose() // [d_out, d_in]

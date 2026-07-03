@@ -160,6 +160,49 @@ impl BatchNorm1d {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Weight averaging (SWA)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stage 24 (Code Quality Cleanup, item 4.3): shared "streaming weight
+/// average" behavior for the layer types accumulated during SWA
+/// (`training::trainer::apply_swa`). Each `accumulate` call adds `other`'s
+/// parameters into `self` in place; `finalize` divides every accumulated
+/// field by the total checkpoint count. Purely additive: no existing
+/// `forward`/`forward_1d`/`new` method changes at all.
+pub trait WeightAveraging {
+    /// Add `other`'s parameters into `self` element-wise, in place.
+    fn accumulate(&mut self, other: &Self);
+    /// Divide every accumulated parameter by `n` (the number of summed models).
+    fn finalize(&mut self, n: f32);
+}
+
+impl WeightAveraging for Linear {
+    fn accumulate(&mut self, other: &Self) {
+        self.weight = (&self.weight + &other.weight).to_owned();
+        self.bias = (&self.bias + &other.bias).to_owned();
+    }
+    fn finalize(&mut self, n: f32) {
+        self.weight /= n;
+        self.bias /= n;
+    }
+}
+
+impl WeightAveraging for BatchNorm1d {
+    fn accumulate(&mut self, other: &Self) {
+        self.gamma = (&self.gamma + &other.gamma).to_owned();
+        self.beta = (&self.beta + &other.beta).to_owned();
+        self.mean = (&self.mean + &other.mean).to_owned();
+        self.var = (&self.var + &other.var).to_owned();
+    }
+    fn finalize(&mut self, n: f32) {
+        self.gamma /= n;
+        self.beta /= n;
+        self.mean /= n;
+        self.var /= n;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Activations and pooling
 // ─────────────────────────────────────────────────────────────────────────────
 

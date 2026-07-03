@@ -22,8 +22,8 @@ use rayon::prelude::*;
 use crate::error::{ClassifierError, Result};
 use crate::model::pointnet::PointNetClassifier;
 use crate::preprocessing::{
-    BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION, N_EIGEN_FEATURES_PER_RADIUS,
-    N_SCALAR_FEATURES, RAYON_MIN_CHUNK,
+    validate_block_filename, BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION,
+    MAX_FEAT_PAYLOAD_BYTES, N_EIGEN_FEATURES_PER_RADIUS, N_SCALAR_FEATURES, RAYON_MIN_CHUNK,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +193,9 @@ fn process_block(
     feat_dir: &Path,
     block_size: f64,
 ) -> Result<BlockInferenceResult> {
+    // Stage 20 (Security Hardening): reject manifest file names that could
+    // escape `feat_dir` via path traversal before joining.
+    validate_block_filename(&meta.file)?;
     let feat_path = feat_dir.join(&meta.file);
 
     // ── Load .feat file ───────────────────────────────────────────────────
@@ -207,9 +210,34 @@ fn process_block(
     let header = read_feat_header(&mut r, &feat_path.to_string_lossy())?;
     let n = header.n_points;
 
-    // Read f32 data payload: n_points × n_features
-    let n_floats = n * header.n_features;
-    let mut raw = vec![0u8; n_floats * 4];
+    // Read f32 data payload: n_points × n_features.
+    // Stage 20 (Security Hardening): use checked arithmetic and enforce an
+    // upper bound *before* allocating, so a corrupted or maliciously-crafted
+    // header (e.g. n_points ≈ u32::MAX) cannot drive a multi-gigabyte
+    // allocation attempt.
+    let n_floats = n.checked_mul(header.n_features).ok_or_else(|| {
+        ClassifierError::Pipeline(format!(
+            "'{}': n_points × n_features overflows usize (n_points={n}, n_features={})",
+            feat_path.display(),
+            header.n_features
+        ))
+    })?;
+    let payload_bytes = n_floats.checked_mul(4).ok_or_else(|| {
+        ClassifierError::Pipeline(format!(
+            "'{}': data payload size overflows usize",
+            feat_path.display()
+        ))
+    })?;
+    if payload_bytes > MAX_FEAT_PAYLOAD_BYTES {
+        return Err(ClassifierError::Pipeline(format!(
+            "'{}': data payload of {payload_bytes} bytes exceeds the {MAX_FEAT_PAYLOAD_BYTES}-byte \
+             safety cap (n_points={n}, n_features={}); refusing to allocate",
+            feat_path.display(),
+            header.n_features
+        )));
+    }
+
+    let mut raw = vec![0u8; payload_bytes];
     r.read_exact(&mut raw).map_err(|e| {
         ClassifierError::Pipeline(format!(
             "'{}': data payload read error: {e}",
@@ -217,10 +245,21 @@ fn process_block(
         ))
     })?;
 
-    let floats: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    // Stage 21 (Performance): zero-copy byte→f32 reinterpretation via
+    // `bytemuck::try_cast_slice` instead of a manual per-element
+    // `chunks_exact(4).map(from_le_bytes)` loop. `try_cast_slice` (rather
+    // than the panicking `cast_slice`) preserves the project-wide
+    // no-panics rule: on the (practically unreachable, since a `Vec<u8>`'s
+    // heap allocation is always suitably aligned for `f32` on every
+    // supported platform) misalignment case, fall back to the original
+    // manual conversion instead of erroring or panicking.
+    let floats: Vec<f32> = match bytemuck::try_cast_slice::<u8, f32>(&raw) {
+        Ok(slice) => slice.to_vec(),
+        Err(_) => raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+    };
 
     let features = Array2::from_shape_vec((n, header.n_features), floats)
         .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
