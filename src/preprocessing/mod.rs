@@ -174,6 +174,20 @@ pub struct PreprocessConfig {
     ///   ≤ `block_size / 2`.
     /// - Constraint: `0.0 ≤ block_overlap < block_size`.
     pub block_overlap: f64,
+
+    // ── Jitter-based oversampling (Stage 29) ───────────────────────────────
+    /// Standard deviation (projection units) of per-axis Gaussian jitter
+    /// applied to padding-only points when a block is oversampled
+    /// (`raw_count < target_points`). Offsets are clipped to `±3σ`.
+    ///
+    /// - `0.0` (default) — disabled; behaviour identical to pre-Stage-29
+    ///   exact-duplicate padding.
+    /// - `> 0.0` — each padding-only copy's (x, y, z) is perturbed before
+    ///   feature extraction, producing distinct eigenvalue features instead
+    ///   of an exact clone of its source point.
+    ///
+    /// See `docs/stages/stage-29-jitter-oversampling.md`.
+    pub oversample_jitter: f64,
 }
 
 impl Default for PreprocessConfig {
@@ -195,6 +209,7 @@ impl Default for PreprocessConfig {
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
             block_overlap: 0.0,
+            oversample_jitter: 0.0,
         }
     }
 }

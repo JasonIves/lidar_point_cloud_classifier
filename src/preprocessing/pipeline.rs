@@ -81,6 +81,8 @@ pub struct BlockManifest {
     /// `0.0` means no overlap (default, backward-compatible).
     #[serde(default)]
     pub block_overlap: f64,
+    #[serde(default)]
+    pub oversample_jitter: f64,
     pub blocks: Vec<BlockMeta>,
 }
 
@@ -394,8 +396,12 @@ impl PreprocessingPipeline {
 
                 // (c) Density-gated sampling — canonical points only.
                 //     Border points are context-only and must not appear in output.
-                let (sampled, sampled_indices, oversampled) =
-                    resample_block(&block.points, config.target_points, block_id);
+                let (sampled, sampled_indices, oversampled) = resample_block(
+                    &block.points,
+                    config.target_points,
+                    block_id,
+                    config.oversample_jitter,
+                );
 
                 let sampled_count = sampled.len();
 
@@ -507,6 +513,7 @@ impl PreprocessingPipeline {
             outlier_elev_diff: config.outlier_elev_diff,
             outlier_use_median: config.outlier_use_median,
             block_overlap: config.block_overlap,
+            oversample_jitter: config.oversample_jitter,
             blocks: block_metas,
         };
 
@@ -871,6 +878,7 @@ mod tests {
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
             block_overlap: 12.5,
+            oversample_jitter: 0.0,
             blocks: vec![],
         };
 

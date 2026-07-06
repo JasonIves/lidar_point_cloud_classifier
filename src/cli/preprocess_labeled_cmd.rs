@@ -33,6 +33,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut outlier_elev_diff: f64 = 50.0;
     let mut outlier_use_median: bool = false;
     let mut block_overlap: f64 = 0.0;
+    let mut oversample_jitter: f64 = 0.0;
 
     let mut i = 0;
     while i < args.len() {
@@ -116,6 +117,12 @@ pub fn run(args: &[String]) -> Result<()> {
                     "--block-overlap",
                 )?;
             }
+            "--oversample-jitter" => {
+                oversample_jitter = parse_f64(
+                    next_value(args, &mut i, "--oversample-jitter")?,
+                    "--oversample-jitter",
+                )?;
+            }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
                     "preprocess-labeled: unknown flag '{flag}'"
@@ -186,6 +193,11 @@ pub fn run(args: &[String]) -> Result<()> {
             "--block-overlap must be less than --block-size".to_string(),
         ));
     }
+    if oversample_jitter < 0.0 || !oversample_jitter.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--oversample-jitter must be >= 0.0 and finite".to_string(),
+        ));
+    }
 
     // Load label map from JSON file, or use default.
     let label_map: HashMap<u8, u8> = if let Some(ref p) = label_map_path {
@@ -216,6 +228,7 @@ pub fn run(args: &[String]) -> Result<()> {
         outlier_elev_diff,
         outlier_use_median,
         block_overlap,
+        oversample_jitter,
     };
 
     let config = LabeledPreprocessConfig {
@@ -253,6 +266,11 @@ fn print_usage() {
          Block overlap (disabled by default):\n\
            --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
                                        Recommended: block-size / 2.  Must be < block-size.\n\
+         \n\
+         Jitter-based oversampling (disabled by default):\n\
+           --oversample-jitter <f64>   Std-dev (projection units) of per-axis Gaussian jitter\n\
+                                       applied to padding-only points when a block is\n\
+                                       oversampled. Offsets clipped to ±3σ. (default: 0.0)\n\
          \n\
          Outlier removal (disabled by default):\n\
            --outlier-removal           Enable outlier removal pre-pass (whole-file)\n\

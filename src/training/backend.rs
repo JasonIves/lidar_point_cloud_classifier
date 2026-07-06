@@ -98,6 +98,97 @@ fn gpu_is_available() -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stage 28: VRAM pre-flight visibility (informational only)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// See docs/stages/stage-28-vram-preflight-visibility.md for the full
+// diagnostic journey and rationale. Both functions below are strictly
+// informational: they never alter `config`, never retry, never clamp, and
+// never block training. They exist solely to close an "informative logging"
+// gap (AGENTS.md) identified while diagnosing a real GPU VRAM-oversubscription
+// slowdown.
+
+/// Log the identity of the first enumerated GPU adapter (name, backend,
+/// device type) once at GPU training start.
+///
+/// `wgpu` provides no way to know which adapter `WgpuDevice::default()` will
+/// actually bind internally, so on multi-adapter systems this is presented
+/// with an explicit caveat rather than a false claim of certainty. Never
+/// panics: an empty adapter list (unreachable in practice, since callers only
+/// reach this after `gpu_is_available()` returned true) is handled gracefully.
+#[cfg(feature = "training")]
+fn log_gpu_adapter_info() {
+    let instance = wgpu::Instance::default();
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+
+    let Some(first) = adapters.first() else {
+        eprintln!("[device] GPU adapter: none enumerated (unexpected — proceeding anyway)");
+        return;
+    };
+
+    let info = first.get_info();
+    eprintln!(
+        "[device] GPU adapter: {} ({:?}, {:?})",
+        info.name, info.backend, info.device_type
+    );
+    if adapters.len() > 1 {
+        eprintln!(
+            "[device] Note: {} adapters were enumerated; the logged adapter is the first one \
+             found and may not be the one burn's WgpuDevice::default() actually binds.",
+            adapters.len()
+        );
+    }
+}
+
+/// Informational threshold for total points fed into one batched forward pass
+/// (`forward_batch_size × max_sampled_points_per_block`), above which a
+/// one-time VRAM-oversubscription advisory is logged.
+///
+/// Calibrated from two empirically-confirmed data points on an 8 GB-class GPU
+/// (RTX 2070 SUPER), gathered while diagnosing a real training slowdown (see
+/// `docs/stages/stage-28-vram-preflight-visibility.md`):
+/// - 81,920 points/batch (`forward_batch_size=16 × 5,120` target points):
+///   confirmed safe — 7.6 GB VRAM, sustained 55-70% GPU utilization.
+/// - 163,840 points/batch (`forward_batch_size=32 × 5,120` target points):
+///   confirmed oversubscribed — dedicated VRAM full, spilling into slower
+///   shared system memory via WDDM (no crash, just a severe slowdown).
+///
+/// This is a rough, transparent proxy metric, not a physical VRAM byte model:
+/// wgpu exposes no portable way to query total adapter VRAM (see the stage
+/// doc's "Why an exact VRAM estimate is not attempted" section).
+#[cfg(feature = "training")]
+const VRAM_PREFLIGHT_POINTS_PER_BATCH_WARN_THRESHOLD: usize = 120_000;
+
+/// Log a one-time informational warning when the configured
+/// `forward_batch_size` combined with the dataset's largest block size would
+/// push the batched-forward workload above the empirically-calibrated
+/// [`VRAM_PREFLIGHT_POINTS_PER_BATCH_WARN_THRESHOLD`].
+///
+/// Purely informational: never modifies `config`, never blocks or delays
+/// training. Uses `saturating_mul` so a pathological configuration cannot
+/// panic via overflow (AGENTS.md error-handling guardrails).
+#[cfg(feature = "training")]
+fn vram_preflight_check(dataset: &LabeledBlockDataset, config: &TrainConfig) {
+    let fb = config.forward_batch_size.max(1);
+    let max_points = dataset.max_sampled_points_per_block();
+    let points_per_batch = fb.saturating_mul(max_points);
+
+    if points_per_batch > VRAM_PREFLIGHT_POINTS_PER_BATCH_WARN_THRESHOLD {
+        eprintln!(
+            "[device] VRAM pre-flight: --forward-batch-size {fb} × max block size {max_points} \
+             points = {points_per_batch} points per batched forward pass, above the \
+             {VRAM_PREFLIGHT_POINTS_PER_BATCH_WARN_THRESHOLD}-point informational threshold. \
+             On 8 GB-class GPUs this configuration has been observed to oversubscribe VRAM \
+             (Windows WDDM silently spills into slower shared system memory rather than \
+             erroring), causing a severe training slowdown without a crash. This is \
+             informational only — training will proceed unmodified. Consider lowering \
+             --forward-batch-size if you observe reduced GPU utilization or dedicated VRAM \
+             saturation in Task Manager / nvidia-smi."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -276,6 +367,14 @@ fn train_gpu_inner(dataset: &LabeledBlockDataset, config: &TrainConfig) -> Resul
     use burn::backend::{Autodiff, Wgpu};
 
     type GpuBackend = Autodiff<Wgpu>;
+
+    // Stage 28 (informational only — see docs/stages/stage-28-vram-preflight-visibility.md):
+    // log the bound adapter's identity and, if the configured batched-forward
+    // workload is large enough to risk VRAM oversubscription on 8 GB-class
+    // GPUs, a one-time advisory. Neither call alters `config` or training
+    // behavior in any way.
+    log_gpu_adapter_info();
+    vram_preflight_check(dataset, config);
 
     let device = WgpuDevice::default();
     train::<GpuBackend>(dataset, config, &device)

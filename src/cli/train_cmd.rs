@@ -285,6 +285,10 @@ fn print_usage() {
            --batch-size        <usize>  Effective batch: blocks per optimizer step (default: 16)\n\
            --forward-batch-size <usize> Blocks per batched forward — effective BatchNorm\n\
                                         batch size; micro-batched then accumulated (default: 8)\n\
+                                        Stage 28: keep forward_batch_size x target_points below\n\
+                                        ~120,000 on 8GB-class GPUs to avoid VRAM oversubscription\n\
+                                        (WDDM silently spills into slower shared system memory\n\
+                                        instead of erroring, causing a severe slowdown)\n\
            --learning-rate     <f64>    Initial AdamW LR (default: 1e-3)\n\
            --weight-decay      <f32>    AdamW weight decay (default: 1e-4)\n\
            --val-split         <f64>    Val macro-tile fraction (default: 0.20)\n\

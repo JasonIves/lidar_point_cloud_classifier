@@ -11,6 +11,14 @@
 //!   replacement to pad to `target_points`; caller sets `oversampled = true`
 //!
 //! Seeding by `block_id` guarantees reproducible output across runs.
+//!
+//! **Jitter-based oversampling (Stage 29):** when `jitter_sigma > 0.0`, each
+//! padding-only draw has its (x, y, z) coordinates perturbed by an independent
+//! per-axis clipped-Gaussian offset (±3σ) *before* feature extraction runs, so
+//! padded points produce genuinely distinct eigenvalue features rather than
+//! being exact clones of their source point. `jitter_sigma == 0.0` (the
+//! default) preserves bit-identical pre-Stage-29 behaviour. See
+//! `docs/stages/stage-29-jitter-oversampling.md`.
 
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -19,7 +27,13 @@ use wblidar::PointRecord;
 /// Resample `pts` to exactly `target` points.
 ///
 /// - If `pts.len() >= target`: random sample without replacement.
-/// - If `pts.len() < target`: random oversample with replacement to pad.
+/// - If `pts.len() < target`: random oversample with replacement to pad,
+///   optionally jittering each padding-only copy's coordinates (Stage 29).
+///
+/// `jitter_sigma` is the standard deviation (projection units) of the
+/// per-axis Gaussian offset applied to padding-only points. `0.0` disables
+/// jitter entirely (exact-duplicate behaviour, unchanged from pre-Stage-29).
+/// See `docs/stages/stage-29-jitter-oversampling.md`.
 ///
 /// Returns `(sampled_points, sampled_indices, oversampled)` where:
 /// - `sampled_points` are the resampled `PointRecord` values,
@@ -31,6 +45,7 @@ pub fn resample_block(
     pts: &[PointRecord],
     target: usize,
     seed: u64,
+    jitter_sigma: f64,
 ) -> (Vec<PointRecord>, Vec<usize>, bool) {
     if pts.is_empty() || target == 0 {
         return (Vec::new(), Vec::new(), false);
@@ -55,11 +70,39 @@ pub fn resample_block(
         let extra = target - pts.len();
         for _ in 0..extra {
             let idx = rng.random_range(0..pts.len());
-            sampled.push(pts[idx]);
+            let mut p = pts[idx];
+            if jitter_sigma > 0.0 {
+                p.x += jitter_offset(&mut rng, jitter_sigma);
+                p.y += jitter_offset(&mut rng, jitter_sigma);
+                p.z += jitter_offset(&mut rng, jitter_sigma);
+            }
+            sampled.push(p);
             sampled_indices.push(idx);
         }
         (sampled, sampled_indices, true)
     }
+}
+
+/// Draw one zero-mean Gaussian offset with standard deviation `sigma`,
+/// clipped to `±3σ`, using a Box–Muller transform sourced from `rng`.
+///
+/// Implemented locally (rather than pulling in `rand_distr`) to keep the
+/// dependency footprint minimal per AGENTS.md — two uniform draws plus a
+/// `ln`/`sqrt`/`cos` is negligible cost compared to the k-d tree build and
+/// eigendecomposition that follow.
+///
+/// Returns `0.0` immediately for `sigma <= 0.0` (jitter disabled).
+fn jitter_offset(rng: &mut impl Rng, sigma: f64) -> f64 {
+    if sigma <= 0.0 {
+        return 0.0;
+    }
+    // u1 drawn from (0, 1] (never exactly 0) to avoid ln(0) = -inf.
+    let u1: f64 = 1.0 - rng.random::<f64>();
+    let u2: f64 = rng.random::<f64>();
+    let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+    let raw = z0 * sigma;
+    let clip = 3.0 * sigma;
+    raw.clamp(-clip, clip)
 }
 
 /// Normalise the scalar point attributes (indices 0–6 of the feature vector)
@@ -312,7 +355,7 @@ mod tests {
         let pts: Vec<PointRecord> = (0..100)
             .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
             .collect();
-        let (sampled, _indices, over) = resample_block(&pts, 50, 42);
+        let (sampled, _indices, over) = resample_block(&pts, 50, 42, 0.0);
         assert_eq!(sampled.len(), 50);
         assert!(!over);
     }
@@ -322,7 +365,7 @@ mod tests {
         let pts: Vec<PointRecord> = (0..10)
             .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
             .collect();
-        let (sampled, _indices, over) = resample_block(&pts, 50, 42);
+        let (sampled, _indices, over) = resample_block(&pts, 50, 42, 0.0);
         assert_eq!(sampled.len(), 50);
         assert!(over);
     }
@@ -332,7 +375,7 @@ mod tests {
         let pts: Vec<PointRecord> = (0..1024)
             .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
             .collect();
-        let (sampled, _indices, over) = resample_block(&pts, 1024, 0);
+        let (sampled, _indices, over) = resample_block(&pts, 1024, 0, 0.0);
         assert_eq!(sampled.len(), 1024);
         assert!(!over);
     }
@@ -342,8 +385,8 @@ mod tests {
         let pts: Vec<PointRecord> = (0..200)
             .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
             .collect();
-        let (s1, _, _) = resample_block(&pts, 100, 99);
-        let (s2, _, _) = resample_block(&pts, 100, 99);
+        let (s1, _, _) = resample_block(&pts, 100, 99, 0.0);
+        let (s2, _, _) = resample_block(&pts, 100, 99, 0.0);
         let xs1: Vec<i64> = s1.iter().map(|p| (p.x * 1e6) as i64).collect();
         let xs2: Vec<i64> = s2.iter().map(|p| (p.x * 1e6) as i64).collect();
         assert_eq!(
@@ -366,5 +409,98 @@ mod tests {
                 assert!((0.0..=1.0).contains(&v), "feature out of [0,1]: {v}");
             }
         }
+    }
+
+    // ── Stage 29: jitter-based oversampling ────────────────────────────────
+
+    /// `jitter_sigma == 0.0` must produce bit-identical output to the
+    /// pre-Stage-29 exact-duplicate behaviour (DoD #5).
+    #[test]
+    fn test_jitter_zero_is_bit_identical_to_no_jitter() {
+        let pts: Vec<PointRecord> = (0..10)
+            .map(|i| make_pt(i as f64, i as f64 * 2.0, i as f64 * 0.5, 100, 1, 1))
+            .collect();
+        let (s_no_jitter, idx_no_jitter, over1) = resample_block(&pts, 50, 7, 0.0);
+        let (s_zero_sigma, idx_zero_sigma, over2) = resample_block(&pts, 50, 7, 0.0);
+        assert_eq!(over1, over2);
+        assert_eq!(idx_no_jitter, idx_zero_sigma);
+        for (a, b) in s_no_jitter.iter().zip(s_zero_sigma.iter()) {
+            assert!((a.x - b.x).abs() < 1e-15);
+            assert!((a.y - b.y).abs() < 1e-15);
+            assert!((a.z - b.z).abs() < 1e-15);
+        }
+    }
+
+    /// With `jitter_sigma > 0.0`, padding-only points must differ in
+    /// coordinates from their source point (DoD #6), while the original
+    /// (non-padded) points remain untouched.
+    #[test]
+    fn test_jitter_perturbs_padding_points_only() {
+        let pts: Vec<PointRecord> = (0..5)
+            .map(|i| make_pt(i as f64 * 10.0, i as f64 * 10.0, 0.0, 100, 1, 1))
+            .collect();
+        let (sampled, indices, over) = resample_block(&pts, 20, 123, 1.0);
+        assert!(over);
+        assert_eq!(sampled.len(), 20);
+
+        // First 5 entries are the original points, untouched.
+        for i in 0..5 {
+            assert!((sampled[i].x - pts[i].x).abs() < 1e-12);
+            assert!((sampled[i].y - pts[i].y).abs() < 1e-12);
+            assert!((sampled[i].z - pts[i].z).abs() < 1e-12);
+        }
+
+        // At least one padded point should differ from its source (jitter applied).
+        let mut any_diff = false;
+        for i in 5..20 {
+            let src = pts[indices[i]];
+            if (sampled[i].x - src.x).abs() > 1e-9
+                || (sampled[i].y - src.y).abs() > 1e-9
+                || (sampled[i].z - src.z).abs() > 1e-9
+            {
+                any_diff = true;
+            }
+        }
+        assert!(
+            any_diff,
+            "expected at least one padded point to be perturbed by jitter"
+        );
+    }
+
+    /// Jitter offsets must be clipped to ±3σ (DoD #7).
+    #[test]
+    fn test_jitter_offset_clipped_to_three_sigma() {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
+        let sigma = 0.5;
+        for _ in 0..10_000 {
+            let v = jitter_offset(&mut rng, sigma);
+            assert!(
+                v.abs() <= 3.0 * sigma + 1e-12,
+                "jitter offset {v} exceeded ±3σ ({sigma})"
+            );
+        }
+    }
+
+    /// Jitter must be fully reproducible given the same seed (DoD #8).
+    #[test]
+    fn test_jitter_is_reproducible() {
+        let pts: Vec<PointRecord> = (0..5)
+            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+            .collect();
+        let (s1, _, _) = resample_block(&pts, 30, 55, 0.25);
+        let (s2, _, _) = resample_block(&pts, 30, 55, 0.25);
+        for (a, b) in s1.iter().zip(s2.iter()) {
+            assert!((a.x - b.x).abs() < 1e-15);
+            assert!((a.y - b.y).abs() < 1e-15);
+            assert!((a.z - b.z).abs() < 1e-15);
+        }
+    }
+
+    /// `jitter_offset` returns exactly `0.0` for non-positive sigma.
+    #[test]
+    fn test_jitter_offset_zero_for_nonpositive_sigma() {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(2);
+        assert_eq!(jitter_offset(&mut rng, 0.0), 0.0);
+        assert_eq!(jitter_offset(&mut rng, -1.0), 0.0);
     }
 }

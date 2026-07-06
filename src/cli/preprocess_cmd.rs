@@ -129,6 +129,12 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                     "--block-overlap",
                 )?;
             }
+            "--oversample-jitter" => {
+                cfg.oversample_jitter = parse_f64(
+                    next_value(args, &mut i, "--oversample-jitter")?,
+                    "--oversample-jitter",
+                )?;
+            }
             unknown => {
                 return Err(ClassifierError::Pipeline(format!(
                     "unknown argument: '{unknown}'"
@@ -200,6 +206,11 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     if cfg.block_overlap >= cfg.block_size {
         return Err(ClassifierError::Pipeline(
             "--block-overlap must be less than --block-size".to_string(),
+        ));
+    }
+    if cfg.oversample_jitter < 0.0 || !cfg.oversample_jitter.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--oversample-jitter must be >= 0.0 and finite".to_string(),
         ));
     }
 
@@ -277,6 +288,11 @@ fn print_help() {
            --outlier-removal           Enable lidar_remove_outliers pre-pass (whole-file)\n\
            --outlier-radius  <f64>     Neighbourhood radius for residual calculation (default: 2.0)\n\
            --outlier-elev-diff <f64>   Residual threshold; points exceeding this are removed (default: 50.0)\n\
-           --outlier-use-median        Use neighbourhood median instead of mean\n"
+           --outlier-use-median        Use neighbourhood median instead of mean\n\
+         \n\
+         JITTER-BASED OVERSAMPLING (disabled by default):\n\
+           --oversample-jitter <f64>   Std-dev (projection units) of per-axis Gaussian jitter\n\
+                                       applied to padding-only points when a block is\n\
+                                       oversampled. Offsets are clipped to ±3σ. (default: 0.0)\n"
     );
 }

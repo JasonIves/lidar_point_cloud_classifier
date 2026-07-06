@@ -239,6 +239,7 @@ mod tests {
             outlier_elev_diff: 50.0,
             outlier_use_median: false,
             block_overlap: 0.0,
+            oversample_jitter: 0.0,
             blocks: vec![BlockMeta {
                 id: 0,
                 file: "block_00000.feat".into(),
