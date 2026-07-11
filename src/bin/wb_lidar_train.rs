@@ -10,7 +10,7 @@ fn main() {
 }
 
 fn run() -> lidar_point_cloud_classifier::Result<()> {
-    use lidar_point_cloud_classifier::cli::{preprocess_labeled_cmd, train_cmd};
+    use lidar_point_cloud_classifier::cli::{preprocess_labeled_cmd, split_dataset_cmd, train_cmd};
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -21,6 +21,7 @@ fn run() -> lidar_point_cloud_classifier::Result<()> {
 
     match args[1].as_str() {
         "preprocess-labeled" => preprocess_labeled_cmd::run(&args[2..]),
+        "split-dataset" => split_dataset_cmd::run(&args[2..]),
         "train" => train_cmd::run(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -41,6 +42,7 @@ fn print_usage() {
          Sub-commands:\n\
          \n\
            preprocess-labeled   Preprocess labeled LiDAR → .feat + .lbl blocks\n\
+           split-dataset        Materialize a physical train/val/test directory split\n\
            train                Train a PointNet model → .wbmodel\n\
            help                 Show this message\n\
          \n\

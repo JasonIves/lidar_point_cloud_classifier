@@ -24,7 +24,10 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let mut cfg = TrainConfig::default();
     let mut data_dirs: Vec<PathBuf> = Vec::new();
+    let mut val_data_dirs: Vec<PathBuf> = Vec::new();
     let mut val_tile_blocks_path: Option<PathBuf> = None;
+    let mut val_split_explicit = false;
+    let mut val_tile_blocks_explicit = false;
     let mut device_pref = DevicePreference::default();
 
     let mut i = 0;
@@ -32,6 +35,9 @@ pub fn run(args: &[String]) -> Result<()> {
         match args[i].as_str() {
             "--data-dir" => {
                 data_dirs.push(PathBuf::from(next_value(args, &mut i, "--data-dir")?));
+            }
+            "--val-data-dir" => {
+                val_data_dirs.push(PathBuf::from(next_value(args, &mut i, "--val-data-dir")?));
             }
             "--output-model" => {
                 cfg.output_model = PathBuf::from(next_value(args, &mut i, "--output-model")?);
@@ -67,6 +73,7 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--val-split" => {
                 cfg.val_split = parse_f64(next_value(args, &mut i, "--val-split")?, "--val-split")?;
+                val_split_explicit = true;
             }
             "--val-tile-blocks" => {
                 val_tile_blocks_path = Some(PathBuf::from(next_value(
@@ -74,6 +81,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     &mut i,
                     "--val-tile-blocks",
                 )?));
+                val_tile_blocks_explicit = true;
             }
             "--seed" => {
                 cfg.seed = parse_u64(next_value(args, &mut i, "--seed")?, "--seed")?;
@@ -233,25 +241,48 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
-    // Load explicit val-tile-blocks override if provided.
-    let val_tile_ids: Option<HashSet<u64>> = if let Some(ref p) = val_tile_blocks_path {
-        let f = std::fs::File::open(p)?;
-        let ids: Vec<u64> = serde_json::from_reader(f)
-            .map_err(|e| ClassifierError::Pipeline(format!("--val-tile-blocks parse: {e}")))?;
-        Some(ids.into_iter().collect())
+    // Stage 32 (Dataset Split Materialization): if one or more
+    // --val-data-dir directories were supplied, the split has already been
+    // decided physically (via `wb_lidar_train split-dataset`) — every block
+    // in --data-dir goes to train, every block in --val-data-dir goes to
+    // val, with no macro-tile logic. --val-split/--val-tile-blocks are
+    // ignored in this mode (warned, not errored, so a shared flag template
+    // can be reused across both on-the-fly and pre-split invocations).
+    let dataset = if val_data_dirs.is_empty() {
+        // Load explicit val-tile-blocks override if provided.
+        let val_tile_ids: Option<HashSet<u64>> = if let Some(ref p) = val_tile_blocks_path {
+            let f = std::fs::File::open(p)?;
+            let ids: Vec<u64> = serde_json::from_reader(f)
+                .map_err(|e| ClassifierError::Pipeline(format!("--val-tile-blocks parse: {e}")))?;
+            Some(ids.into_iter().collect())
+        } else {
+            None
+        };
+
+        // Load dataset — accepts one or more preprocessing directories.
+        // Stage 27 (Block Caching, audit finding 5.2): .with_block_cache(None)
+        // (the default, when --cache-blocks-max-mb is not passed) is a no-op —
+        // load_block() behaves exactly as it did before Stage 27.
+        let dataset =
+            LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?
+                .with_block_cache(cfg.cache_blocks_max_mb);
+
+        cfg.val_tile_block_ids = val_tile_ids;
+        dataset
     } else {
-        None
+        if val_split_explicit {
+            eprintln!(
+                "[train] warning: --val-split is ignored because --val-data-dir was supplied"
+            );
+        }
+        if val_tile_blocks_explicit {
+            eprintln!(
+                "[train] warning: --val-tile-blocks is ignored because --val-data-dir was supplied"
+            );
+        }
+        LabeledBlockDataset::load_presplit(&data_dirs, &val_data_dirs)?
+            .with_block_cache(cfg.cache_blocks_max_mb)
     };
-
-    // Load dataset — accepts one or more preprocessing directories.
-    // Stage 27 (Block Caching, audit finding 5.2): .with_block_cache(None)
-    // (the default, when --cache-blocks-max-mb is not passed) is a no-op —
-    // load_block() behaves exactly as it did before Stage 27.
-    let dataset =
-        LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?
-            .with_block_cache(cfg.cache_blocks_max_mb);
-
-    cfg.val_tile_block_ids = val_tile_ids;
 
     // Default metrics output: <first_data_dir>/../metrics/metrics.csv
     if cfg.metrics_out.as_os_str() == "metrics.csv" {
@@ -280,6 +311,14 @@ fn print_usage() {
            --output-model  <path>   Output .wbmodel file\n\
          \n\
          Optional:\n\
+           --val-data-dir      <dir>    Pre-split validation directory (repeatable). When at\n\
+                                        least one is supplied, ALL --data-dir directories are\n\
+                                        used entirely for training (no on-the-fly split), and\n\
+                                        ALL --val-data-dir directories are used entirely for\n\
+                                        validation. --val-split/--val-tile-blocks are ignored\n\
+                                        in this mode (with a warning if explicitly set).\n\
+                                        See `wb_lidar_train split-dataset` to materialize a\n\
+                                        pre-split train/val directory pair.\n\
            --n-classes         <u8>     Output classes (default: 8)\n\
            --epochs            <usize>  Training epochs (default: 50)\n\
            --batch-size        <usize>  Effective batch: blocks per optimizer step (default: 16)\n\

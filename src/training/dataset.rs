@@ -200,106 +200,7 @@ impl LabeledBlockDataset {
             ));
         }
 
-        // Load all manifests and validate class consistency.
-        let mut dirs = Vec::with_capacity(data_dirs.len());
-        let mut validated_n_classes: Option<usize> = None;
-
-        for (idx, dir) in data_dirs.iter().enumerate() {
-            let manifest_path = dir.join("labeled_blocks.json");
-            let f = File::open(&manifest_path).map_err(|e| {
-                ClassifierError::Pipeline(format!("cannot open {}: {e}", manifest_path.display()))
-            })?;
-            let manifest: LabeledBlockManifest = serde_json::from_reader(BufReader::new(f))
-                .map_err(|e| {
-                    ClassifierError::Pipeline(format!(
-                        "labeled_blocks.json parse error in {}: {e}",
-                        dir.display()
-                    ))
-                })?;
-
-            // Derive n_classes from the number of *distinct* model class
-            // indices defined in the label map.
-            //
-            // WHY NOT max(values)+1:
-            // The previous formula used `max(label_map.values()) + 1` as an
-            // index-range upper bound.  That assumption breaks whenever any
-            // model class index in the range [0, max] is absent from the
-            // training data (e.g. raw code 0 = "never classified" in ASPRS,
-            // or any skipped code in a non-ASPRS dataset).  The absent class
-            // gets count=0 → weight=0.0 → burn's CrossEntropyLoss panics.
-            //
-            // The correct interpretation: the label map defines a finite,
-            // explicit set of output classes.  `n_classes` is simply the
-            // number of distinct values (model indices) in that set.
-            // `class_distribution` in each block only contains keys that
-            // actually appear, so the counts Vec is indexed by model class
-            // index and will naturally be 0 for indices not present in data —
-            // but now n_classes matches the declared set, not a max+1 guess.
-            //
-            // The floor weight (1e-3) in compute_class_weights handles the
-            // residual case where a declared class has no training samples.
-            //
-            // CONTRACT: label map values must form a 0-based contiguous set
-            // {0, 1, …, n-1}.  This is validated below.
-            let nc = {
-                let distinct: std::collections::BTreeSet<u8> =
-                    manifest.label_map.values().copied().collect();
-                if distinct.is_empty() {
-                    8 // safe fallback: matches TrainConfig::default().n_classes
-                } else {
-                    // Validate that values are 0-based contiguous: {0, 1, …, n-1}.
-                    // This is required because class_counts_train() uses model
-                    // class indices directly as Vec indices.  A gap (e.g. values
-                    // {1,2,3} instead of {0,1,2}) would leave slot 0 permanently
-                    // empty and cause index 3 to be out-of-bounds.
-                    let n = distinct.len();
-                    let expected: std::collections::BTreeSet<u8> = (0..n as u8).collect();
-                    if distinct != expected {
-                        let vals: Vec<u8> = distinct.into_iter().collect();
-                        return Err(ClassifierError::Pipeline(format!(
-                            "label map in '{}' has non-contiguous or non-zero-based \
-                             model class indices: {vals:?}.\n\
-                             Model class indices (the VALUES in the label map JSON) \
-                             must form the set {{0, 1, …, n-1}}.\n\
-                             Example for 8 classes: {{\"2\":0, \"3\":1, \"4\":2, \
-                             \"5\":3, \"6\":4, \"9\":5, \"7\":6, \"1\":7}}.\n\
-                             The KEYS are your raw dataset class codes (any values); \
-                             the VALUES are the 0-based model output indices.",
-                            dir.display()
-                        )));
-                    }
-                    n
-                }
-            };
-
-            match validated_n_classes {
-                None => validated_n_classes = Some(nc),
-                Some(expected) if expected != nc => {
-                    return Err(ClassifierError::Pipeline(format!(
-                        "n_classes mismatch: directory 0 has {expected} classes \
-                         but directory {idx} ('{}') has {nc} classes. \
-                         Re-preprocess all directories with the same --label-map.",
-                        dir.display()
-                    )));
-                }
-                _ => {}
-            }
-
-            let block_index: HashMap<u64, usize> = manifest
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (b.meta.id, i))
-                .collect();
-
-            dirs.push(DirEntry {
-                path: dir.clone(),
-                manifest,
-                block_index,
-            });
-        }
-
-        let n_classes_inner = validated_n_classes.unwrap_or(8);
+        let (dirs, n_classes_inner) = load_dir_entries(data_dirs)?;
 
         // Fixed-width feature count (Stage 30, Step 5e+5f+5g): every manifest
         // produced by the whole-file eigenvalue pre-pass has exactly
@@ -362,6 +263,83 @@ impl LabeledBlockDataset {
                 val_ids.len()
             );
         }
+
+        let train_set: HashSet<u64> = train_ids.iter().copied().collect();
+
+        Ok(Self {
+            dirs,
+            n_classes_inner,
+            n_features_inner,
+            train_ids,
+            val_ids,
+            train_set,
+            cache: None,
+        })
+    }
+
+    /// Load from pre-split `train`/`val` directories (Stage 32).
+    ///
+    /// Unlike [`load`](Self::load), no macro-tile stride selection is
+    /// performed at all — the split was already decided physically when
+    /// `wb_lidar_train split-dataset` materialized these directories. Every
+    /// block found under any of `train_dirs` is assigned to `train_ids`;
+    /// every block found under any of `val_dirs` is assigned to `val_ids`.
+    ///
+    /// `n_classes`/label-map-contiguity validation is shared across **all**
+    /// directories (train + val combined), exactly as it is today across
+    /// multiple `--data-dir` entries passed to [`load`](Self::load) — a val
+    /// directory preprocessed with a different label map than the train
+    /// directories is still a hard error.
+    ///
+    /// # Errors
+    /// Returns an error if either `train_dirs` or `val_dirs` is empty, if any
+    /// manifest cannot be read/parsed, or if the `n_classes` values are
+    /// inconsistent across the combined directory set.
+    pub fn load_presplit(train_dirs: &[PathBuf], val_dirs: &[PathBuf]) -> Result<Self> {
+        if train_dirs.is_empty() {
+            return Err(ClassifierError::Pipeline(
+                "at least one --data-dir (train) is required".into(),
+            ));
+        }
+        if val_dirs.is_empty() {
+            return Err(ClassifierError::Pipeline(
+                "at least one --val-data-dir is required".into(),
+            ));
+        }
+
+        // Load all directories (train first, so train dirs occupy the low
+        // indices and val dirs occupy the high indices — purely an internal
+        // detail, transparent via the existing GlobalBlockId composite key).
+        let mut all_dirs: Vec<PathBuf> = Vec::with_capacity(train_dirs.len() + val_dirs.len());
+        all_dirs.extend_from_slice(train_dirs);
+        all_dirs.extend_from_slice(val_dirs);
+
+        let (dirs, n_classes_inner) = load_dir_entries(&all_dirs)?;
+        let n_features_inner = N_FEATURES;
+
+        let n_train_dirs = train_dirs.len();
+        let mut train_ids = Vec::new();
+        let mut val_ids = Vec::new();
+        for (dir_idx, entry) in dirs.iter().enumerate() {
+            let is_val = dir_idx >= n_train_dirs;
+            for b in &entry.manifest.blocks {
+                let gid = make_global_id(dir_idx, b.meta.id);
+                if is_val {
+                    val_ids.push(gid);
+                } else {
+                    train_ids.push(gid);
+                }
+            }
+        }
+
+        eprintln!(
+            "[dataset] pre-split directories — {} train dir(s), {} val dir(s) — \
+             train blocks: {}, val blocks: {}",
+            n_train_dirs,
+            val_dirs.len(),
+            train_ids.len(),
+            val_ids.len()
+        );
 
         let train_set: HashSet<u64> = train_ids.iter().copied().collect();
 
@@ -520,6 +498,129 @@ impl LabeledBlockDataset {
 
         Ok(loaded)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Directory / manifest loading (shared by `load()` and `load_presplit()`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Load and validate a set of `preprocess-labeled` output directories,
+/// returning the parsed `DirEntry` list (in the same order as `data_dirs`)
+/// plus the validated common class count across all of them.
+///
+/// Shared by [`LabeledBlockDataset::load`] and
+/// [`LabeledBlockDataset::load_presplit`] (Stage 32) so both constructors
+/// enforce identical `n_classes`/label-map-contiguity validation from a
+/// single canonical implementation.
+///
+/// # Errors
+/// Returns an error if any manifest cannot be read/parsed, if any label map
+/// has non-contiguous/non-zero-based model class indices, or if the
+/// `n_classes` values are inconsistent across directories.
+fn load_dir_entries(data_dirs: &[PathBuf]) -> Result<(Vec<DirEntry>, usize)> {
+    let mut dirs = Vec::with_capacity(data_dirs.len());
+    let mut validated_n_classes: Option<usize> = None;
+
+    for (idx, dir) in data_dirs.iter().enumerate() {
+        let manifest_path = dir.join("labeled_blocks.json");
+        let f = File::open(&manifest_path).map_err(|e| {
+            ClassifierError::Pipeline(format!("cannot open {}: {e}", manifest_path.display()))
+        })?;
+        let manifest: LabeledBlockManifest =
+            serde_json::from_reader(BufReader::new(f)).map_err(|e| {
+                ClassifierError::Pipeline(format!(
+                    "labeled_blocks.json parse error in {}: {e}",
+                    dir.display()
+                ))
+            })?;
+
+        // Derive n_classes from the number of *distinct* model class
+        // indices defined in the label map.
+        //
+        // WHY NOT max(values)+1:
+        // The previous formula used `max(label_map.values()) + 1` as an
+        // index-range upper bound.  That assumption breaks whenever any
+        // model class index in the range [0, max] is absent from the
+        // training data (e.g. raw code 0 = "never classified" in ASPRS,
+        // or any skipped code in a non-ASPRS dataset).  The absent class
+        // gets count=0 → weight=0.0 → burn's CrossEntropyLoss panics.
+        //
+        // The correct interpretation: the label map defines a finite,
+        // explicit set of output classes.  `n_classes` is simply the
+        // number of distinct values (model indices) in that set.
+        // `class_distribution` in each block only contains keys that
+        // actually appear, so the counts Vec is indexed by model class
+        // index and will naturally be 0 for indices not present in data —
+        // but now n_classes matches the declared set, not a max+1 guess.
+        //
+        // The floor weight (1e-3) in compute_class_weights handles the
+        // residual case where a declared class has no training samples.
+        //
+        // CONTRACT: label map values must form a 0-based contiguous set
+        // {0, 1, …, n-1}.  This is validated below.
+        let nc = {
+            let distinct: std::collections::BTreeSet<u8> =
+                manifest.label_map.values().copied().collect();
+            if distinct.is_empty() {
+                8 // safe fallback: matches TrainConfig::default().n_classes
+            } else {
+                // Validate that values are 0-based contiguous: {0, 1, …, n-1}.
+                // This is required because class_counts_train() uses model
+                // class indices directly as Vec indices.  A gap (e.g. values
+                // {1,2,3} instead of {0,1,2}) would leave slot 0 permanently
+                // empty and cause index 3 to be out-of-bounds.
+                let n = distinct.len();
+                // n is a small class count (never anywhere near u8::MAX),
+                // so the truncating cast below is inconsequential.
+                #[allow(clippy::cast_possible_truncation)]
+                let expected: std::collections::BTreeSet<u8> = (0..n as u8).collect();
+                if distinct != expected {
+                    let vals: Vec<u8> = distinct.into_iter().collect();
+                    return Err(ClassifierError::Pipeline(format!(
+                        "label map in '{}' has non-contiguous or non-zero-based \
+                         model class indices: {vals:?}.\n\
+                         Model class indices (the VALUES in the label map JSON) \
+                         must form the set {{0, 1, …, n-1}}.\n\
+                         Example for 8 classes: {{\"2\":0, \"3\":1, \"4\":2, \
+                         \"5\":3, \"6\":4, \"9\":5, \"7\":6, \"1\":7}}.\n\
+                         The KEYS are your raw dataset class codes (any values); \
+                         the VALUES are the 0-based model output indices.",
+                        dir.display()
+                    )));
+                }
+                n
+            }
+        };
+
+        match validated_n_classes {
+            None => validated_n_classes = Some(nc),
+            Some(expected) if expected != nc => {
+                return Err(ClassifierError::Pipeline(format!(
+                    "n_classes mismatch: directory 0 has {expected} classes \
+                     but directory {idx} ('{}') has {nc} classes. \
+                     Re-preprocess all directories with the same --label-map.",
+                    dir.display()
+                )));
+            }
+            _ => {}
+        }
+
+        let block_index: HashMap<u64, usize> = manifest
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.meta.id, i))
+            .collect();
+
+        dirs.push(DirEntry {
+            path: dir.clone(),
+            manifest,
+            block_index,
+        });
+    }
+
+    let n_classes_inner = validated_n_classes.unwrap_or(8);
+    Ok((dirs, n_classes_inner))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -948,6 +1049,66 @@ mod tests {
         assert!(
             msg.contains("non-contiguous"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    // ── Stage 32 (Dataset Split Materialization): load_presplit() ─────────
+
+    #[test]
+    fn test_load_presplit_assigns_entire_dirs_to_train_or_val() {
+        let train_dir = tempfile::tempdir().expect("train tempdir");
+        let val_dir = tempfile::tempdir().expect("val tempdir");
+
+        let train_manifest = dummy_manifest(vec![make_lbm(0, 0), make_lbm(1, 1)]);
+        let val_manifest = dummy_manifest(vec![make_lbm(0, 2)]); // local id 0 again — must not collide
+
+        std::fs::write(
+            train_dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&train_manifest).expect("serialize train manifest"),
+        )
+        .expect("write train manifest fixture");
+        std::fs::write(
+            val_dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&val_manifest).expect("serialize val manifest"),
+        )
+        .expect("write val manifest fixture");
+
+        let dataset = LabeledBlockDataset::load_presplit(
+            &[train_dir.path().to_path_buf()],
+            &[val_dir.path().to_path_buf()],
+        )
+        .expect("load_presplit should succeed");
+
+        assert_eq!(
+            dataset.train_ids.len(),
+            2,
+            "all train-dir blocks → train_ids"
+        );
+        assert_eq!(dataset.val_ids.len(), 1, "all val-dir blocks → val_ids");
+
+        // No overlap between train_ids and val_ids despite colliding local IDs.
+        let train_set: HashSet<u64> = dataset.train_ids.iter().copied().collect();
+        let val_set: HashSet<u64> = dataset.val_ids.iter().copied().collect();
+        assert!(train_set.is_disjoint(&val_set));
+    }
+
+    #[test]
+    fn test_load_presplit_rejects_empty_train_or_val_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dummy_manifest(vec![make_lbm(0, 0)]);
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write fixture");
+
+        assert!(
+            LabeledBlockDataset::load_presplit(&[], &[dir.path().to_path_buf()]).is_err(),
+            "empty train_dirs must be rejected"
+        );
+        assert!(
+            LabeledBlockDataset::load_presplit(&[dir.path().to_path_buf()], &[]).is_err(),
+            "empty val_dirs must be rejected"
         );
     }
 

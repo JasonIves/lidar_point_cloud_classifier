@@ -1,6 +1,7 @@
 //! Preprocessing module — config types and sub-module declarations.
 
 pub mod block_partitioner;
+pub mod dataset_split;
 pub mod feature_extractor;
 pub mod labeled_pipeline;
 pub mod lite_point;

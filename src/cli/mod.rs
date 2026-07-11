@@ -6,6 +6,8 @@ pub mod preprocess_cmd;
 #[cfg(feature = "training")]
 pub mod preprocess_labeled_cmd;
 #[cfg(feature = "training")]
+pub mod split_dataset_cmd;
+#[cfg(feature = "training")]
 pub mod train_cmd;
 
 use crate::error::Result;
