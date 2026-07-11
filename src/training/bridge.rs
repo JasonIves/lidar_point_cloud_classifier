@@ -270,8 +270,9 @@ mod tests {
 
     #[test]
     fn test_weight_bridge_round_trip() {
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
+
         let model = BurnPointNet::<B>::new(&cfg, &device).unwrap();
         let label_map: Vec<u8> = (0u8..8).collect();
 
@@ -286,14 +287,18 @@ mod tests {
         assert_eq!(loaded.label_map, label_map);
         assert!(loaded.input_tnet.is_some());
 
-        // enc0 weight should be [out=64, in=12] in Stage 02 format
-        assert_eq!(loaded.encoder_layers[0].0.weight.shape(), &[64, 12][..]);
+        // enc0 weight should be [out=64, in=N_FEATURES] in Stage 02 format
+        assert_eq!(
+            loaded.encoder_layers[0].0.weight.shape(),
+            &[64, N_FEATURES][..]
+        );
     }
 
     #[test]
     fn test_swa_averaging() {
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
+
         let label_map: Vec<u8> = (0u8..8).collect();
 
         let dir = tempfile::tempdir().unwrap();
@@ -314,6 +319,6 @@ mod tests {
 
         assert_eq!(avg.shape(), w1.shape());
         // Verify elementwise mean
-        assert!((avg[[0, 0]] - (w1[[0, 0]] + w2[[0, 0]]) / 2.0).abs() < 1e-6);
+        assert!((avg[[0, 0]] - f32::midpoint(w1[[0, 0]], w2[[0, 0]])).abs() < 1e-6);
     }
 }

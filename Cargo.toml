@@ -23,15 +23,22 @@ path = "src/bin/wb_lidar_train.rs"
 required-features = ["training"]
 
 [dependencies]
-# Whitebox Next Gen path dependencies (read-only; never modify these crates)
-wblidar     = { path = "../whitebox_next_gen/crates/wblidar",     features = ["parallel"] }
-# TEMP (2026-06-17): wbcore and wbtools_oss commented out for build speed.
-# These were used only in preprocessing/pipeline.rs::run_outlier_removal().
-# The algorithm has been reimplemented locally in src/preprocessing/outlier_filter.rs.
-# To revert: uncomment below, delete outlier_filter.rs, see stage-04-outlier-removal.md.
-# wbcore      = { path = "../whitebox_next_gen/crates/wbcore" }
-# wbtools_oss = { path = "../whitebox_next_gen/crates/wbtools_oss" }
-wbraster    = { path = "../whitebox_next_gen/crates/wbraster" }
+# Whitebox Next Gen — pinned git dependencies (NOT crates.io, NOT local path).
+# `wbcore`/`wbtools_oss` are unpublished (`publish = false`) experimental crates;
+# a git dependency is the only "online" (non-local-path) way to depend on them.
+#
+# HARD RULE: every whitebox-* crate below MUST share the identical `git` URL and
+# `rev`. Never mix a git-sourced Whitebox crate with a crates.io-sourced one —
+# doing so creates duplicate, incompatible copies of shared types (`Raster`,
+# `PointRecord`, etc.). See docs/stages/stage-30-whitebox-git-dependency-integration.md.
+#
+# Upstream: https://github.com/jblindsay/whitebox_next_gen
+# Pinned rev: d8d9a02a28995faf7cac1f50680ec04f0113de13 (2026-06-04)
+wblidar     = { git = "https://github.com/jblindsay/whitebox_next_gen", rev = "d8d9a02a28995faf7cac1f50680ec04f0113de13", features = ["parallel"] }
+wbraster    = { git = "https://github.com/jblindsay/whitebox_next_gen", rev = "d8d9a02a28995faf7cac1f50680ec04f0113de13" }
+wbcore      = { git = "https://github.com/jblindsay/whitebox_next_gen", rev = "d8d9a02a28995faf7cac1f50680ec04f0113de13" }
+wbtools_oss = { git = "https://github.com/jblindsay/whitebox_next_gen", rev = "d8d9a02a28995faf7cac1f50680ec04f0113de13" }
+
 
 # Parallelism
 rayon = "1"

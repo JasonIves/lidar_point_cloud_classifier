@@ -3,11 +3,12 @@
 pub mod block_partitioner;
 pub mod feature_extractor;
 pub mod labeled_pipeline;
+pub mod lite_point;
 pub mod normalizer;
-pub mod outlier_filter;
 pub mod pipeline;
 pub mod spatial_index;
 
+pub use lite_point::LitePoint;
 pub use pipeline::{BlockManifest, BlockMeta, BlockProcessResult, PreprocessingPipeline};
 
 /// Minimum Rayon chunk size before spawning parallel tasks pays off.
@@ -23,24 +24,27 @@ pub const FEAT_VERSION: u8 = 1;
 /// Number of scalar (non-eigenvalue) features per point.
 pub const N_SCALAR_FEATURES: usize = 7;
 
-/// Number of eigenvalue-derived features computed per search radius.
-pub const N_EIGEN_FEATURES_PER_RADIUS: usize = 5;
-
-/// Compute the total feature count for a given number of search radii.
+/// Number of eigenvalue-derived structural features per point, produced by a
+/// single whole-file `wbtools_oss::LidarEigenvalueFeaturesTool` pre-pass
+/// (Stage 30, Step 5e+5f+5g): `lambda1, lambda2, lambda3, linearity,
+/// planarity, sphericity, omnivariance, eigentropy, slope, residual`.
 ///
-/// ```text
-/// total = N_SCALAR_FEATURES + N_EIGEN_FEATURES_PER_RADIUS × n_radii
-///       =        7          +           5                 × n_radii
-/// ```
-#[inline]
-#[must_use]
-pub const fn n_features_for_radii(n_radii: usize) -> usize {
-    N_SCALAR_FEATURES + N_EIGEN_FEATURES_PER_RADIUS * n_radii
-}
+/// Prior to Stage 30 this project computed only 5 eigenvalue features
+/// locally, once per configured search radius (multi-scale). That entire
+/// concept is now architecturally meaningless: the pre-pass tool yields
+/// exactly one 10-value row per point with no "radius" dimension, so
+/// eigenvalue features are always a fixed-width block regardless of how
+/// many `--search-radii` a user might have once configured.
+pub const N_EIGEN_FEATURES: usize = 10;
 
-/// Legacy alias: single-radius feature count (12).
-/// Retained for backward compatibility with single-scale code paths.
-pub const N_FEATURES: usize = n_features_for_radii(1); // = 12
+/// Total feature count per point: `N_SCALAR_FEATURES + N_EIGEN_FEATURES`.
+///
+/// Fixed-width as of Stage 30 (Step 5e+5f+5g) — there is no longer a
+/// variable "N radii" dimension. This is a **breaking change** to the
+/// `.feat` binary format (previously `7 + 5×n_radii`, commonly 12 for the
+/// single-radius default); all previously-generated `.feat` files and
+/// trained models must be regenerated/retrained.
+pub const N_FEATURES: usize = N_SCALAR_FEATURES + N_EIGEN_FEATURES; // = 17
 
 /// High-water mark for the in-flight block accumulator (bytes).
 /// When total buffered point data exceeds this threshold, the largest cells
@@ -119,20 +123,17 @@ pub struct PreprocessConfig {
     /// Minimum point density (pts/m²) required to retain a block.
     pub min_density: f64,
 
-    /// Base radius for k-NN eigenvalue neighbourhood queries (single-scale shorthand).
-    /// If `search_radii` is non-empty this field is ignored.
+    /// Neighbourhood radius (projection units) passed to the whole-file
+    /// `wbtools_oss::LidarEigenvalueFeaturesTool` pre-pass invocation.
+    ///
+    /// As of Stage 30 (Step 5e+5f+5g), eigenvalue features are always
+    /// computed by a single whole-file pre-pass with exactly one radius —
+    /// there is no longer a multi-scale (`search_radii: Vec<f64>`) mode.
     pub search_radius: f64,
 
-    /// Explicit list of eigenvalue search radii for multi-scale feature extraction.
-    /// When non-empty, overrides `search_radius`.  Radii are sorted ascending
-    /// by `search_radii_effective()` before use.
-    /// When empty, `[search_radius]` is used (single-scale, backward-compatible).
-    pub search_radii: Vec<f64>,
-
-    /// Minimum neighbour count required; in single-scale mode the radius expands
-    /// adaptively up to `search_radius × 4` if this is not satisfied.
-    /// In multi-scale mode a fixed radius is used per scale and this threshold
-    /// only governs the minimum for a valid covariance matrix (3 points).
+    /// Retained for potential future use; no longer consumed by eigenvalue
+    /// feature extraction (Stage 30, Step 5e+5f+5g — the pre-pass table has
+    /// no "minimum neighbours" concept of its own). Harmless as dead config.
     pub min_neighbors: usize,
 
     /// Optional path to a DTM raster for Height Above Ground computation.
@@ -188,7 +189,28 @@ pub struct PreprocessConfig {
     ///
     /// See `docs/stages/stage-29-jitter-oversampling.md`.
     pub oversample_jitter: f64,
+
+    // ── Eigenvalue-feature pre-pass memory gating (Stage 30, Step 5) ───────
+    /// Memory budget (bytes) used to decide whether the whole-file
+    /// `wbtools_oss::LidarEigenvalueFeaturesTool` pre-pass can be run in a
+    /// single whole-file invocation, or must instead be run over
+    /// memory-gated spatial splits.
+    ///
+    /// The decision is made by comparing this budget against
+    /// `header_point_count * size_of::<wblidar::PointRecord>()` — an
+    /// estimate of how much memory the *tool's own* whole-cloud
+    /// point-record buffer would require, not this project's own
+    /// (potentially slimmer) in-pipeline point representation. See
+    /// `docs/stages/stage-30-whitebox-git-dependency-integration.md`,
+    /// "Approved Design" §2 and §6.
+    ///
+    /// Default: 2 GiB (`2 * 1024 * 1024 * 1024` bytes). Overridable via
+    /// `--eigen-memory-budget-mb <usize>`.
+    pub eigen_memory_budget_bytes: usize,
 }
+
+/// Default eigenvalue-feature pre-pass memory budget: 2 GiB.
+pub const DEFAULT_EIGEN_MEMORY_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 impl Default for PreprocessConfig {
     fn default() -> Self {
@@ -199,8 +221,8 @@ impl Default for PreprocessConfig {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
-            search_radii: Vec::new(),
             min_neighbors: 8,
+
             hag_model: None,
             threads: None,
             debug_csv: false,
@@ -210,24 +232,8 @@ impl Default for PreprocessConfig {
             outlier_use_median: false,
             block_overlap: 0.0,
             oversample_jitter: 0.0,
+            eigen_memory_budget_bytes: DEFAULT_EIGEN_MEMORY_BUDGET_BYTES,
         }
-    }
-}
-
-impl PreprocessConfig {
-    /// Return the effective list of eigenvalue search radii, sorted ascending.
-    ///
-    /// If `search_radii` is non-empty, uses that list (multi-scale mode).
-    /// Otherwise falls back to `[search_radius]` (single-scale, backward-compatible).
-    #[must_use]
-    pub fn search_radii_effective(&self) -> Vec<f64> {
-        let mut radii = if self.search_radii.is_empty() {
-            vec![self.search_radius]
-        } else {
-            self.search_radii.clone()
-        };
-        radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        radii
     }
 }
 

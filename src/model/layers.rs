@@ -463,6 +463,11 @@ mod tests {
     }
 
     // DoD #6 — ReLU
+    // `relu` computes exact `max(0.0, x)`, so the output values here are
+    // bit-identical to the literal constants below (no accumulated
+    // floating-point error) — a strict `==` comparison is intentional and
+    // safe here, unlike the general case `clippy::float_cmp` warns about.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_relu_zeros_negatives() {
         let x =
@@ -535,7 +540,7 @@ mod tests {
         Ok(())
     }
 
-    /// Construct a TNet with zero weights (and no BN) for a given k.
+    /// Construct a `TNet` with zero weights (and no BN) for a given k.
     fn make_tnet_zeros(k: usize) -> Result<TNet> {
         Ok(TNet {
             k,

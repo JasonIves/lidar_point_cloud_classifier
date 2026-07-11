@@ -19,10 +19,15 @@
 //! being exact clones of their source point. `jitter_sigma == 0.0` (the
 //! default) preserves bit-identical pre-Stage-29 behaviour. See
 //! `docs/stages/stage-29-jitter-oversampling.md`.
+//!
+//! **Stage 31**: operates on the lean, project-local [`LitePoint`] rather
+//! than `wblidar::PointRecord` — see `docs/stages/stage-31-lean-point-record.md`.
 
 use rand::prelude::*;
 use rand::SeedableRng;
-use wblidar::PointRecord;
+use wbraster::{NodataPolicy, ResampleMethod};
+
+use crate::preprocessing::lite_point::LitePoint;
 
 /// Resample `pts` to exactly `target` points.
 ///
@@ -36,17 +41,17 @@ use wblidar::PointRecord;
 /// See `docs/stages/stage-29-jitter-oversampling.md`.
 ///
 /// Returns `(sampled_points, sampled_indices, oversampled)` where:
-/// - `sampled_points` are the resampled `PointRecord` values,
+/// - `sampled_points` are the resampled `LitePoint` values,
 /// - `sampled_indices` are the 0-based indices into `pts` for each output point
 ///   (padded oversample entries repeat indices from the original range),
 /// - `oversampled` is `true` when padding with replacement was applied.
 #[must_use]
 pub fn resample_block(
-    pts: &[PointRecord],
+    pts: &[LitePoint],
     target: usize,
     seed: u64,
     jitter_sigma: f64,
-) -> (Vec<PointRecord>, Vec<usize>, bool) {
+) -> (Vec<LitePoint>, Vec<usize>, bool) {
     if pts.is_empty() || target == 0 {
         return (Vec::new(), Vec::new(), false);
     }
@@ -65,7 +70,7 @@ pub fn resample_block(
         (sampled, chosen.to_vec(), false)
     } else {
         // Start with all original points, then pad with replacement.
-        let mut sampled: Vec<PointRecord> = pts.to_vec();
+        let mut sampled: Vec<LitePoint> = pts.to_vec();
         let mut sampled_indices: Vec<usize> = (0..pts.len()).collect();
         let extra = target - pts.len();
         for _ in 0..extra {
@@ -122,7 +127,7 @@ fn jitter_offset(rng: &mut impl Rng, sigma: f64) -> f64 {
 /// # Panics
 /// Panics if `pts.len() != hag_values.len()`.
 pub fn normalise_scalar_features(
-    pts: &[PointRecord],
+    pts: &[LitePoint],
     origin_x: f64,
     origin_y: f64,
     block_size: f64,
@@ -193,7 +198,7 @@ pub fn normalise_scalar_features(
 /// Falls back to proxy for any point that falls outside the raster extent or
 /// lands on a nodata cell.
 #[must_use]
-pub fn compute_hag(pts: &[PointRecord], dtm: Option<&DtmView>) -> Vec<f64> {
+pub fn compute_hag(pts: &[LitePoint], dtm: Option<&DtmView>) -> Vec<f64> {
     let z_min = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
 
     pts.iter()
@@ -208,103 +213,56 @@ pub fn compute_hag(pts: &[PointRecord], dtm: Option<&DtmView>) -> Vec<f64> {
 
 // ── DTM view ──────────────────────────────────────────────────────────────────
 
-/// Lightweight read-only view of a DTM raster, extracted from `wbraster::Raster`
-/// before entering parallel processing so it can be shared via `Arc`.
+/// Lightweight read-only view of a DTM raster, wrapping an owned
+/// `wbraster::Raster` so it can be shared across Rayon worker threads via
+/// `Arc<DtmView>` and sampled with `wbraster`'s own bilinear interpolation.
 ///
-/// Stores the flattened band-0 data as `Vec<f64>` (top-down row order) and the
-/// spatial transform needed to convert (x, y) → (row, col).
+/// **Stage 30 Step 4 (adopted):** ground-elevation sampling now delegates to
+/// [`wbraster::Raster::sample_world`] (band 0, `ResampleMethod::Bilinear`,
+/// `NodataPolicy::Strict`) instead of a hand-rolled interpolator. See the
+/// doc comment on [`DtmView::bilinear_interp`] for the coordinate-convention
+/// change this entails.
 #[derive(Debug, Clone)]
 pub struct DtmView {
-    data: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    nodata: f64,
-    x_min: f64,
-    y_max: f64,
-    cell_size_x: f64,
-    cell_size_y: f64,
+    raster: wbraster::Raster,
 }
 
 impl DtmView {
     /// Construct a `DtmView` from a loaded `wbraster::Raster`.
     #[must_use]
     pub fn from_raster(r: &wbraster::Raster) -> Self {
-        Self {
-            data: r.band_to_vec_f64(0),
-            rows: r.rows,
-            cols: r.cols,
-            nodata: r.nodata,
-            x_min: r.x_min,
-            // `wbraster::Raster` stores y_min (south edge); top = y_min + rows * cell_size_y
-            // `as f64` cast for raster geometry is lossless for any realistic
-            // row count (usize fits in f64 without precision loss up to 2^53).
-            #[allow(clippy::cast_precision_loss)]
-            y_max: r.y_min + r.rows as f64 * r.cell_size_y,
-            cell_size_x: r.cell_size_x,
-            cell_size_y: r.cell_size_y,
-        }
+        Self { raster: r.clone() }
     }
 
-    /// Bilinear interpolation at world coordinate (x, y).
+    /// Sample the DTM (band 0) at world coordinate (x, y) using
+    /// `wbraster::Raster::sample_world` with bilinear resampling and strict
+    /// nodata handling (requires all four surrounding cells to be valid).
     ///
-    /// Returns `None` if the coordinate is outside the raster extent or all
-    /// four surrounding cells are nodata.
+    /// Returns `None` if the coordinate is outside the raster extent or any
+    /// of the four surrounding cells is nodata.
+    ///
+    /// # Stage 30 Step 4 — adopted, convention change documented
+    ///
+    /// Prior to Stage 30, this method used a **corner-registered** pixel
+    /// convention (`col_f = (x - x_min) / cell_size_x`, no `-0.5` offset —
+    /// cell `(0,0)`'s value anchored at the raster's south-west corner).
+    ///
+    /// `wbraster::Raster::sample_world()` uses the GDAL-standard
+    /// **pixel-center** convention instead (`col_f = (x - x_min) /
+    /// cell_size_x - 0.5` — cell `(0,0)`'s value anchored at the center of
+    /// that cell). Adopting `sample_world` therefore introduces a genuine,
+    /// deliberate **~half-pixel spatial offset** in HAG (height-above-ground)
+    /// sampling versus the pre-Stage-30 behaviour.
+    ///
+    /// This is accepted as part of Stage 30's broader breaking-change scope
+    /// (alongside the Step 5 eigenvalue-feature migration): no permanently
+    /// trained model exists yet, so retraining absorbs this shift. Any model
+    /// trained against pre-Stage-30 `.feat` files should be retrained after
+    /// this change lands.
     #[must_use]
     pub fn bilinear_interp(&self, x: f64, y: f64) -> Option<f64> {
-        // Convert to fractional pixel coordinates (row 0 = north edge).
-        let col_f = (x - self.x_min) / self.cell_size_x;
-        let row_f = (self.y_max - y) / self.cell_size_y;
-
-        // isize casts: col_f.floor() returns a finite value; the raster is
-        // bounded to realistic extents so truncation to isize is safe.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let col0 = col_f.floor() as isize;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let row0 = row_f.floor() as isize;
-        let col1 = col0 + 1;
-        let row1 = row0 + 1;
-
-        // `as f64` casts for integer raster indices are lossless.
-        #[allow(clippy::cast_precision_loss)]
-        let tx = col_f - col0 as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let ty = row_f - row0 as f64;
-
-        let v00 = self.get(row0, col0)?;
-        let v10 = self.get(row0, col1)?;
-        let v01 = self.get(row1, col0)?;
-        let v11 = self.get(row1, col1)?;
-
-        Some(
-            v00 * (1.0 - tx) * (1.0 - ty)
-                + v10 * tx * (1.0 - ty)
-                + v01 * (1.0 - tx) * ty
-                + v11 * tx * ty,
-        )
-    }
-
-    #[inline]
-    fn get(&self, row: isize, col: isize) -> Option<f64> {
-        if row < 0 || col < 0 || row >= self.rows as isize || col >= self.cols as isize {
-            return None;
-        }
-        // isize-checked bounds: both indices are verified positive above.
-        #[allow(clippy::cast_sign_loss)]
-        let v = self.data[row as usize * self.cols + col as usize];
-        if self.is_nodata(v) {
-            None
-        } else {
-            Some(v)
-        }
-    }
-
-    #[inline]
-    fn is_nodata(&self, v: f64) -> bool {
-        if self.nodata.is_nan() {
-            v.is_nan()
-        } else {
-            (v - self.nodata).abs() < 1e-9
-        }
+        self.raster
+            .sample_world(0, x, y, ResampleMethod::Bilinear, NodataPolicy::Strict)
     }
 }
 
@@ -339,21 +297,22 @@ fn percentile_99(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
-    fn make_pt(x: f64, y: f64, z: f64, intensity: u16, ret: u8, nrets: u8) -> PointRecord {
-        let mut pt = PointRecord::default();
-        pt.x = x;
-        pt.y = y;
-        pt.z = z;
-        pt.intensity = intensity;
-        pt.return_number = ret;
-        pt.number_of_returns = nrets;
-        pt
+    fn make_pt(x: f64, y: f64, z: f64, intensity: u16, ret: u8, nrets: u8) -> LitePoint {
+        LitePoint {
+            x,
+            y,
+            z,
+            intensity,
+            return_number: ret,
+            number_of_returns: nrets,
+            ..LitePoint::default()
+        }
     }
 
     #[test]
     fn test_resample_subsamples_correctly() {
-        let pts: Vec<PointRecord> = (0..100)
-            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+        let pts: Vec<LitePoint> = (0..100)
+            .map(|i| make_pt(f64::from(i), 0.0, 0.0, 0, 1, 1))
             .collect();
         let (sampled, _indices, over) = resample_block(&pts, 50, 42, 0.0);
         assert_eq!(sampled.len(), 50);
@@ -362,8 +321,8 @@ mod tests {
 
     #[test]
     fn test_resample_oversamples_to_target() {
-        let pts: Vec<PointRecord> = (0..10)
-            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+        let pts: Vec<LitePoint> = (0..10)
+            .map(|i| make_pt(f64::from(i), 0.0, 0.0, 0, 1, 1))
             .collect();
         let (sampled, _indices, over) = resample_block(&pts, 50, 42, 0.0);
         assert_eq!(sampled.len(), 50);
@@ -372,8 +331,8 @@ mod tests {
 
     #[test]
     fn test_resample_exact_count_no_oversample() {
-        let pts: Vec<PointRecord> = (0..1024)
-            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+        let pts: Vec<LitePoint> = (0..1024)
+            .map(|i| make_pt(f64::from(i), 0.0, 0.0, 0, 1, 1))
             .collect();
         let (sampled, _indices, over) = resample_block(&pts, 1024, 0, 0.0);
         assert_eq!(sampled.len(), 1024);
@@ -382,8 +341,8 @@ mod tests {
 
     #[test]
     fn test_resample_is_reproducible() {
-        let pts: Vec<PointRecord> = (0..200)
-            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+        let pts: Vec<LitePoint> = (0..200)
+            .map(|i| make_pt(f64::from(i), 0.0, 0.0, 0, 1, 1))
             .collect();
         let (s1, _, _) = resample_block(&pts, 100, 99, 0.0);
         let (s2, _, _) = resample_block(&pts, 100, 99, 0.0);
@@ -405,7 +364,7 @@ mod tests {
         let hag = vec![0.0, 5.0, 10.0];
         let feats = normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag);
         for f in &feats {
-            for &v in f.iter() {
+            for &v in f {
                 assert!((0.0..=1.0).contains(&v), "feature out of [0,1]: {v}");
             }
         }
@@ -414,11 +373,20 @@ mod tests {
     // ── Stage 29: jitter-based oversampling ────────────────────────────────
 
     /// `jitter_sigma == 0.0` must produce bit-identical output to the
-    /// pre-Stage-29 exact-duplicate behaviour (DoD #5).
+    /// pre-Stage-29 exact-duplicate behaviour (`DoD` #5).
     #[test]
     fn test_jitter_zero_is_bit_identical_to_no_jitter() {
-        let pts: Vec<PointRecord> = (0..10)
-            .map(|i| make_pt(i as f64, i as f64 * 2.0, i as f64 * 0.5, 100, 1, 1))
+        let pts: Vec<LitePoint> = (0..10)
+            .map(|i| {
+                make_pt(
+                    f64::from(i),
+                    f64::from(i) * 2.0,
+                    f64::from(i) * 0.5,
+                    100,
+                    1,
+                    1,
+                )
+            })
             .collect();
         let (s_no_jitter, idx_no_jitter, over1) = resample_block(&pts, 50, 7, 0.0);
         let (s_zero_sigma, idx_zero_sigma, over2) = resample_block(&pts, 50, 7, 0.0);
@@ -432,12 +400,12 @@ mod tests {
     }
 
     /// With `jitter_sigma > 0.0`, padding-only points must differ in
-    /// coordinates from their source point (DoD #6), while the original
+    /// coordinates from their source point (`DoD` #6), while the original
     /// (non-padded) points remain untouched.
     #[test]
     fn test_jitter_perturbs_padding_points_only() {
-        let pts: Vec<PointRecord> = (0..5)
-            .map(|i| make_pt(i as f64 * 10.0, i as f64 * 10.0, 0.0, 100, 1, 1))
+        let pts: Vec<LitePoint> = (0..5)
+            .map(|i| make_pt(f64::from(i) * 10.0, f64::from(i) * 10.0, 0.0, 100, 1, 1))
             .collect();
         let (sampled, indices, over) = resample_block(&pts, 20, 123, 1.0);
         assert!(over);
@@ -467,7 +435,7 @@ mod tests {
         );
     }
 
-    /// Jitter offsets must be clipped to ±3σ (DoD #7).
+    /// Jitter offsets must be clipped to ±3σ (`DoD` #7).
     #[test]
     fn test_jitter_offset_clipped_to_three_sigma() {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
@@ -481,11 +449,11 @@ mod tests {
         }
     }
 
-    /// Jitter must be fully reproducible given the same seed (DoD #8).
+    /// Jitter must be fully reproducible given the same seed (`DoD` #8).
     #[test]
     fn test_jitter_is_reproducible() {
-        let pts: Vec<PointRecord> = (0..5)
-            .map(|i| make_pt(i as f64, 0.0, 0.0, 0, 1, 1))
+        let pts: Vec<LitePoint> = (0..5)
+            .map(|i| make_pt(f64::from(i), 0.0, 0.0, 0, 1, 1))
             .collect();
         let (s1, _, _) = resample_block(&pts, 30, 55, 0.25);
         let (s2, _, _) = resample_block(&pts, 30, 55, 0.25);
@@ -497,6 +465,10 @@ mod tests {
     }
 
     /// `jitter_offset` returns exactly `0.0` for non-positive sigma.
+    // jitter_offset takes an early-return path for sigma <= 0.0, returning
+    // the literal 0.0 with no floating-point computation; exact equality is
+    // therefore deterministic and safe to assert here.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_jitter_offset_zero_for_nonpositive_sigma() {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(2);

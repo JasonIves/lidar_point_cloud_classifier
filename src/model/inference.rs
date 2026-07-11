@@ -23,7 +23,7 @@ use crate::error::{ClassifierError, Result};
 use crate::model::pointnet::PointNetClassifier;
 use crate::preprocessing::{
     validate_block_filename, BlockManifest, BlockMeta, FEAT_MAGIC, FEAT_VERSION,
-    MAX_FEAT_PAYLOAD_BYTES, N_EIGEN_FEATURES_PER_RADIUS, N_SCALAR_FEATURES, RAYON_MIN_CHUNK,
+    MAX_FEAT_PAYLOAD_BYTES, N_FEATURES, RAYON_MIN_CHUNK,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,17 +119,13 @@ fn read_feat_header<R: Read>(r: &mut R, path_hint: &str) -> Result<FeatHeader> {
     let origin_x = read_f64_le(r)?;
     let origin_y = read_f64_le(r)?;
 
-    // Multi-scale-aware validation (Stage 06): n_features must be
-    // N_SCALAR_FEATURES + N_EIGEN_FEATURES_PER_RADIUS × n_radii, where n_radii ≥ 1.
-    // This accepts both the legacy 12-feature single-scale format and any
-    // multi-scale format produced by Stage 06.
-    if n_features < N_SCALAR_FEATURES
-        || (n_features - N_SCALAR_FEATURES) % N_EIGEN_FEATURES_PER_RADIUS != 0
-        || (n_features - N_SCALAR_FEATURES) / N_EIGEN_FEATURES_PER_RADIUS == 0
-    {
+    // Fixed-width validation (Stage 30, Step 5e+5f+5g): n_features must equal
+    // the fixed N_FEATURES constant (7 scalar + 10 pre-pass eigenvalue features).
+    // The prior multi-scale (7 + 5×N) format no longer exists.
+    if n_features != N_FEATURES {
         return Err(ClassifierError::Pipeline(format!(
-            "{path_hint}: n_features={n_features} is not a valid multi-scale feature count \
-             (expected {N_SCALAR_FEATURES} + {N_EIGEN_FEATURES_PER_RADIUS}×N for N≥1)"
+            "{path_hint}: n_features={n_features} does not match expected fixed-width \
+             feature count N_FEATURES={N_FEATURES}"
         )));
     }
 

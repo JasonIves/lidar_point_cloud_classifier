@@ -261,8 +261,18 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
+ "bincode_derive",
  "serde",
  "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
 ]
 
 [[package]]
@@ -779,6 +789,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "wasm-bindgen",
+ "windows-link",
 ]
 
 [[package]]
@@ -1563,6 +1586,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "erased-serde"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2add8a07dd6a8d93ff627029c51de145e12686fbc36ecb298ac22e74cf02dec"
+dependencies = [
+ "serde",
+ "serde_core",
+ "typeid",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1571,6 +1605,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "evalexpr"
+version = "13.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25929004897f2bbab309121a60400d36992f6d911d09baa6c172f6cc55706601"
 
 [[package]]
 name = "event-listener"
@@ -1665,6 +1705,16 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flatbuffers"
+version = "24.12.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f1baf0dbf96932ec9a3038d57900329c015b0bfb7b63d904f3bc27e2b02a096"
+dependencies = [
+ "bitflags 1.3.2",
+ "rustc_version",
+]
 
 [[package]]
 name = "flate2"
@@ -2480,6 +2530,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "iana-time-zone"
+version = "0.1.65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
+dependencies = [
+ "android_system_properties",
+ "core-foundation-sys",
+ "iana-time-zone-haiku",
+ "js-sys",
+ "log",
+ "wasm-bindgen",
+ "windows-core 0.57.0",
+]
+
+[[package]]
+name = "iana-time-zone-haiku"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2686,6 +2760,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
@@ -3083,8 +3166,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "wbcore",
  "wblidar",
  "wbraster",
+ "wbtools_oss",
  "wgpu",
 ]
 
@@ -3327,6 +3412,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
+ "serde",
  "simba",
  "typenum",
 ]
@@ -3353,6 +3439,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "rawpointer",
+ "serde",
 ]
 
 [[package]]
@@ -3622,6 +3709,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "ordered-float"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3810,6 +3906,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "primal-check"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
+dependencies = [
+ "num-integer",
 ]
 
 [[package]]
@@ -4270,6 +4375,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
 name = "rstest"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4326,6 +4437,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustfft"
+version = "6.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21db5f9893e91f41798c88680037dba611ca6674703c1a18601b01a72c8adb89"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "primal-check",
+ "strength_reduce",
+ "transpose",
 ]
 
 [[package]]
@@ -4684,6 +4809,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "smartcore"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95448e4a8d52c5fb6a738005deaa11e16cd963d85406610673fde23d80653240"
+dependencies = [
+ "approx",
+ "cfg-if",
+ "num",
+ "num-traits",
+ "ordered-float",
+ "rand 0.8.6",
+ "serde",
+ "typetag",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4713,6 +4854,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "strength_reduce"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
 name = "strsim"
@@ -5150,6 +5297,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "transpose"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
+dependencies = [
+ "num-integer",
+ "strength_reduce",
+]
+
+[[package]]
 name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5162,10 +5319,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "typetag"
+version = "0.2.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a897b12c6c1151ad0b138b8db50252dc301f93bc3b027db05eec82aeed298c"
+dependencies = [
+ "erased-serde",
+ "inventory",
+ "once_cell",
+ "serde",
+ "typetag-impl",
+]
+
+[[package]]
+name = "typetag-impl"
+version = "0.2.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf808357c6ed7e13ba0f3277ec8d8f21b2d501274895104263985330c726c1c5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "ug"
@@ -5328,6 +5515,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5451,8 +5644,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wbcore"
+version = "0.1.1"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "wbgeotiff"
 version = "0.1.2"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
 dependencies = [
  "flate2",
  "jpeg-decoder",
@@ -5471,6 +5675,7 @@ dependencies = [
 [[package]]
 name = "wbhdf"
 version = "0.1.0"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
 dependencies = [
  "byteorder",
  "flate2",
@@ -5481,6 +5686,7 @@ dependencies = [
 [[package]]
 name = "wblidar"
 version = "0.1.2"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
 dependencies = [
  "rayon",
  "wbhdf",
@@ -5491,6 +5697,7 @@ dependencies = [
 [[package]]
 name = "wbprojection"
 version = "0.3.0"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
 dependencies = [
  "thiserror 1.0.69",
  "wide 1.5.0",
@@ -5499,6 +5706,7 @@ dependencies = [
 [[package]]
 name = "wbraster"
 version = "0.2.0"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
 dependencies = [
  "flate2",
  "jpeg-decoder",
@@ -5516,6 +5724,71 @@ dependencies = [
  "wbprojection",
  "wide 1.5.0",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "wbspatialstats"
+version = "0.1.0"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
+dependencies = [
+ "log",
+ "nalgebra",
+ "ndarray 0.15.6",
+ "rand 0.8.6",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "wbtools_oss"
+version = "0.1.1"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
+dependencies = [
+ "bincode",
+ "chrono",
+ "evalexpr",
+ "image",
+ "kdtree",
+ "nalgebra",
+ "rand 0.10.1",
+ "rayon",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "smartcore",
+ "time",
+ "ureq",
+ "wbcore",
+ "wbgeotiff",
+ "wblidar",
+ "wbprojection",
+ "wbraster",
+ "wbspatialstats",
+ "wbtopology",
+ "wbvector",
+ "wide 1.5.0",
+]
+
+[[package]]
+name = "wbtopology"
+version = "0.2.0"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
+dependencies = [
+ "rayon",
+ "robust",
+ "wbvector",
+]
+
+[[package]]
+name = "wbvector"
+version = "0.1.4"
+source = "git+https://github.com/jblindsay/whitebox_next_gen?rev=d8d9a02a28995faf7cac1f50680ec04f0113de13#d8d9a02a28995faf7cac1f50680ec04f0113de13"
+dependencies = [
+ "flatbuffers",
+ "thiserror 1.0.69",
+ "wbprojection",
 ]
 
 [[package]]

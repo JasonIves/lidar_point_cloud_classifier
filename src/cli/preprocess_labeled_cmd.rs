@@ -21,7 +21,6 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut target_points: usize = 1024;
     let mut min_density: f64 = 1.0;
     let mut search_radius: f64 = 1.0;
-    let mut search_radii: Vec<f64> = Vec::new();
     let mut min_neighbors: usize = 8;
     let mut hag_model: Option<PathBuf> = None;
     let mut label_map_path: Option<PathBuf> = None;
@@ -34,6 +33,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut outlier_use_median: bool = false;
     let mut block_overlap: f64 = 0.0;
     let mut oversample_jitter: f64 = 0.0;
+    let mut eigen_memory_budget_bytes: usize =
+        crate::preprocessing::DEFAULT_EIGEN_MEMORY_BUDGET_BYTES;
 
     let mut i = 0;
     while i < args.len() {
@@ -61,12 +62,6 @@ pub fn run(args: &[String]) -> Result<()> {
                 search_radius = parse_f64(
                     next_value(args, &mut i, "--search-radius")?,
                     "--search-radius",
-                )?;
-            }
-            "--search-radii" => {
-                search_radii = parse_radii(
-                    next_value(args, &mut i, "--search-radii")?,
-                    "--search-radii",
                 )?;
             }
             "--min-neighbors" => {
@@ -122,6 +117,13 @@ pub fn run(args: &[String]) -> Result<()> {
                     next_value(args, &mut i, "--oversample-jitter")?,
                     "--oversample-jitter",
                 )?;
+            }
+            "--eigen-memory-budget-mb" => {
+                let mb = parse_usize(
+                    next_value(args, &mut i, "--eigen-memory-budget-mb")?,
+                    "--eigen-memory-budget-mb",
+                )?;
+                eigen_memory_budget_bytes = mb.saturating_mul(1024 * 1024);
             }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
@@ -198,8 +200,14 @@ pub fn run(args: &[String]) -> Result<()> {
             "--oversample-jitter must be >= 0.0 and finite".to_string(),
         ));
     }
+    if eigen_memory_budget_bytes == 0 {
+        return Err(ClassifierError::Pipeline(
+            "--eigen-memory-budget-mb must be >= 1".to_string(),
+        ));
+    }
 
     // Load label map from JSON file, or use default.
+
     let label_map: HashMap<u8, u8> = if let Some(ref p) = label_map_path {
         let f = std::fs::File::open(p)?;
         let raw: HashMap<String, u8> = serde_json::from_reader(f)
@@ -218,7 +226,6 @@ pub fn run(args: &[String]) -> Result<()> {
         target_points,
         min_density,
         search_radius,
-        search_radii,
         min_neighbors,
         hag_model,
         threads,
@@ -229,6 +236,7 @@ pub fn run(args: &[String]) -> Result<()> {
         outlier_use_median,
         block_overlap,
         oversample_jitter,
+        eigen_memory_budget_bytes,
     };
 
     let config = LabeledPreprocessConfig {
@@ -254,8 +262,6 @@ fn print_usage() {
            --target-points <usize>  Points per block after sampling (default: 1024)\n\
            --min-density   <f64>    Minimum pts/m² (default: 1.0)\n\
            --search-radius <f64>    Base eigenvalue query radius (default: 1.0)\n\
-           --search-radii  <f64,..> Comma-separated radii for multi-scale features\n\
-                                    (overrides --search-radius when provided)\n\
            --min-neighbors <usize>  Min neighbours for adaptive radius (default: 8)\n\
            --hag-model     <path>   DTM raster for Height Above Ground\n\
            --label-map     <path>   JSON ASPRS→class-index remapping\n\
@@ -276,7 +282,11 @@ fn print_usage() {
            --outlier-removal           Enable outlier removal pre-pass (whole-file)\n\
            --outlier-radius  <f64>     Neighbourhood radius for residual calc (default: 2.0)\n\
            --outlier-elev-diff <f64>   Residual threshold; exceeding removes point (default: 50.0)\n\
-           --outlier-use-median        Use neighbourhood median instead of mean"
+           --outlier-use-median        Use neighbourhood median instead of mean\n\
+         \n\
+         Eigenvalue-feature pre-pass memory budget:\n\
+           --eigen-memory-budget-mb <usize>  Memory budget (MB) gating whole-file vs.\n\
+                                       memory-gated split eigenvalue pre-pass (default: 2048)"
     );
 }
 
@@ -324,16 +334,6 @@ fn parse_f64(s: &str, flag: &str) -> Result<f64> {
 fn parse_usize(s: &str, flag: &str) -> Result<usize> {
     s.parse()
         .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid usize '{s}'")))
-}
-
-fn parse_radii(s: &str, flag: &str) -> Result<Vec<f64>> {
-    s.split(',')
-        .map(|v| {
-            let v = v.trim();
-            v.parse::<f64>()
-                .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid radius '{v}'")))
-        })
-        .collect()
 }
 
 #[cfg(test)]

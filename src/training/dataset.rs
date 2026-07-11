@@ -22,8 +22,7 @@ use ndarray::Array2;
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
 use crate::preprocessing::{
-    n_features_for_radii, validate_block_filename, FEAT_MAGIC, FEAT_VERSION,
-    MAX_FEAT_PAYLOAD_BYTES, N_EIGEN_FEATURES_PER_RADIUS, N_FEATURES, N_SCALAR_FEATURES,
+    validate_block_filename, FEAT_MAGIC, FEAT_VERSION, MAX_FEAT_PAYLOAD_BYTES, N_FEATURES,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,8 +153,8 @@ pub struct LabeledBlockDataset {
     dirs: Vec<DirEntry>,
     /// Validated common class count across all directories.
     n_classes_inner: usize,
-    /// Feature count derived from manifest `search_radii`.
-    /// 12 for single-radius (backward-compatible), 7+5×N for N radii.
+    /// Fixed feature count (Stage 30, Step 5e+5f+5g): `N_FEATURES` (17),
+    /// derived from a single whole-file eigenvalue pre-pass.
     n_features_inner: usize,
     pub train_ids: Vec<u64>,
     pub val_ids: Vec<u64>,
@@ -302,33 +301,11 @@ impl LabeledBlockDataset {
 
         let n_classes_inner = validated_n_classes.unwrap_or(8);
 
-        // Derive n_features from the first manifest's search_radii.
-        // Empty search_radii = single-scale = N_FEATURES (12) for backward compat.
-        let n_features_inner = {
-            let radii = &dirs[0].manifest.search_radii;
-            if radii.is_empty() {
-                N_FEATURES
-            } else {
-                n_features_for_radii(radii.len())
-            }
-        };
-
-        // Validate that all directories agree on n_features_inner.
-        for (idx, entry) in dirs.iter().enumerate().skip(1) {
-            let nf = if entry.manifest.search_radii.is_empty() {
-                N_FEATURES
-            } else {
-                n_features_for_radii(entry.manifest.search_radii.len())
-            };
-            if nf != n_features_inner {
-                return Err(ClassifierError::Pipeline(format!(
-                    "n_features mismatch: directory 0 has {n_features_inner} features \
-                     but directory {idx} ('{}') has {nf} features. \
-                     Re-preprocess all directories with the same --search-radii.",
-                    entry.path.display()
-                )));
-            }
-        }
+        // Fixed-width feature count (Stage 30, Step 5e+5f+5g): every manifest
+        // produced by the whole-file eigenvalue pre-pass has exactly
+        // N_FEATURES columns per point. There is no more per-directory
+        // variability to validate.
+        let n_features_inner = N_FEATURES;
 
         // Build train/val split.  If an explicit override is supplied, apply it
         // to all directories; warn if multiple dirs are in use since the raw
@@ -418,7 +395,7 @@ impl LabeledBlockDataset {
         self.n_classes_inner
     }
 
-    /// Return the feature count per point (`7 + 5 × n_radii`).
+    /// Return the fixed feature count per point (`N_FEATURES` = 17).
     #[must_use]
     pub fn n_features(&self) -> usize {
         self.n_features_inner
@@ -642,12 +619,12 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
             "feat: unsupported version {version}"
         )));
     }
-    // Accept any positive n_features (multi-scale or legacy 12).
-    if n_features == 0
-        || !matches!(n_features, f if (f - N_SCALAR_FEATURES).is_multiple_of(N_EIGEN_FEATURES_PER_RADIUS))
-    {
+    // Fixed-width validation (Stage 30, Step 5e+5f+5g): n_features must equal
+    // the fixed N_FEATURES constant (7 scalar + 10 pre-pass eigenvalue features).
+    if n_features != N_FEATURES {
         return Err(ClassifierError::Pipeline(format!(
-            "feat: n_features={n_features} is not a valid value (expected 7 + 5×N)"
+            "feat: n_features={n_features} does not match expected fixed-width \
+             feature count N_FEATURES={N_FEATURES}"
         )));
     }
 
@@ -790,6 +767,9 @@ mod tests {
         assert!(train.contains(&44));
     }
 
+    // Test-fixture index range (0..16) is nowhere near u32::MAX; truncation
+    // is not possible in practice.
+    #[allow(clippy::cast_possible_truncation)]
     #[test]
     fn test_spatial_split_fraction() {
         // 16 blocks in 16 distinct macro-tiles; val_split=0.25 → 4 val tiles
@@ -869,7 +849,10 @@ mod tests {
         let path = dir.path().join("oversized.feat");
 
         let n_points: u32 = 100_000_000;
-        let n_features: u32 = 12; // valid: 7 + 5×1
+        // N_FEATURES is a small compile-time constant (well within u32 range);
+        // truncation is not possible in practice.
+        #[allow(clippy::cast_possible_truncation)]
+        let n_features: u32 = N_FEATURES as u32; // valid fixed-width count
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FEAT_MAGIC);
         bytes.push(FEAT_VERSION);
@@ -1131,8 +1114,13 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FEAT_MAGIC);
         bytes.push(FEAT_VERSION);
-        bytes.extend_from_slice(&(n_points as u32).to_le_bytes());
-        bytes.extend_from_slice(&(n_features as u32).to_le_bytes());
+        // n_points/n_features are tiny test-fixture constants (4 and
+        // N_FEATURES), nowhere near u32::MAX — truncation is not possible.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            bytes.extend_from_slice(&(n_points as u32).to_le_bytes());
+            bytes.extend_from_slice(&(n_features as u32).to_le_bytes());
+        }
         bytes.extend_from_slice(&block_id.to_le_bytes());
         bytes.extend_from_slice(&0f64.to_le_bytes());
         bytes.extend_from_slice(&0f64.to_le_bytes());
@@ -1258,6 +1246,10 @@ mod tests {
             .collect()
     }
 
+    // Test-fixture helper: `id` is always a small deterministic index in
+    // these tests, nowhere near f64's precision limit — precision loss is
+    // not possible in practice.
+    #[allow(clippy::cast_precision_loss)]
     fn make_lbm(id: u64, macro_tile_id: u32) -> LabeledBlockMeta {
         LabeledBlockMeta {
             meta: BlockMeta {
@@ -1282,7 +1274,6 @@ mod tests {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
-            search_radii: vec![],
             min_neighbors: 8,
             crs_epsg: None,
             label_map: HM::new(),

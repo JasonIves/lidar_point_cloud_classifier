@@ -2,24 +2,37 @@
 //! 2-D grid block partitioner with memory-pressure spill/merge support.
 //!
 //! Points arriving from any number of streaming chunks are routed into a
-//! `HashMap<(i32,i32), Vec<PointRecord>>` accumulator that stays open for
-//! the entire stream duration.  No block is finalised until `finalize()` is
-//! called after EOF, so chunk-spanning blocks are handled correctly.
+//! `HashMap<(i32,i32), Vec<(u64, LitePoint)>>` accumulator that stays open
+//! for the entire stream duration.  No block is finalised until `finalize()`
+//! is called after EOF, so chunk-spanning blocks are handled correctly.
+//!
+//! Each point is paired with its **original-file point index** (0-based,
+//! matching the order points were streamed from the input LAS/LAZ/COPC file,
+//! which is also the ordering used by `wbtools_oss::LidarEigenvalueFeaturesTool`'s
+//! own `point_num` field). This index survives the full round trip through
+//! spill files so that, once loaded, a block's points can be joined against a
+//! precomputed per-point eigenvalue-feature table by index (Stage 30,
+//! point-index-join extension — a prerequisite for Step 5e).
 //!
 //! When the total in-flight buffer exceeds `SPILL_HIGH_WATER_BYTES` the
-//! largest cells are spilled to temporary `.spill` files (raw `PointRecord`
-//! bytes).  After the stream ends, `finalize()` merges each block's spill
+//! largest cells are spilled to temporary `.spill` files (raw `(u64, LitePoint)`
+//! bytes). After the stream ends, `finalize()` merges each block's spill
 //! files with any remaining in-memory data before returning complete `Block`
 //! structs.
+//!
+//! **Stage 31 note**: this module operates entirely on the lean, project-local
+//! [`LitePoint`] struct rather than `wblidar::PointRecord` — the caller
+//! (`pipeline.rs::stream_points()`) converts each point exactly once, at
+//! streaming-ingest time, before calling [`BlockPartitioner::add_point`]. See
+//! `docs/stages/stage-31-lean-point-record.md`.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use wblidar::PointRecord;
-
 use crate::error::{ClassifierError, Result};
+use crate::preprocessing::lite_point::LitePoint;
 use crate::preprocessing::SPILL_HIGH_WATER_BYTES;
 
 /// A raw (unprocessed) point data for a single 2-D grid cell.
@@ -36,7 +49,18 @@ pub struct Block {
     /// Y origin of this block (south edge).
     pub origin_y: f64,
     /// All points belonging to this block (post-merge, pre-sampling).
-    pub points: Vec<PointRecord>,
+    pub points: Vec<LitePoint>,
+    /// Original-file point index for each entry in `points` (same length,
+    /// same order — `point_indices[i]` is the 0-based index of `points[i]`
+    /// in the original input stream, matching the ordering used by
+    /// `wbtools_oss::LidarEigenvalueFeaturesTool`'s own `point_num` field).
+    ///
+    /// Added in Stage 30 (point-index-join extension) so per-block feature
+    /// extraction can look up precomputed eigenvalue rows for each point
+    /// after a round trip through spill files, without relying on point
+    /// order being preserved (which it is not, once spilling/merging or
+    /// multiple spill files per cell are involved).
+    pub point_indices: Vec<u64>,
 }
 
 /// Lightweight block descriptor returned by [`BlockPartitioner::finalize_stubs`].
@@ -66,16 +90,20 @@ impl BlockStub {
     /// file immediately after reading.
     ///
     /// This is intended to be called once per block, inside a Rayon parallel
-    /// closure, so the loaded `Vec<PointRecord>` is dropped at the end of the
+    /// closure, so the loaded `Vec<LitePoint>` is dropped at the end of the
     /// closure scope rather than accumulating across all blocks.
     ///
     /// # Errors
     /// Returns [`ClassifierError::SpillCorrupt`] if any spill file is unreadable.
     pub fn load(self) -> Result<Block> {
         let mut points = Vec::with_capacity(self.point_count);
+        let mut point_indices = Vec::with_capacity(self.point_count);
         for path in &self.spill_paths {
             let spilled = read_spill_file(path)?;
-            points.extend(spilled);
+            for (idx, pt) in spilled {
+                point_indices.push(idx);
+                points.push(pt);
+            }
             let _ = fs::remove_file(path);
         }
         Ok(Block {
@@ -85,6 +113,7 @@ impl BlockStub {
             origin_x: self.origin_x,
             origin_y: self.origin_y,
             points,
+            point_indices,
         })
     }
 
@@ -95,22 +124,27 @@ impl BlockStub {
     /// ownership of its spill files and will delete them when its own `load()`
     /// is called in the parallel closure.
     ///
+    /// Border points are context-only (never resampled or written to output),
+    /// so original-file point indices are discarded here — only `load()`
+    /// (used for a block's own canonical points) needs to retain them.
+    ///
     /// # Errors
     /// Returns [`ClassifierError::SpillCorrupt`] if any spill file is unreadable.
-    pub fn read_points(&self) -> Result<Vec<PointRecord>> {
+    pub fn read_points(&self) -> Result<Vec<LitePoint>> {
         let mut points = Vec::with_capacity(self.point_count);
         for path in &self.spill_paths {
             let spilled = read_spill_file(path)?;
-            points.extend(spilled);
+            points.extend(spilled.into_iter().map(|(_, pt)| pt));
         }
         Ok(points)
     }
 }
 
-/// Accumulates `PointRecord`s into 2-D grid cells with an optional spill path.
+/// Accumulates `LitePoint`s into 2-D grid cells with an optional spill path.
 pub struct BlockPartitioner {
-    /// In-memory per-cell accumulators.
-    cells: HashMap<(i32, i32), Vec<PointRecord>>,
+    /// In-memory per-cell accumulators. Each entry pairs a point with its
+    /// original-file index (see `Block::point_indices` doc for rationale).
+    cells: HashMap<(i32, i32), Vec<(u64, LitePoint)>>,
     /// Spill files written under memory pressure: key → list of spill paths.
     spill_paths: HashMap<(i32, i32), Vec<PathBuf>>,
     /// Directory used for temporary `.spill` files.
@@ -126,9 +160,14 @@ pub struct BlockPartitioner {
 }
 
 /// Bytes written to a spill file per point.
-/// Layout: `x`(8) `y`(8) `z`(8) `intensity`(2) `classification`(1) `return_number`(1)
-///         `number_of_returns`(1) `scan_angle`(2) = 31 bytes
-const PT_BYTES: usize = 31;
+/// Layout: `point_index`(8, u64) `x`(8) `y`(8) `z`(8) `intensity`(2)
+///         `classification`(1) `return_number`(1) `number_of_returns`(1)
+///         `scan_angle`(2) = 39 bytes
+const PT_BYTES: usize = 39;
+
+/// Bytes of in-memory accounting per buffered point: the `LitePoint` itself
+/// plus its paired `u64` original-file index.
+const PT_ACCOUNTING_BYTES: usize = std::mem::size_of::<u64>();
 
 impl BlockPartitioner {
     /// Create a new partitioner.
@@ -176,11 +215,18 @@ impl BlockPartitioner {
 
     /// Add a single point to its corresponding grid cell.
     ///
+    /// `index` is the point's 0-based position in the original input stream
+    /// (i.e. the `n`th point read from the LAS/LAZ/COPC file, counting from
+    /// zero) — this must match the ordering used by
+    /// `wbtools_oss::LidarEigenvalueFeaturesTool`'s own `point_num` field so
+    /// that per-block feature extraction can later join against the
+    /// pre-pass's eigenvalue table by index (Stage 30, Step 5e).
+    ///
     /// Triggers a spill pass when the in-memory high-water mark is exceeded.
     ///
     /// # Errors
     /// Returns an error if a spill file write fails.
-    pub fn add_point(&mut self, pt: PointRecord) -> Result<()> {
+    pub fn add_point(&mut self, index: u64, pt: LitePoint) -> Result<()> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         // floor() to i32: sign-loss is intentional — points outside the
         // positive grid half-plane are assigned negative col/row and handled
@@ -189,13 +235,15 @@ impl BlockPartitioner {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = ((pt.y - self.y_min) / self.block_size).floor() as i32;
         let key = (col, row);
-        self.cells.entry(key).or_default().push(pt);
-        // Use the actual in-memory size of PointRecord for accounting, not the
-        // smaller on-disk spill-record size (PT_BYTES = 31).  PointRecord carries
-        // GPS time, RGB, scan flags, and extra bytes that are not serialised to
-        // the spill file, so PT_BYTES would under-count by roughly 2–3×, causing
-        // the spill threshold to represent far more heap than intended.
-        self.buffered_bytes += std::mem::size_of::<PointRecord>();
+        self.cells.entry(key).or_default().push((index, pt));
+        // Use the actual in-memory size of LitePoint (+ its paired u64 index)
+        // for accounting. This governs this project's own internal-pipeline
+        // spill threshold (distinct from, and independent of, the Stage 30
+        // eigenvalue pre-pass's own memory-budget calculation, which remains
+        // pinned to `size_of::<wblidar::PointRecord>()` regardless of this
+        // module's internal representation — see
+        // `docs/stages/stage-31-lean-point-record.md`, "Critical Caveat").
+        self.buffered_bytes += std::mem::size_of::<LitePoint>() + PT_ACCOUNTING_BYTES;
 
         if self.buffered_bytes >= SPILL_HIGH_WATER_BYTES {
             self.spill_largest_cells()?;
@@ -222,18 +270,25 @@ impl BlockPartitioner {
 
         for key @ (col, row) in all_keys {
             // Merge spill files first.
-            let mut points: Vec<PointRecord> = Vec::new();
+            let mut points: Vec<LitePoint> = Vec::new();
+            let mut point_indices: Vec<u64> = Vec::new();
             if let Some(paths) = self.spill_paths.remove(&key) {
                 for path in &paths {
                     let spilled = read_spill_file(path)?;
-                    points.extend(spilled);
+                    for (idx, pt) in spilled {
+                        point_indices.push(idx);
+                        points.push(pt);
+                    }
                     // Clean up the temp file immediately after reading.
                     let _ = fs::remove_file(path);
                 }
             }
             // Append whatever remains in memory for this key.
             if let Some(mem_pts) = self.cells.remove(&key) {
-                points.extend(mem_pts);
+                for (idx, pt) in mem_pts {
+                    point_indices.push(idx);
+                    points.push(pt);
+                }
             }
 
             let id = crate::preprocessing::block_id(row as i64, col as i64, self.grid_cols as i64);
@@ -247,6 +302,7 @@ impl BlockPartitioner {
                 origin_x,
                 origin_y,
                 points,
+                point_indices,
             });
         }
 
@@ -270,7 +326,7 @@ impl BlockPartitioner {
                 break;
             }
             if let Some(pts) = self.cells.remove(&key) {
-                let freed = pts.len() * std::mem::size_of::<PointRecord>();
+                let freed = pts.len() * (std::mem::size_of::<LitePoint>() + PT_ACCOUNTING_BYTES);
                 let path = self.spill_path_for(key);
                 write_spill_file(&path, &pts)?;
                 self.spill_paths.entry(key).or_default().push(path);
@@ -306,7 +362,7 @@ fn spill_point_count(path: &Path) -> usize {
 /// is processed.  Peak memory is bounded to:
 ///
 /// ```text
-/// (Rayon thread count) × (largest single-block size × size_of::<PointRecord>())
+/// (Rayon thread count) × (largest single-block size × size_of::<LitePoint>())
 /// ```
 ///
 /// rather than the entire dataset — critical for large files.
@@ -358,36 +414,38 @@ impl BlockPartitioner {
     }
 }
 
+/// Write a slice of `(point_index, LitePoint)` pairs to a `.spill` file.
 ///
-/// Format: per-point little-endian fields — x(f64) y(f64) z(f64)
-/// `intensity`(u16) `classification`(u8) `return_number`(u8)
-/// `number_of_returns`(u8) `scan_angle`(i16) = 31 bytes per point.
-fn write_spill_file(path: &Path, pts: &[PointRecord]) -> Result<()> {
+/// Format: per-point little-endian fields — `point_index`(u64) `x`(f64)
+/// `y`(f64) `z`(f64) `intensity`(u16) `classification`(u8) `return_number`(u8)
+/// `number_of_returns`(u8) `scan_angle`(i16) = 39 bytes per point.
+fn write_spill_file(path: &Path, pts: &[(u64, LitePoint)]) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     let mut buf = [0u8; PT_BYTES];
-    for pt in pts {
+    for (idx, pt) in pts {
         let x = pt.x.to_le_bytes();
         let y = pt.y.to_le_bytes();
         let z = pt.z.to_le_bytes();
         let int = pt.intensity.to_le_bytes();
         let sa = pt.scan_angle.to_le_bytes();
-        buf[0..8].copy_from_slice(&x);
-        buf[8..16].copy_from_slice(&y);
-        buf[16..24].copy_from_slice(&z);
-        buf[24..26].copy_from_slice(&int);
-        buf[26] = pt.classification;
-        buf[27] = pt.return_number;
-        buf[28] = pt.number_of_returns;
-        buf[29..31].copy_from_slice(&sa);
+        buf[0..8].copy_from_slice(&idx.to_le_bytes());
+        buf[8..16].copy_from_slice(&x);
+        buf[16..24].copy_from_slice(&y);
+        buf[24..32].copy_from_slice(&z);
+        buf[32..34].copy_from_slice(&int);
+        buf[34] = pt.classification;
+        buf[35] = pt.return_number;
+        buf[36] = pt.number_of_returns;
+        buf[37..39].copy_from_slice(&sa);
         writer.write_all(&buf)?;
     }
     writer.flush()?;
     Ok(())
 }
 
-/// Read a spill file back into a `Vec<PointRecord>`.
-fn read_spill_file(path: &Path) -> Result<Vec<PointRecord>> {
+/// Read a spill file back into a `Vec<(point_index, LitePoint)>`.
+fn read_spill_file(path: &Path) -> Result<Vec<(u64, LitePoint)>> {
     let metadata = fs::metadata(path).map_err(|_| ClassifierError::SpillCorrupt {
         path: path.display().to_string(),
     })?;
@@ -409,18 +467,18 @@ fn read_spill_file(path: &Path) -> Result<Vec<PointRecord>> {
         let corrupt = || ClassifierError::SpillCorrupt {
             path: path.display().to_string(),
         };
-        let pt = PointRecord {
-            x: f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
-            y: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
-            z: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
-            intensity: u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
-            classification: buf[26],
-            return_number: buf[27],
-            number_of_returns: buf[28],
-            scan_angle: i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
-            ..PointRecord::default()
+        let idx = u64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?);
+        let pt = LitePoint {
+            x: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
+            y: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
+            z: f64::from_le_bytes(buf[24..32].try_into().map_err(|_| corrupt())?),
+            intensity: u16::from_le_bytes(buf[32..34].try_into().map_err(|_| corrupt())?),
+            classification: buf[34],
+            return_number: buf[35],
+            number_of_returns: buf[36],
+            scan_angle: i16::from_le_bytes(buf[37..39].try_into().map_err(|_| corrupt())?),
         };
-        pts.push(pt);
+        pts.push((idx, pt));
     }
     Ok(pts)
 }
@@ -431,12 +489,12 @@ fn read_spill_file(path: &Path) -> Result<Vec<PointRecord>> {
 mod tests {
     use super::*;
 
-    fn make_pt(x: f64, y: f64) -> PointRecord {
-        PointRecord {
+    fn make_pt(x: f64, y: f64) -> LitePoint {
+        LitePoint {
             x,
             y,
             z: 0.0,
-            ..PointRecord::default()
+            ..LitePoint::default()
         }
     }
 
@@ -446,11 +504,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut p = BlockPartitioner::new(0.0, 0.0, 100.0, 100.0, 50.0, tmp.path());
 
-        // Points at the four quadrant centres
-        p.add_point(make_pt(25.0, 25.0)).unwrap(); // (0,0)
-        p.add_point(make_pt(75.0, 25.0)).unwrap(); // (1,0)
-        p.add_point(make_pt(25.0, 75.0)).unwrap(); // (0,1)
-        p.add_point(make_pt(75.0, 75.0)).unwrap(); // (1,1)
+        // Points at the four quadrant centres, tagged with distinct original
+        // file indices so we can verify the point-index-join round trip.
+        p.add_point(0, make_pt(25.0, 25.0)).unwrap(); // (0,0)
+        p.add_point(1, make_pt(75.0, 25.0)).unwrap(); // (1,0)
+        p.add_point(2, make_pt(25.0, 75.0)).unwrap(); // (0,1)
+        p.add_point(3, make_pt(75.0, 75.0)).unwrap(); // (1,1)
 
         let mut blocks = p.finalize().unwrap();
         blocks.sort_by_key(|b| (b.col, b.row));
@@ -467,9 +526,19 @@ mod tests {
 
         for b in &blocks {
             assert_eq!(b.points.len(), 1);
+            assert_eq!(b.point_indices.len(), 1);
         }
+
+        // Verify each block retained the correct original-file point index.
+        assert_eq!(blocks[0].point_indices, vec![0]);
+        assert_eq!(blocks[1].point_indices, vec![2]);
+        assert_eq!(blocks[2].point_indices, vec![1]);
+        assert_eq!(blocks[3].point_indices, vec![3]);
     }
 
+    // Test fixture point generation from a small index range (n=200);
+    // precision loss converting the index to f64 is negligible here.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_spill_merge_produces_same_result() {
         use crate::preprocessing::SPILL_HIGH_WATER_BYTES;
@@ -478,43 +547,92 @@ mod tests {
 
         // Build a set of points for a single block.
         let n = 200_usize;
-        let pts: Vec<PointRecord> = (0..n)
-            .map(|i| {
-                let mut pt = PointRecord::default();
-                pt.x = 10.0 + i as f64 * 0.1;
-                pt.y = 10.0;
-                pt.z = i as f64;
-                pt
+        let pts: Vec<LitePoint> = (0..n)
+            .map(|i| LitePoint {
+                x: 10.0 + i as f64 * 0.1,
+                y: 10.0,
+                z: i as f64,
+                ..LitePoint::default()
             })
             .collect();
 
-        // Add the same points through two partitioners — one in-memory,
-        // one with a tiny high-water mark to force spilling.
+        // Add the same points through an in-memory partitioner, tagging each
+        // with its position in `pts` as the original-file index.
         let mut p_mem = BlockPartitioner::new(0.0, 0.0, 100.0, 100.0, 50.0, tmp.path());
-        for &pt in &pts {
-            p_mem.add_point(pt).unwrap();
+        for (i, &pt) in pts.iter().enumerate() {
+            p_mem.add_point(i as u64, pt).unwrap();
         }
         let mem_blocks = p_mem.finalize().unwrap();
 
-        // Override high-water mark via a trivially small PT_BYTES threshold
-        // by writing a custom version that just spills every 5 points.
-        // Since we can't override the constant we just verify the spill round-trip
-        // directly by calling write/read helpers.
+        // Verify the spill write/read round trip directly, including indices.
+        let indexed_pts: Vec<(u64, LitePoint)> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, &pt)| (i as u64, pt))
+            .collect();
         let spill_path = tmp.path().join("test.spill");
-        write_spill_file(&spill_path, &pts).unwrap();
+        write_spill_file(&spill_path, &indexed_pts).unwrap();
         let recovered = read_spill_file(&spill_path).unwrap();
 
         assert_eq!(recovered.len(), pts.len());
-        for (a, b) in pts.iter().zip(recovered.iter()) {
+        for ((idx, a), (rec_idx, b)) in indexed_pts.iter().zip(recovered.iter()) {
+            assert_eq!(idx, rec_idx, "point index must survive spill round trip");
             assert!((a.x - b.x).abs() < 1e-12);
             assert!((a.z - b.z).abs() < 1e-12);
         }
 
-        // Verify the in-memory partitioner put everything in the right cell.
+        // Verify the in-memory partitioner put everything in the right cell,
+        // and that all original indices (0..n) are present exactly once.
         assert_eq!(mem_blocks.len(), 1);
         assert_eq!(mem_blocks[0].points.len(), n);
+        assert_eq!(mem_blocks[0].point_indices.len(), n);
+        let mut sorted_indices = mem_blocks[0].point_indices.clone();
+        sorted_indices.sort_unstable();
+        assert_eq!(sorted_indices, (0..n as u64).collect::<Vec<_>>());
 
         // Suppress unused import lint for the constant in test context.
         let _ = SPILL_HIGH_WATER_BYTES;
+    }
+
+    /// Verify that point indices survive the full `finalize_stubs()` →
+    /// `BlockStub::load()` round trip (the actual production code path,
+    /// which always writes through spill files regardless of dataset size),
+    /// and that each recovered index is still paired with the correct point.
+    #[test]
+    fn test_finalize_stubs_preserves_point_indices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = BlockPartitioner::new(0.0, 0.0, 100.0, 100.0, 50.0, tmp.path());
+
+        // Points spread across two blocks, added with distinct, non-sequential
+        // indices to make sure no code path assumes index == position.
+        let assignments = [
+            (10u64, 25.0, 25.0), // block (0,0)
+            (20u64, 30.0, 30.0), // block (0,0)
+            (30u64, 75.0, 25.0), // block (1,0)
+        ];
+        for &(idx, x, y) in &assignments {
+            p.add_point(idx, make_pt(x, y)).unwrap();
+        }
+
+        let stubs = p.finalize_stubs().unwrap();
+        let mut blocks: Vec<Block> = stubs.into_iter().map(|s| s.load().unwrap()).collect();
+        blocks.sort_by_key(|b| (b.col, b.row));
+
+        assert_eq!(blocks.len(), 2);
+        let mut b0_indices = blocks[0].point_indices.clone();
+        b0_indices.sort_unstable();
+        assert_eq!(b0_indices, vec![10, 20]);
+        assert_eq!(blocks[1].point_indices, vec![30]);
+
+        // Verify each recovered point's coordinates match the point that was
+        // originally tagged with that index (not just that the index set is
+        // correct, but that index <-> point pairing survived intact).
+        for b in &blocks {
+            for (idx, pt) in b.point_indices.iter().zip(b.points.iter()) {
+                let expected = assignments.iter().find(|(i, _, _)| i == idx).unwrap();
+                assert!((pt.x - expected.1).abs() < 1e-9);
+                assert!((pt.y - expected.2).abs() < 1e-9);
+            }
+        }
     }
 }

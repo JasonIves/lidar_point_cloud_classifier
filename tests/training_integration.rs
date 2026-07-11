@@ -128,7 +128,6 @@ fn test_training_loop_reduces_loss_on_synthetic_dataset() {
         target_points: N_POINTS,
         min_density: 1.0,
         search_radius: 1.0,
-        search_radii: vec![],
         min_neighbors: 8,
         crs_epsg: None,
         label_map,

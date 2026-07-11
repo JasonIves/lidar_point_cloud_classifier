@@ -590,9 +590,12 @@ mod tests {
         }
     }
 
+    // Test fixture flat feature array from small index range (n*N_FEATURES);
+    // precision loss converting index to f32 is negligible here.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_forward_output_shape_no_feature_tnet() {
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
         let model = BurnPointNet::<B>::new(&cfg, &device).unwrap();
 
@@ -600,6 +603,7 @@ mod tests {
         let flat: Vec<f32> = (0..(n * N_FEATURES))
             .map(|i| (i % 100) as f32 / 100.0)
             .collect();
+
         let input = features_to_tensor::<B>(flat, n, N_FEATURES, &device);
 
         let out = model.forward(input);
@@ -608,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_forward_output_shape_with_feature_tnet() {
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = PointNetConfig {
             use_feature_tnet: true,
             ..default_cfg()
@@ -629,18 +633,23 @@ mod tests {
     /// (`[1, C, 1]`) computes a per-sample variance of 0 in training mode, so its
     /// EMA-updated `running_var` decays 1.0 → 0 (momentum 0.1 → ×0.9 per step).
     /// At inference this near-zero variance divides by ~sqrt(eps) and explodes.
-    /// This documents *why* Stage 17 omits BatchNorm on the post-pool FC layers.
+    /// This documents *why* Stage 17 omits `BatchNorm` on the post-pool FC layers.
+    // step/c loop indices are small (<=22); precision loss converting to f32
+    // is negligible and irrelevant to the running-variance decay behaviour
+    // this test verifies.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_batchnorm_batch1_running_var_decays_toward_zero() {
         use burn::backend::Autodiff;
 
         type Ad = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let bn = BatchNormConfig::new(8).init::<Ad, 1>(&device);
 
         // Feed 15 distinct single-sample [1, 8, 1] tensors in training mode.
         for step in 0..15 {
             let vals: Vec<f32> = (0..8).map(|c| (step + c) as f32 * 0.1).collect();
+
             let x = Tensor::<Ad, 3>::from_floats(TensorData::new(vals, vec![1, 8, 1]), &device);
             let _ = bn.forward(x);
         }
@@ -656,11 +665,15 @@ mod tests {
     }
 
     /// Regression guard: after several training-mode forwards populate the
-    /// BatchNorm running statistics, the inference-mode (`.valid()`) forward must
+    /// `BatchNorm` running statistics, the inference-mode (`.valid()`) forward must
     /// produce finite, bounded logits.  Before the Stage 17 fix, the post-pool
-    /// T-Net FC BatchNorm layers drove `running_var` → 0, so `.valid()` produced a
+    /// T-Net FC `BatchNorm` layers drove `running_var` → 0, so `.valid()` produced a
     /// logit explosion (values ~1e5+, `val_loss` ~1.6e5).  With those layers'
-    /// BatchNorm removed, the output stays sane.
+    /// `BatchNorm` removed, the output stays sane.
+    // Test fixture flat feature arrays from small index ranges; precision loss
+    // converting the index to f32 is negligible and irrelevant to the
+    // inference-logit-boundedness behaviour this test verifies.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_valid_inference_logits_bounded_after_training() {
         use burn::backend::Autodiff;
@@ -668,7 +681,7 @@ mod tests {
         use burn::tensor::backend::AutodiffBackend;
 
         type Ad = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
         let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
 
@@ -687,6 +700,7 @@ mod tests {
         let flat: Vec<f32> = (0..(n * N_FEATURES))
             .map(|i| (i % 89) as f32 / 89.0)
             .collect();
+
         let input = features_to_tensor::<<Ad as AutodiffBackend>::InnerBackend>(
             flat, n, N_FEATURES, &device,
         );
@@ -709,18 +723,22 @@ mod tests {
 
     /// Empirical confirmation for Stage 18.
     ///
-    /// Demonstrates that the train-mode (batch-statistic) BatchNorm output and
+    /// Demonstrates that the train-mode (batch-statistic) `BatchNorm` output and
     /// the inference-mode (`.valid()`, running-statistic) output for the *same*
     /// input **diverge** when the training blocks are heterogeneous (each block
     /// has a different per-feature distribution), and **agree** when the blocks
     /// share one distribution.
     ///
     /// This isolates the cause of the poor validation metrics to exactly the
-    /// per-block-vs-global BatchNorm statistics mismatch: with an effective
-    /// BatchNorm batch size of one block, training normalizes each block by its
+    /// per-block-vs-global `BatchNorm` statistics mismatch: with an effective
+    /// `BatchNorm` batch size of one block, training normalizes each block by its
     /// own statistics, while `.valid()` (and deployment) normalize every block by
     /// a single global running average — so heterogeneous blocks are systematically
     /// mis-normalized at inference.
+    // Test fixture block generation and gap-averaging use small index ranges /
+    // element counts; precision loss converting to f32 is negligible and
+    // irrelevant to the train/eval BN gap behaviour this test verifies.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_batchnorm_train_eval_gap_depends_on_block_heterogeneity() {
         use burn::backend::Autodiff;
@@ -728,7 +746,7 @@ mod tests {
         use burn::tensor::backend::AutodiffBackend;
 
         type Ad = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let n = 128usize;
 
         // Deterministic block generator: fixed content pattern, shifted by a
@@ -819,13 +837,16 @@ mod tests {
     /// shape, and (b) when every block in the batch is identical, produce
     /// identical per-block outputs across the batch dimension.  The latter
     /// confirms the per-sample global max-pool does not leak across blocks and
-    /// that the batched BatchNorm path is wired correctly.
+    /// that the batched `BatchNorm` path is wired correctly.
+    // Test fixture flat feature array from a small index range; precision
+    // loss converting to f32 is negligible here.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_forward_batched_identical_blocks_are_consistent() {
         use burn::backend::Autodiff;
 
         type Ad = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
         let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
 
@@ -836,6 +857,7 @@ mod tests {
         let single: Vec<f32> = (0..(n * N_FEATURES))
             .map(|i| ((i * 17 + 3) % 91) as f32 / 91.0)
             .collect();
+
         let mut batch_flat = Vec::with_capacity(b * n * N_FEATURES);
         for _ in 0..b {
             batch_flat.extend_from_slice(&single);
@@ -868,13 +890,16 @@ mod tests {
 
     /// Batched forward over a genuine multi-block batch produces finite, bounded
     /// logits of the right shape when the blocks have *different* distributions —
-    /// the real training scenario (BatchNorm normalizes across the whole batch).
+    /// the real training scenario (`BatchNorm` normalizes across the whole batch).
+    // Test fixture flat feature array from a small index range; precision
+    // loss converting to f32 is negligible here.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_forward_batched_heterogeneous_blocks_bounded() {
         use burn::backend::Autodiff;
 
         type Ad = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
         let cfg = default_cfg();
         let model = BurnPointNet::<Ad>::new(&cfg, &device).unwrap();
 

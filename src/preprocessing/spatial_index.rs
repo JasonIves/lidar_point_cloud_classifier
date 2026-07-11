@@ -6,7 +6,8 @@
 
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
-use wblidar::PointRecord;
+
+use crate::preprocessing::lite_point::LitePoint;
 
 /// Wrapper around `kdtree::KdTree<f64, usize, [f64; 3]>` that stores the
 /// 3-D coordinates and exposes an adaptive-radius search.
@@ -15,12 +16,12 @@ pub struct BlockSpatialIndex {
 }
 
 impl BlockSpatialIndex {
-    /// Build a 3-D k-d tree from a slice of `PointRecord`s.
+    /// Build a 3-D k-d tree from a slice of `LitePoint`s.
     ///
     /// Each point's index into `pts` is stored as the tree payload so callers
     /// can look up the original record after a neighbourhood query.
     #[must_use]
-    pub fn build(pts: &[PointRecord]) -> Self {
+    pub fn build(pts: &[LitePoint]) -> Self {
         // bucket_size = 32 is a good default for medium-density LiDAR clouds.
         let mut tree: KdTree<f64, usize, [f64; 3]> = KdTree::with_capacity(3, pts.len());
         for (i, pt) in pts.iter().enumerate() {
@@ -91,21 +92,20 @@ impl BlockSpatialIndex {
 mod tests {
     use super::*;
 
-    fn pts_from_coords(coords: &[(f64, f64, f64)]) -> Vec<PointRecord> {
+    fn pts_from_coords(coords: &[(f64, f64, f64)]) -> Vec<LitePoint> {
         coords
             .iter()
-            .map(|&(x, y, z)| {
-                let mut pt = PointRecord::default();
-                pt.x = x;
-                pt.y = y;
-                pt.z = z;
-                pt
+            .map(|&(x, y, z)| LitePoint {
+                x,
+                y,
+                z,
+                ..LitePoint::default()
             })
             .collect()
     }
 
     /// Brute-force reference search for test verification.
-    fn brute_radius(pts: &[PointRecord], center: [f64; 3], r: f64) -> Vec<usize> {
+    fn brute_radius(pts: &[LitePoint], center: [f64; 3], r: f64) -> Vec<usize> {
         pts.iter()
             .enumerate()
             .filter(|(_, p)| {
@@ -145,8 +145,9 @@ mod tests {
     #[test]
     fn test_adaptive_radius_expands_when_needed() {
         // Place 10 points just beyond base_radius = 1.0, within 1.5.
-        let far: Vec<(f64, f64, f64)> =
-            (0..10).map(|i| (1.1 + i as f64 * 0.01, 0.0, 0.0)).collect();
+        let far: Vec<(f64, f64, f64)> = (0..10)
+            .map(|i| (1.1 + f64::from(i) * 0.01, 0.0, 0.0))
+            .collect();
         let pts = pts_from_coords(&far);
         let idx = BlockSpatialIndex::build(&pts);
 

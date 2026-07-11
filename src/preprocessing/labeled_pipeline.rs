@@ -53,10 +53,6 @@ pub struct LabeledBlockManifest {
     pub target_points: usize,
     pub min_density: f64,
     pub search_radius: f64,
-    /// Search radii used for multi-scale eigenvalue features.
-    /// Empty means single-scale using `search_radius`.
-    #[serde(default)]
-    pub search_radii: Vec<f64>,
     pub min_neighbors: usize,
     pub crs_epsg: Option<u32>,
     /// ASPRS code (string key) → model class index mapping embedded for traceability.
@@ -231,7 +227,6 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
         target_points: base_manifest.target_points,
         min_density: base_manifest.min_density,
         search_radius: base_manifest.search_radius,
-        search_radii: base_manifest.search_radii.clone(),
         min_neighbors: base_manifest.min_neighbors,
         crs_epsg: base_manifest.crs_epsg,
         label_map: label_map_str,
@@ -499,7 +494,6 @@ mod tests {
             target_points: 1024,
             min_density: 1.0,
             search_radius: 1.0,
-            search_radii: vec![],
             min_neighbors: 8,
             crs_epsg: Some(32617),
             label_map: {

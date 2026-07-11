@@ -36,6 +36,10 @@ pub enum ClassifierError {
     /// Generic pipeline error with a descriptive message.
     #[error("Pipeline error: {0}")]
     Pipeline(String),
+
+    /// Error returned by a `wbcore::Tool` invocation (e.g. `LidarRemoveOutliersTool`).
+    #[error("Whitebox tool error: {0}")]
+    Tool(#[from] wbcore::ToolError),
 }
 
 /// Convenient `Result` alias used throughout the crate.

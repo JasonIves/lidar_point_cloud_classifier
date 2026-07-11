@@ -93,7 +93,7 @@ mod tests {
 
         // At t=T/2: lr should be (lr_max + lr_min) / 2 (cos(π/2) = 0)
         let lr_half = sched.lr(50);
-        let expected = (1e-3 + 1e-6) / 2.0;
+        let expected = f64::midpoint(1e-3, 1e-6);
         assert!(
             (lr_half - expected).abs() < 1e-9,
             "lr(T/2) should be midpoint {expected}, got {lr_half}"
@@ -126,10 +126,10 @@ mod tests {
         );
 
         // At t == warmup_steps: lr should equal lr_max (start of cosine phase).
-        let lr10 = sched.lr(10);
+        let lr_at_warmup_end = sched.lr(10);
         assert!(
-            (lr10 - 1e-3).abs() < 1e-9,
-            "lr(warmup_steps) should be lr_max, got {lr10}"
+            (lr_at_warmup_end - 1e-3).abs() < 1e-9,
+            "lr(warmup_steps) should be lr_max, got {lr_at_warmup_end}"
         );
 
         // At t == total_steps: lr should be lr_min (cos(π) = -1), same as
@@ -145,7 +145,7 @@ mod tests {
         // should be the (lr_max + lr_min) / 2 midpoint, exactly as the
         // no-warmup cosine curve's T/2 point.
         let lr_mid = sched.lr(60);
-        let expected_mid = (1e-3 + 1e-6) / 2.0;
+        let expected_mid = f64::midpoint(1e-3, 1e-6);
         assert!(
             (lr_mid - expected_mid).abs() < 1e-9,
             "lr(post-warmup midpoint) should be {expected_mid}, got {lr_mid}"

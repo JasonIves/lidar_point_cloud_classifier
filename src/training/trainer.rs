@@ -1125,7 +1125,7 @@ mod tests {
 
     /// β = 0.9999 → weights are numerically close to pure inverse-frequency.
     ///
-    /// For large counts (> ~1000), β^count ≈ 0, so effective_num ≈ 1/(1-β) = 10000.
+    /// For large counts (> ~1000), β^count ≈ 0, so `effective_num` ≈ 1/(1-β) = 10000.
     /// All large-count classes collapse to the same effective number, so the
     /// weight ratio between classes is driven by the inverse-frequency ratio.
     /// We verify that the weight ordering matches inverse-frequency ordering and
@@ -1168,18 +1168,18 @@ mod tests {
     ///
     /// counts = [100, 50, 10], β = 0.9
     ///
-    /// effective_num[c] = (1 - 0.9^count[c]) / (1 - 0.9) = (1 - 0.9^count[c]) / 0.1
+    /// `effective_num`[c] = (1 - 0.9^count[c]) / (1 - 0.9) = (1 - 0.9^count[c]) / 0.1
     ///
-    /// For count=100: 0.9^100 ≈ 2.656e-5 → eff_num ≈ (1 - 2.656e-5) / 0.1 ≈ 9.9997
-    /// For count=50:  0.9^50  ≈ 5.154e-3 → eff_num ≈ (1 - 5.154e-3) / 0.1 ≈ 9.9485
-    /// For count=10:  0.9^10  ≈ 0.34868  → eff_num ≈ (1 - 0.34868) / 0.1 ≈ 6.5132
+    /// For count=100: 0.9^100 ≈ 2.656e-5 → `eff_num` ≈ (1 - 2.656e-5) / 0.1 ≈ 9.9997
+    /// For count=50:  0.9^50  ≈ 5.154e-3 → `eff_num` ≈ (1 - 5.154e-3) / 0.1 ≈ 9.9485
+    /// For count=10:  0.9^10  ≈ 0.34868  → `eff_num` ≈ (1 - 0.34868) / 0.1 ≈ 6.5132
     ///
-    /// raw_weight[c] = 1 / eff_num[c]:
+    /// `raw_weight`[c] = 1 / `eff_num`[c]:
     ///   rw[0] ≈ 1/9.9997  ≈ 0.10000
     ///   rw[1] ≈ 1/9.9485  ≈ 0.10052
     ///   rw[2] ≈ 1/6.5132  ≈ 0.15353
     ///
-    /// present_sum ≈ 0.35405, n_present = 3, scale ≈ 3/0.35405 ≈ 8.4734
+    /// `present_sum` ≈ 0.35405, `n_present` = 3, scale ≈ 3/0.35405 ≈ 8.4734
     ///
     /// normalized weights:
     ///   w[0] ≈ 0.10000 * 8.4734 ≈ 0.8473
@@ -1203,6 +1203,10 @@ mod tests {
         }
 
         // Mean of all weights must equal 1.0 (normalization invariant).
+        // `weights.len()` is a small, fixed test-fixture class count (3), far
+        // below f32's precision limit — the cast below cannot lose precision
+        // in practice.
+        #[allow(clippy::cast_precision_loss)]
         let mean: f32 = weights.iter().sum::<f32>() / weights.len() as f32;
         assert!(
             (mean - 1.0_f32).abs() < 1e-4,
@@ -1210,8 +1214,8 @@ mod tests {
         );
     }
 
-    /// Absent class (count=0) receives the ABSENT_CLASS_WEIGHT_FLOOR (1e-3)
-    /// rather than 0.0, so burn's CrossEntropyLoss does not panic.
+    /// Absent class (count=0) receives the `ABSENT_CLASS_WEIGHT_FLOOR` (1e-3)
+    /// rather than 0.0, so burn's `CrossEntropyLoss` does not panic.
     #[test]
     fn test_class_weight_absent_class_is_zero() {
         let counts = vec![1000u64, 0, 500];
@@ -1332,7 +1336,7 @@ mod tests {
         use burn::backend::{Autodiff, NdArray};
 
         type B = Autodiff<NdArray>;
-        let device = Default::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
 
         let cfg = PointNetConfig {
             n_features_in: N_FEATURES,
@@ -1397,7 +1401,7 @@ mod tests {
         );
         // Check a representative element is within floating-point tolerance.
         let diff = (avg_tnet_w - &expected_avg).mapv(f32::abs);
-        let max_err = diff.iter().cloned().fold(0.0_f32, f32::max);
+        let max_err = diff.iter().copied().fold(0.0_f32, f32::max);
         assert!(
             max_err < 1e-5,
             "SWA T-Net weight not correctly averaged; max element error = {max_err}"

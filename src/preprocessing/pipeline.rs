@@ -31,8 +31,8 @@ use crate::error::{ClassifierError, Result};
 use crate::preprocessing::{
     block_partitioner::{BlockPartitioner, BlockStub},
     feature_extractor::extract_features,
+    lite_point::LitePoint,
     normalizer::{resample_block, DtmView},
-    spatial_index::BlockSpatialIndex,
     PreprocessConfig, FEAT_MAGIC, FEAT_VERSION, RAYON_MIN_CHUNK,
 };
 
@@ -61,10 +61,6 @@ pub struct BlockManifest {
     /// Header-derived south-west Y origin — the same value passed to `BlockPartitioner`.
     #[serde(default)]
     pub grid_y_min: f64,
-    /// Search radii used for multi-scale eigenvalue feature extraction.
-    /// Empty list means single-scale using `search_radius`.
-    #[serde(default)]
-    pub search_radii: Vec<f64>,
     /// Whether the outlier removal pre-pass was applied before block partitioning.
     #[serde(default)]
     pub outlier_removal: bool,
@@ -166,45 +162,77 @@ impl PreprocessingPipeline {
         fs::create_dir_all(&config.output_dir)?;
 
         // ── 1b. Optional outlier removal pre-pass ─────────────────────────────────
-        // When enabled, all points are loaded into memory, filtered with the local
-        // elevation residual algorithm (outlier_filter::apply), and fed to the
-        // partitioner directly — no temp file needed.
+        // When enabled, `wbtools_oss::LidarRemoveOutliersTool` is invoked directly
+        // via the `wbcore::Tool` trait.  The tool writes a temp `_outlier_cleaned.las`
+        // file in the output directory; all subsequent steps (header inspection,
+        // point streaming) use that cleaned file as the effective input.  The temp
+        // file is deleted once the pipeline run completes.
         //
-        // Header inspection always uses `config.input` (the original file) because
-        // the bounding box and CRS are unchanged by outlier filtering.
-        //
-        // NOTE (2026-06-17): This previously called `LidarRemoveOutliersTool` via
-        // wbtools_oss and wrote a temp .las file.  That crate was removed for build
-        // speed; see src/preprocessing/outlier_filter.rs for the revert path.
-        let input_path = &config.input;
-        let outlier_filtered_pts: Option<Vec<PointRecord>> = if config.outlier_removal {
+        // See docs/stages/stage-04-outlier-removal.md (original design) and
+        // docs/stages/stage-30-whitebox-git-dependency-integration.md (restoration).
+        let outlier_cleaned_path = config.output_dir.join("_outlier_cleaned.las");
+        let input_path_owned: PathBuf;
+        let input_path: &Path = if config.outlier_removal {
             eprintln!(
                 "[preprocessing] outlier removal: radius={:.2}, elev_diff={:.2}, use_median={}",
                 config.outlier_radius, config.outlier_elev_diff, config.outlier_use_median
             );
-            let raw = load_all_points(input_path)?;
-            let filtered = crate::preprocessing::outlier_filter::apply(
-                &raw,
-                config.outlier_radius,
-                config.outlier_elev_diff,
-                config.outlier_use_median,
-            );
+            run_outlier_removal(&config.input, &outlier_cleaned_path, config)?;
             eprintln!(
-                "[preprocessing] outlier removal: {} → {} points ({} removed)",
-                raw.len(),
-                filtered.len(),
-                raw.len().saturating_sub(filtered.len())
+                "[preprocessing] outlier removal: wrote {}",
+                outlier_cleaned_path.display()
             );
-            Some(filtered)
+            input_path_owned = outlier_cleaned_path.clone();
+            &input_path_owned
         } else {
-            None
+            &config.input
         };
 
         // ── 2. Open the LiDAR file and inspect the header ───────────────────────────
+        // NOTE: header inspection is intentionally performed *before* the new
+        // Step 1c eigenvalue pre-pass (below) rather than strictly after it as
+        // the Stage 30 doc's "Approved Design" narratively numbers the steps.
+        // The pre-pass's memory-budget decision (Step 5b) needs the header's
+        // point count, so the single `inspect_lidar_header` call is shared by
+        // both Step 1c and the grid-geometry computation that follows —
+        // avoiding a second, redundant header read.
         let (x_min, y_min, x_max, y_max, total_points, crs_epsg) =
             inspect_lidar_header(input_path)?;
 
+        // ── 1c. Eigenvalue-feature pre-pass (Stage 30, Step 5b/5c/5d) ───────────────
+        // Runs `wbtools_oss::LidarEigenvalueFeaturesTool` once over the whole
+        // (possibly outlier-cleaned) input file when the header-derived point
+        // count fits within `config.eigen_memory_budget_bytes`; otherwise the
+        // memory-gated spatial-split path (Stage 30 Step 5d) is used instead
+        // — see `run_eigenvalue_prepass_split`.
+        //
+        // As of Step 5e+5f+5g, this table is joined into per-block feature
+        // extraction below (Step 7) by each point's original stream index
+        // (`block.point_indices[i]`), replacing the prior per-block, per-
+        // radius local eigenvalue computation entirely.
+        let eigen_table = run_eigenvalue_prepass(
+            input_path,
+            &config.output_dir,
+            config,
+            total_points,
+            (x_min, y_min, x_max, y_max),
+        )?;
+
+        if eigen_table.is_empty() {
+            eprintln!("[preprocessing] eigen pre-pass: 0 rows (empty input)");
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let mean_linearity: f64 =
+                eigen_table.iter().map(|r| f64::from(r[3])).sum::<f64>() / eigen_table.len() as f64;
+            eprintln!(
+                "[preprocessing] eigen pre-pass: {} rows parsed (mean linearity = {mean_linearity:.4})",
+                eigen_table.len()
+            );
+        }
+        let eigen_table = Arc::new(eigen_table);
+
         // Compute grid geometry from the header bounding box.  These values
+
         // are the authoritative source for block-ID arithmetic throughout the
         // entire pipeline — store them in the manifest so no consumer ever
         // needs to re-derive them from retained block origins.
@@ -218,9 +246,10 @@ impl PreprocessingPipeline {
         eprintln!("[preprocessing] grid: {grid_cols} cols × {grid_rows} rows");
         eprintln!("[preprocessing] points: {total_points}");
 
-        // ── 3. Stream / feed points into the block partitioner ───────────────────
-        // If outlier removal produced a filtered Vec, feed it directly.
-        // Otherwise stream from the original file (no allocation).
+        // ── 3. Stream points into the block partitioner ───────────────────────────
+        // `input_path` is either the original file or the outlier-cleaned temp
+        // file from Step 1b; either way it is streamed without loading the
+        // full file into memory.
         let mut partitioner = BlockPartitioner::new(
             x_min,
             y_min,
@@ -229,13 +258,7 @@ impl PreprocessingPipeline {
             config.block_size,
             &config.output_dir,
         );
-        if let Some(ref filtered) = outlier_filtered_pts {
-            for pt in filtered {
-                partitioner.add_point(*pt)?;
-            }
-        } else {
-            stream_points(input_path, &mut partitioner)?;
-        }
+        stream_points(input_path, &mut partitioner)?;
 
         // ── 4. Finalise — flush in-memory cells to disk, return lightweight stubs ───
         // `finalize_stubs()` clears the heap before returning: all block data is
@@ -363,7 +386,7 @@ impl PreprocessingPipeline {
                 //     then delete the file immediately to free disk space.
                 //     When overlap is disabled, `border_path` is None and no I/O
                 //     occurs here.
-                let border_pts: Vec<PointRecord> = match border_path {
+                let border_pts: Vec<LitePoint> = match border_path {
                     Some(ref p) => {
                         let pts = read_border_spill(p)?;
                         let _ = fs::remove_file(p);
@@ -372,30 +395,16 @@ impl PreprocessingPipeline {
                     None => Vec::new(),
                 };
 
-                // (b) Build augmented k-d tree.
-                //     Merge canonical + border into a single contiguous Vec once
-                //     and reuse it for both the index and feature extraction.
-                //     Border points are NEVER resampled or written to .feat files.
-                let ctx: Vec<PointRecord> = if border_pts.is_empty() {
-                    Vec::new() // no overlap: zero-copy path below
-                } else {
-                    let mut v = Vec::with_capacity(block.points.len() + border_pts.len());
-                    v.extend_from_slice(&block.points);
-                    v.extend_from_slice(&border_pts);
-                    v
-                };
-                // border_pts no longer needed — drop it to free memory before
-                // building the k-d tree (which itself allocates).
+                // Border points are context-only, used exclusively for the
+                // (now-removed) local k-d-tree eigenvalue computation. Since
+                // eigenvalue features come from the whole-file pre-pass table
+                // instead (Stage 30, Step 5e+5f+5g), border points no longer
+                // serve any purpose in feature extraction — they are dropped
+                // immediately without being merged into a context buffer or
+                // used to build a spatial index.
                 drop(border_pts);
 
-                let index = if ctx.is_empty() {
-                    BlockSpatialIndex::build(&block.points)
-                } else {
-                    BlockSpatialIndex::build(&ctx)
-                };
-
                 // (c) Density-gated sampling — canonical points only.
-                //     Border points are context-only and must not appear in output.
                 let (sampled, sampled_indices, oversampled) = resample_block(
                     &block.points,
                     config.target_points,
@@ -405,38 +414,33 @@ impl PreprocessingPipeline {
 
                 let sampled_count = sampled.len();
 
-                // (d–f) Extract all features (multi-scale or single-scale).
-                //     When overlap is active, `ctx` (canonical + border) is the
-                //     neighbourhood context so eigenvalue queries near block edges
-                //     draw on real neighbour points.
-                //     When overlap is disabled, canonical points only — identical
-                //     to the pre-Stage-08 behaviour.
-                let search_radii = config.search_radii_effective();
-                let features = if ctx.is_empty() {
-                    extract_features(
-                        &sampled,
-                        &block.points,
-                        &index,
-                        dtm_ref,
-                        origin_x,
-                        origin_y,
-                        config.block_size,
-                        &search_radii,
-                        config.min_neighbors,
-                    )
-                } else {
-                    extract_features(
-                        &sampled,
-                        &ctx,
-                        &index,
-                        dtm_ref,
-                        origin_x,
-                        origin_y,
-                        config.block_size,
-                        &search_radii,
-                        config.min_neighbors,
-                    )
-                };
+                // (d) Look up each sampled point's precomputed eigenvalue row
+                //     from the whole-file pre-pass table via its original
+                //     stream index (`block.point_indices[sampled_idx]`).
+                let eigen_rows: Vec<[f32; 10]> = sampled_indices
+                    .iter()
+                    .map(|&sampled_idx| {
+                        // On 32-bit targets a `u64` point index could in principle
+                        // exceed `usize::MAX`; fall back to an out-of-range sentinel
+                        // (`usize::MAX`) rather than truncating or panicking — the
+                        // subsequent `.get()` lookup simply misses and yields the
+                        // all-zero default row, exactly as for any other cache miss.
+                        let point_idx =
+                            usize::try_from(block.point_indices[sampled_idx]).unwrap_or(usize::MAX);
+                        eigen_table.get(point_idx).copied().unwrap_or([0.0f32; 10])
+                    })
+                    .collect();
+
+                // (e–f) Extract full feature vectors: scalar (from `sampled`)
+                //     combined with the precomputed eigenvalue rows above.
+                let features = extract_features(
+                    &sampled,
+                    &eigen_rows,
+                    dtm_ref,
+                    origin_x,
+                    origin_y,
+                    config.block_size,
+                );
                 let n_features = features.first().map_or(0, Vec::len);
 
                 // (g) Serialise to .feat
@@ -455,7 +459,7 @@ impl PreprocessingPipeline {
                 // (h) Optional debug CSV
                 if config.debug_csv {
                     let csv_path = config.output_dir.join(format!("block_{block_id:05}.csv"));
-                    write_debug_csv(&csv_path, &features, &search_radii)?;
+                    write_debug_csv(&csv_path, &features)?;
                 }
 
                 let meta = BlockMeta {
@@ -507,7 +511,6 @@ impl PreprocessingPipeline {
             grid_rows,
             grid_x_min: x_min,
             grid_y_min: y_min,
-            search_radii: config.search_radii_effective(),
             outlier_removal: config.outlier_removal,
             outlier_radius: config.outlier_radius,
             outlier_elev_diff: config.outlier_elev_diff,
@@ -521,6 +524,11 @@ impl PreprocessingPipeline {
         let manifest_file = File::create(&manifest_path)?;
         serde_json::to_writer_pretty(BufWriter::new(manifest_file), &manifest)?;
         eprintln!("[preprocessing] wrote {}", manifest_path.display());
+
+        // ── 9. Clean up the outlier-removal temp file, if one was created ─────────
+        if config.outlier_removal {
+            let _ = fs::remove_file(&outlier_cleaned_path);
+        }
 
         Ok((manifest, process_results))
     }
@@ -571,6 +579,14 @@ fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, u64, Option<
 }
 
 /// Stream all points from the input file, dispatching each to the partitioner.
+///
+/// Maintains a running 0-based point-index counter (`idx`), incremented once
+/// per point read across all three format branches (`las`/`laz`/`copc`), and
+/// passes it to `BlockPartitioner::add_point`. This counter's ordering must
+/// match the ordering used by `wbtools_oss::LidarEigenvalueFeaturesTool`'s own
+/// `point_num` field (both simply count points in input-stream order), so
+/// that a block's points can later be joined against the eigenvalue pre-pass
+/// table by index (Stage 30, point-index-join extension / Step 5e).
 fn stream_points(path: &Path, partitioner: &mut BlockPartitioner) -> Result<()> {
     use std::fs::File;
     use std::io::BufReader;
@@ -585,27 +601,31 @@ fn stream_points(path: &Path, partitioner: &mut BlockPartitioner) -> Result<()> 
         .to_ascii_lowercase();
 
     let mut pt = PointRecord::default();
+    let mut idx: u64 = 0;
 
     match ext.as_str() {
         "las" => {
             let f = File::open(path)?;
             let mut reader = LasReader::new(BufReader::new(f))?;
             while reader.read_point(&mut pt)? {
-                partitioner.add_point(pt)?;
+                partitioner.add_point(idx, LitePoint::from(&pt))?;
+                idx += 1;
             }
         }
         "laz" => {
             let f = File::open(path)?;
             let mut reader = LazReader::new(BufReader::new(f))?;
             while reader.read_point(&mut pt)? {
-                partitioner.add_point(pt)?;
+                partitioner.add_point(idx, LitePoint::from(&pt))?;
+                idx += 1;
             }
         }
         "copc" => {
             use wblidar::copc::CopcReader;
             let mut reader = CopcReader::open_path(path)?;
             while reader.read_point(&mut pt)? {
-                partitioner.add_point(pt)?;
+                partitioner.add_point(idx, LitePoint::from(&pt))?;
+                idx += 1;
             }
         }
         _ => {
@@ -619,64 +639,555 @@ fn stream_points(path: &Path, partitioner: &mut BlockPartitioner) -> Result<()> 
 }
 
 // ── Outlier removal helper ────────────────────────────────────────────────────
-// REMOVED (2026-06-17): run_outlier_removal() via wbtools_oss has been replaced
-// by the in-memory outlier_filter::apply() call in run_internal() Step 1b.
-// See src/preprocessing/outlier_filter.rs for the revert path.
 
-// ── LiDAR load helper ────────────────────────────────────────────────────────
+/// Run the `wbtools_oss::LidarRemoveOutliersTool` directly via the `wbcore::Tool`
+/// trait, writing a cleaned copy of `input` to `output_path`.
+///
+/// This restores the original Stage 04 design (see
+/// `docs/stages/stage-04-outlier-removal.md`) after the 2026-06-17 build-speed
+/// workaround (`outlier_filter.rs`) was reverted in Stage 30 — see
+/// `docs/stages/stage-30-whitebox-git-dependency-integration.md`.
+///
+/// The tool is invoked with an explicit `output` path so the result is written
+/// to disk rather than the in-memory lidar store; the caller then treats
+/// `output_path` as the effective input for all subsequent pipeline steps.
+///
+/// # Errors
+/// Returns [`ClassifierError::Tool`] if validation or execution fails.
+fn run_outlier_removal(input: &Path, output_path: &Path, config: &PreprocessConfig) -> Result<()> {
+    use serde_json::json;
+    use wbcore::{AllowAllCapabilities, RecordingProgressSink, Tool, ToolArgs, ToolContext};
+    use wbtools_oss::tools::LidarRemoveOutliersTool;
 
-/// Load all points from a LiDAR file into a `Vec<PointRecord>`.
-/// Used only when outlier removal is enabled; for the normal path
-/// `stream_points` is used to avoid loading the full file into memory.
-fn load_all_points(path: &Path) -> Result<Vec<PointRecord>> {
-    use std::fs::File;
+    let mut args: ToolArgs = ToolArgs::new();
+    args.insert("input".to_string(), json!(input.display().to_string()));
+    args.insert(
+        "output".to_string(),
+        json!(output_path.display().to_string()),
+    );
+    args.insert("search_radius".to_string(), json!(config.outlier_radius));
+    args.insert("elev_diff".to_string(), json!(config.outlier_elev_diff));
+    args.insert("use_median".to_string(), json!(config.outlier_use_median));
+
+    let progress = RecordingProgressSink::new();
+    let capabilities = AllowAllCapabilities;
+    let ctx = ToolContext {
+        progress: &progress,
+        capabilities: &capabilities,
+    };
+
+    let tool = LidarRemoveOutliersTool;
+    tool.validate(&args)?;
+    tool.run(&args, &ctx)?;
+
+    Ok(())
+}
+
+// ── Eigenvalue-feature pre-pass helper (Stage 30, Step 5b/5c/5d) ─────────────
+
+/// Bytes per record in a `.eigen` sidecar file written by
+/// `wbtools_oss::LidarEigenvalueFeaturesTool`: `u64` point_num (8 bytes) +
+/// 10×`f32` (40 bytes) = 48 bytes/record.
+const EIGEN_RECORD_BYTES: usize = 48;
+
+/// Run the `wbtools_oss::LidarEigenvalueFeaturesTool` pre-pass (Stage 30,
+/// Step 5b/5c/5d).
+///
+/// Estimates the in-memory size the tool's own whole-cloud point buffer would
+/// require (`total_points * size_of::<wblidar::PointRecord>()`) and compares it
+/// against `config.eigen_memory_budget_bytes`.
+///
+/// - When the estimate is **within budget**, invokes the tool once over the
+///   entire (possibly outlier-cleaned) input file, parses the resulting
+///   `.eigen` binary sidecar into an in-memory `Vec<[f32; 10]>` indexed by
+///   original-file point index (0-based, matching the tool's own `point_num`
+///   field, which is written in stream order), and deletes both sidecar
+///   files (`.eigen` and `.eigen.json`).
+/// - When the estimate **exceeds budget**, dispatches to
+///   [`run_eigenvalue_prepass_split`] — the memory-gated spatial-split path
+///   (Stage 30 Step 5d) — which returns a table of the same shape.
+///
+/// `bbox` is `(x_min, y_min, x_max, y_max)`, the same header-derived bounding
+/// box used for grid-geometry computation elsewhere in `run_internal()`; it
+/// is the basis for choosing the wider split axis when splitting is required.
+///
+/// # Errors
+/// Returns [`ClassifierError::Tool`] if validation or execution of the
+/// underlying tool fails, [`ClassifierError::Pipeline`] if a `.eigen` file
+/// is malformed, and [`ClassifierError::Io`] on file I/O failure.
+fn run_eigenvalue_prepass(
+    input: &Path,
+    output_dir: &Path,
+    config: &PreprocessConfig,
+    total_points: u64,
+    bbox: (f64, f64, f64, f64),
+) -> Result<Vec<[f32; 10]>> {
+    use serde_json::json;
+    use wbcore::{AllowAllCapabilities, RecordingProgressSink, Tool, ToolArgs, ToolContext};
+    use wbtools_oss::tools::LidarEigenvalueFeaturesTool;
+
+    // ── 5b: memory estimation + whole-file-vs-split decision ─────────────
+    let point_record_size = std::mem::size_of::<PointRecord>();
+    #[allow(clippy::cast_possible_truncation)]
+    let total_points_usize = total_points as usize;
+    let estimated_bytes = total_points_usize.saturating_mul(point_record_size);
+
+    eprintln!(
+        "[preprocessing] eigen pre-pass: {total_points} points × {point_record_size} bytes \
+         ≈ {estimated_bytes} bytes (budget: {} bytes)",
+        config.eigen_memory_budget_bytes
+    );
+
+    if estimated_bytes > config.eigen_memory_budget_bytes {
+        let n_strips = compute_n_strips(estimated_bytes, config.eigen_memory_budget_bytes);
+        eprintln!(
+            "[preprocessing] eigen pre-pass: estimate exceeds budget — splitting into \
+             {n_strips} spatial strips (Stage 30 Step 5d)"
+        );
+        return run_eigenvalue_prepass_split(
+            input,
+            output_dir,
+            config,
+            total_points,
+            bbox,
+            n_strips,
+        );
+    }
+
+    // ── 5c: whole-file invocation ──────────────────────────────────────────
+    let eigen_path = output_dir.join("_eigen_prepass.eigen");
+    let json_path = output_dir.join("_eigen_prepass.eigen.json");
+
+    let mut args: ToolArgs = ToolArgs::new();
+    args.insert("input".to_string(), json!(input.display().to_string()));
+    args.insert("num_neighbours".to_string(), json!(7));
+    args.insert("search_radius".to_string(), json!(config.search_radius));
+    args.insert(
+        "output".to_string(),
+        json!(eigen_path.display().to_string()),
+    );
+
+    let progress = RecordingProgressSink::new();
+    let capabilities = AllowAllCapabilities;
+    let ctx = ToolContext {
+        progress: &progress,
+        capabilities: &capabilities,
+    };
+
+    let tool = LidarEigenvalueFeaturesTool;
+    tool.validate(&args)?;
+    tool.run(&args, &ctx)?;
+
+    let table = read_eigen_file(&eigen_path, total_points)?;
+
+    // Clean up sidecars — they are a transient pre-pass artefact, not part of
+    // the published pipeline output.
+    let _ = fs::remove_file(&eigen_path);
+    let _ = fs::remove_file(&json_path);
+
+    Ok(table)
+}
+
+/// Compute the number of spatial strips needed so that, roughly, each
+/// strip's own point count fits within `budget_bytes` (Stage 30, Step 5d).
+///
+/// `ceil(estimated_bytes / budget_bytes)`, clamped to a minimum of 2 (this
+/// helper is only ever called once the caller has already determined
+/// `estimated_bytes > budget_bytes`, so the true minimum is always ≥ 2 in
+/// practice; the clamp is a defensive guard against rounding edge cases and
+/// a misconfigured `0` budget).
+fn compute_n_strips(estimated_bytes: usize, budget_bytes: usize) -> usize {
+    if budget_bytes == 0 {
+        // Degenerate: the CLI validates `--eigen-memory-budget-mb >= 1`, but
+        // guard against a division by zero regardless of how this helper is
+        // ever called directly (e.g. from a unit test).
+        return estimated_bytes.max(2);
+    }
+    let n = estimated_bytes.div_ceil(budget_bytes);
+    n.max(2)
+}
+
+/// One spatial strip's working state during the Stage 30 Step 5d split pass:
+/// its core/extended coordinate ranges along the chosen split axis, the
+/// temp LAS writer its selected points are streamed into, and the
+/// `(original_point_index, is_core)` tag recorded for each point written (in
+/// the exact order it was written, which is the same order
+/// `wbtools_oss::LidarEigenvalueFeaturesTool` will assign as that strip's own
+/// local `point_num` when it later processes this strip's temp file).
+struct EigenSplitStrip {
+    core_lo: f64,
+    core_hi: f64,
+    ext_lo: f64,
+    ext_hi: f64,
+    is_last: bool,
+    writer: Box<dyn wblidar::io::PointWriter>,
+    tags: Vec<(u64, bool)>,
+    las_path: PathBuf,
+}
+
+/// Mirror `wblidar::frontend::infer_stream_writer_config_from_source` (private
+/// there; also reproduced independently in `src/output/las_writer.rs`) using
+/// only the public `LasReader` API, so each per-strip temp LAS file preserves
+/// the source's point-data format, scale/offset, and CRS.
+fn infer_writer_config_from_source(input: &Path) -> Result<wblidar::las::writer::WriterConfig> {
     use std::io::BufReader;
-    use wblidar::io::PointReader;
+    use wblidar::las::writer::WriterConfig;
     use wblidar::las::LasReader;
-    use wblidar::laz::LazReader;
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let reader = LasReader::new(BufReader::new(File::open(input)?))?;
+    let hdr = reader.header();
+    Ok(WriterConfig {
+        point_data_format: hdr.point_data_format,
+        x_scale: hdr.x_scale,
+        y_scale: hdr.y_scale,
+        z_scale: hdr.z_scale,
+        x_offset: hdr.x_offset,
+        y_offset: hdr.y_offset,
+        z_offset: hdr.z_offset,
+        extra_bytes_per_point: hdr.extra_bytes_count,
+        crs: reader.crs().cloned(),
+        ..WriterConfig::default()
+    })
+}
 
-    let mut pt = PointRecord::default();
-    let mut out = Vec::new();
+/// Route one point to every strip whose *extended* (core + overlap) range
+/// contains it, writing it to that strip's temp LAS file and recording
+/// whether the point falls in that strip's *core* range (Stage 30, Step 5d).
+///
+/// A point may be written to more than one strip when it falls in the
+/// overlap region shared by two adjacent strips — this is intentional: each
+/// strip needs border context from its neighbours for correct neighbourhood
+/// queries near its own edges, but only the strip whose *core* range actually
+/// contains the point will have that point's row retained during stitching.
+fn route_point_to_strips(
+    pt: &PointRecord,
+    idx: u64,
+    axis_is_x: bool,
+    strips: &mut [EigenSplitStrip],
+) -> Result<()> {
+    let coord = if axis_is_x { pt.x } else { pt.y };
+    for strip in strips.iter_mut() {
+        if coord >= strip.ext_lo && coord <= strip.ext_hi {
+            let is_core = if strip.is_last {
+                coord >= strip.core_lo && coord <= strip.core_hi
+            } else {
+                coord >= strip.core_lo && coord < strip.core_hi
+            };
+            strip.writer.write_point(pt)?;
+            strip.tags.push((idx, is_core));
+        }
+    }
+    Ok(())
+}
 
-    match ext.as_str() {
-        "las" => {
-            let f = File::open(path)?;
-            let mut reader = LasReader::new(BufReader::new(f))?;
-            while reader.read_point(&mut pt)? {
-                out.push(pt);
-            }
-        }
-        "laz" => {
-            let f = File::open(path)?;
-            let mut reader = LazReader::new(BufReader::new(f))?;
-            while reader.read_point(&mut pt)? {
-                out.push(pt);
-            }
-        }
-        "copc" => {
-            use wblidar::copc::CopcReader;
-            let mut reader = CopcReader::open_path(path)?;
-            while reader.read_point(&mut pt)? {
-                out.push(pt);
-            }
-        }
-        _ => {
-            return Err(ClassifierError::UnsupportedFormat {
-                path: path.display().to_string(),
-            });
+/// The memory-gated spatial-split eigenvalue pre-pass path (Stage 30, Step
+/// 5d), used when the whole-file estimate in [`run_eigenvalue_prepass`]
+/// exceeds `config.eigen_memory_budget_bytes`.
+///
+/// Splits the input spatially along the **wider** bounding-box axis into
+/// `n_strips` roughly equal-width strips, each extended by an overlap buffer
+/// of `config.search_radius * 2.0` (a safety margin within the doc's
+/// suggested `1.5`–`2.0` range) shared with the adjacent strip(s). Each
+/// strip's selected points (core + overlap) are streamed into its own temp
+/// LAS file under `output_dir/_eigen_split_cache/`, `LidarEigenvalueFeaturesTool`
+/// is invoked once per strip, and only each strip's *core*-region rows are
+/// kept — border-only rows (present purely to give correct neighbourhood
+/// context near the strip's edges) are discarded. All strips' core rows are
+/// stitched back together into a single `Vec<[f32; 10]>` indexed by
+/// **original full-file** point index, identical in shape to the whole-file
+/// path's return value.
+///
+/// Temp-file hygiene mirrors the `.spill` file convention already
+/// established by `BlockPartitioner`: every strip's temp LAS file and
+/// `.eigen`/`.eigen.json` sidecars are deleted immediately after that
+/// strip's rows are consumed. A startup check **warns** (does not silently
+/// delete) about any pre-existing files found in the cache directory,
+/// signalling a possible prior interrupted run.
+///
+/// # Errors
+/// Returns [`ClassifierError::Tool`] if validation or execution of the
+/// underlying tool fails for any strip, [`ClassifierError::Pipeline`] if a
+/// strip's `.eigen` file is malformed, and [`ClassifierError::Io`] on file
+/// I/O failure (including reading/writing the per-strip temp LAS files).
+#[allow(clippy::too_many_lines)]
+fn run_eigenvalue_prepass_split(
+    input: &Path,
+    output_dir: &Path,
+    config: &PreprocessConfig,
+    total_points: u64,
+    bbox: (f64, f64, f64, f64),
+    n_strips: usize,
+) -> Result<Vec<[f32; 10]>> {
+    use serde_json::json;
+    use wbcore::{AllowAllCapabilities, RecordingProgressSink, Tool, ToolArgs, ToolContext};
+    use wblidar::io::{PointReader, PointWriter};
+    use wblidar::las::writer::LasWriter;
+    use wbtools_oss::tools::LidarEigenvalueFeaturesTool;
+
+    let (x_min, y_min, x_max, y_max) = bbox;
+    let dx = x_max - x_min;
+    let dy = y_max - y_min;
+    // Split along the wider axis, per the Approved Design's "simple, pragmatic
+    // split" directive — no attempt at density-aware or sampling-based splits.
+    let axis_is_x = dx >= dy;
+    let (lo, hi) = if axis_is_x {
+        (x_min, x_max)
+    } else {
+        (y_min, y_max)
+    };
+    let span = (hi - lo).max(f64::EPSILON);
+    #[allow(clippy::cast_precision_loss)]
+    let strip_width = span / n_strips as f64;
+    // Overlap buffer: >= search_radius, with a ×2 safety margin (within the
+    // doc's suggested ×1.5–2 range) — required for correctness, since a
+    // point near a strip's core boundary must still see its true full
+    // neighbourhood out to `search_radius` when the tool processes that
+    // strip's temp file.
+    let overlap = (config.search_radius * 2.0).max(0.0);
+
+    let cache_dir = output_dir.join("_eigen_split_cache");
+    fs::create_dir_all(&cache_dir)?;
+
+    // Startup check: warn (do not silently delete) about any pre-existing
+    // files in the cache directory — mirrors `BlockPartitioner::new()`'s
+    // `.spill` stale-file warning convention.
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            eprintln!(
+                "[warn] stale eigen-split cache file found (prior interrupted run?): {}",
+                entry.path().display()
+            );
         }
     }
 
-    Ok(out)
+    // ── Build one strip descriptor + temp LAS writer per strip ───────────
+    let writer_cfg = infer_writer_config_from_source(input)?;
+    let mut strips: Vec<EigenSplitStrip> = Vec::with_capacity(n_strips);
+    for i in 0..n_strips {
+        #[allow(clippy::cast_precision_loss)]
+        let i_f = i as f64;
+        let is_last = i + 1 == n_strips;
+        let core_lo = lo + i_f * strip_width;
+        let core_hi = if is_last {
+            hi
+        } else {
+            lo + (i_f + 1.0) * strip_width
+        };
+        let ext_lo = (core_lo - overlap).max(lo);
+        let ext_hi = (core_hi + overlap).min(hi);
+
+        let las_path = cache_dir.join(format!("strip_{i:04}.las"));
+        let writer: Box<dyn PointWriter> = Box::new(LasWriter::new(
+            BufWriter::new(File::create(&las_path)?),
+            writer_cfg.clone(),
+        )?);
+
+        strips.push(EigenSplitStrip {
+            core_lo,
+            core_hi,
+            ext_lo,
+            ext_hi,
+            is_last,
+            writer,
+            tags: Vec::new(),
+            las_path,
+        });
+    }
+
+    // ── Single pass over the input, routing each point to every strip whose
+    //    extended range contains it ────────────────────────────────────────
+    {
+        use std::io::BufReader;
+        use wblidar::las::LasReader;
+        use wblidar::laz::LazReader;
+
+        let ext = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let mut pt = PointRecord::default();
+        let mut idx: u64 = 0;
+
+        match ext.as_str() {
+            "las" => {
+                let f = File::open(input)?;
+                let mut reader = LasReader::new(BufReader::new(f))?;
+                while reader.read_point(&mut pt)? {
+                    route_point_to_strips(&pt, idx, axis_is_x, &mut strips)?;
+                    idx += 1;
+                }
+            }
+            "laz" => {
+                let f = File::open(input)?;
+                let mut reader = LazReader::new(BufReader::new(f))?;
+                while reader.read_point(&mut pt)? {
+                    route_point_to_strips(&pt, idx, axis_is_x, &mut strips)?;
+                    idx += 1;
+                }
+            }
+            "copc" => {
+                use wblidar::copc::CopcReader;
+                let mut reader = CopcReader::open_path(input)?;
+                while reader.read_point(&mut pt)? {
+                    route_point_to_strips(&pt, idx, axis_is_x, &mut strips)?;
+                    idx += 1;
+                }
+            }
+            _ => {
+                return Err(ClassifierError::UnsupportedFormat {
+                    path: input.display().to_string(),
+                });
+            }
+        }
+    }
+
+    // Finish (flush + close) every strip's temp LAS writer before invoking
+    // the tool on any of them.
+    for strip in &mut strips {
+        strip.writer.finish()?;
+    }
+
+    // ── Prepare the full-length output table ──────────────────────────────
+    #[allow(clippy::cast_possible_truncation)]
+    let total_points_usize = total_points as usize;
+    let mut full_table = vec![[0.0f32; 10]; total_points_usize];
+
+    // ── Run the tool once per strip; retain only core rows; clean up ──────
+    for strip in &strips {
+        if strip.tags.is_empty() {
+            // No points routed to this strip at all (possible for a very
+            // narrow / empty strip) — nothing to process, just discard the
+            // (empty) temp LAS file.
+            let _ = fs::remove_file(&strip.las_path);
+            continue;
+        }
+
+        let eigen_path = strip.las_path.with_extension("eigen");
+        let json_path = PathBuf::from(format!("{}.json", eigen_path.display()));
+
+        let mut args: ToolArgs = ToolArgs::new();
+        args.insert(
+            "input".to_string(),
+            json!(strip.las_path.display().to_string()),
+        );
+        args.insert("num_neighbours".to_string(), json!(7));
+        args.insert("search_radius".to_string(), json!(config.search_radius));
+        args.insert(
+            "output".to_string(),
+            json!(eigen_path.display().to_string()),
+        );
+
+        let progress = RecordingProgressSink::new();
+        let capabilities = AllowAllCapabilities;
+        let ctx = ToolContext {
+            progress: &progress,
+            capabilities: &capabilities,
+        };
+
+        let tool = LidarEigenvalueFeaturesTool;
+        tool.validate(&args)?;
+        tool.run(&args, &ctx)?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let strip_point_count = strip.tags.len() as u64;
+        let strip_table = read_eigen_file(&eigen_path, strip_point_count)?;
+
+        for (local_idx, (orig_idx, is_core)) in strip.tags.iter().enumerate() {
+            if *is_core {
+                if let Some(row) = strip_table.get(local_idx) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let orig_idx_usize = *orig_idx as usize;
+                    full_table[orig_idx_usize] = *row;
+                }
+            }
+        }
+
+        // Clean up this strip's temp files immediately after its rows are
+        // consumed — mirrors the `.spill` file "write → read once → delete"
+        // lifecycle.
+        let _ = fs::remove_file(&eigen_path);
+        let _ = fs::remove_file(&json_path);
+        let _ = fs::remove_file(&strip.las_path);
+    }
+
+    // Best-effort: remove the cache directory itself if it's now empty. Not
+    // an error if it still contains stale files from elsewhere (e.g. the
+    // stale-leftover warning case above) — `remove_dir` only succeeds on an
+    // empty directory.
+    let _ = fs::remove_dir(&cache_dir);
+
+    Ok(full_table)
+}
+
+/// Parse a `wbtools_oss::LidarEigenvalueFeaturesTool` `.eigen` binary sidecar
+/// into an in-memory table indexed by original-file point index.
+///
+/// The tool writes one 48-byte record per point in strict input stream order
+/// (`point_num` is the 0-based index, monotonically increasing with no gaps),
+/// so the returned `Vec<[f32; 10]>` can be indexed directly by point index.
+///
+/// `expected_points` is used only for a diagnostic warning if the actual
+/// record count differs (e.g. due to withheld points) — it is not a hard
+/// requirement, since the actual on-disk record count is authoritative.
+///
+/// # Errors
+/// Returns [`ClassifierError::Pipeline`] if the file size is not a multiple
+/// of `EIGEN_RECORD_BYTES`, or if any `point_num` is out of range for the
+/// file's own record count.
+fn read_eigen_file(path: &Path, expected_points: u64) -> Result<Vec<[f32; 10]>> {
+    let metadata = fs::metadata(path)?;
+    #[allow(clippy::cast_possible_truncation)]
+    let file_bytes = metadata.len() as usize;
+    if !file_bytes.is_multiple_of(EIGEN_RECORD_BYTES) {
+        return Err(ClassifierError::Pipeline(format!(
+            "eigen pre-pass output '{}' has size {file_bytes} bytes, not a multiple of \
+             {EIGEN_RECORD_BYTES} bytes/record",
+            path.display()
+        )));
+    }
+    let n = file_bytes / EIGEN_RECORD_BYTES;
+    #[allow(clippy::cast_possible_truncation)]
+    if n as u64 != expected_points {
+        eprintln!(
+            "[warn] eigen pre-pass output '{}' contains {n} records, header reported \
+             {expected_points} points",
+            path.display()
+        );
+    }
+
+    let mut table = vec![[0.0f32; 10]; n];
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; EIGEN_RECORD_BYTES];
+    for i in 0..n {
+        file.read_exact(&mut buf)?;
+        let corrupt = || {
+            ClassifierError::Pipeline(format!(
+                "eigen pre-pass output '{}' corrupt at record {i}",
+                path.display()
+            ))
+        };
+        let point_num = u64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?);
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = point_num as usize;
+        if idx >= n {
+            return Err(ClassifierError::Pipeline(format!(
+                "eigen pre-pass output '{}' has out-of-range point_num {point_num} at record {i}",
+                path.display()
+            )));
+        }
+        let mut row = [0.0f32; 10];
+        for (j, chunk) in buf[8..48].chunks_exact(4).enumerate() {
+            row[j] = f32::from_le_bytes(chunk.try_into().map_err(|_| corrupt())?);
+        }
+        table[idx] = row;
+    }
+    Ok(table)
 }
 
 // ── Border-point spill I/O (Stage 08) ────────────────────────────────────────
+
 //
 // Border points are written to `.border` files using the same compact binary
 // layout as the main `.spill` files (31 bytes per point).  This keeps the
@@ -689,11 +1200,11 @@ fn load_all_points(path: &Path) -> Result<Vec<PointRecord>> {
 /// Bytes per point in a border spill file — identical to the main spill format.
 const BORDER_PT_BYTES: usize = 31;
 
-/// Write a slice of `PointRecord`s to a `.border` spill file.
+/// Write a slice of `LitePoint`s to a `.border` spill file.
 ///
 /// # Errors
 /// Returns `ClassifierError` on any I/O failure.
-fn write_border_spill(path: &Path, pts: &[PointRecord]) -> Result<()> {
+fn write_border_spill(path: &Path, pts: &[LitePoint]) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     let mut buf = [0u8; BORDER_PT_BYTES];
@@ -712,12 +1223,12 @@ fn write_border_spill(path: &Path, pts: &[PointRecord]) -> Result<()> {
     Ok(())
 }
 
-/// Read a `.border` spill file back into a `Vec<PointRecord>`.
+/// Read a `.border` spill file back into a `Vec<LitePoint>`.
 ///
 /// # Errors
 /// Returns [`ClassifierError::SpillCorrupt`] if the file size is not a
 /// multiple of `BORDER_PT_BYTES` or if any read fails.
-fn read_border_spill(path: &Path) -> Result<Vec<PointRecord>> {
+fn read_border_spill(path: &Path) -> Result<Vec<LitePoint>> {
     let metadata = fs::metadata(path).map_err(|_| ClassifierError::SpillCorrupt {
         path: path.display().to_string(),
     })?;
@@ -737,7 +1248,7 @@ fn read_border_spill(path: &Path) -> Result<Vec<PointRecord>> {
         let corrupt = || ClassifierError::SpillCorrupt {
             path: path.display().to_string(),
         };
-        let pt = PointRecord {
+        let pt = LitePoint {
             x: f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
             y: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
             z: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
@@ -746,7 +1257,6 @@ fn read_border_spill(path: &Path) -> Result<Vec<PointRecord>> {
             return_number: buf[27],
             number_of_returns: buf[28],
             scan_angle: i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
-            ..PointRecord::default()
         };
         pts.push(pt);
     }
@@ -803,13 +1313,14 @@ fn write_feat_file(
     Ok(())
 }
 
-/// Write a debug CSV file with dynamic column names derived from `search_radii`.
-fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> Result<()> {
+/// Write a debug CSV file with the fixed Stage 30 (Step 5e+5f+5g) column layout:
+/// 7 scalar columns followed by the 10 fixed eigenvalue-feature columns
+/// produced by the whole-file pre-pass.
+fn write_debug_csv(path: &Path, features: &[Vec<f32>]) -> Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
 
-    // Build dynamic header.
-    let mut cols = vec![
+    let cols = [
         "x_norm",
         "y_norm",
         "z_norm",
@@ -817,22 +1328,17 @@ fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> 
         "return_ratio",
         "scan_angle_norm",
         "hag",
-    ];
-    let eigen_names = [
+        "lambda1",
+        "lambda2",
+        "lambda3",
         "linearity",
         "planarity",
         "sphericity",
         "omnivariance",
-        "curvature",
+        "eigentropy",
+        "slope",
+        "residual",
     ];
-    let mut extra: Vec<String> = Vec::new();
-    for r in search_radii {
-        for name in &eigen_names {
-            extra.push(format!("{name}_r{r:.2}"));
-        }
-    }
-    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
-    cols.extend_from_slice(&extra_refs);
     writeln!(w, "{}", cols.join(","))?;
 
     for row in features {
@@ -846,6 +1352,57 @@ fn write_debug_csv(path: &Path, features: &[Vec<f32>], search_radii: &[f64]) -> 
 
     w.flush()?;
     Ok(())
+}
+
+// ── Stage 08: border-point loader ────────────────────────────────────────────
+
+/// Collect points from the up-to-8 grid neighbours of `target` that fall
+/// within the expanded bounding box `[origin - overlap, origin + block_size + overlap]`.
+///
+/// This function is called **sequentially** before the Rayon parallel phase so
+/// that all spill files are guaranteed to exist (no concurrent `load()` calls
+/// have deleted them yet).  The returned `Vec<LitePoint>` is written to a
+/// `.border` spill file by the caller; it is not held in memory across blocks.
+///
+/// Points that belong to the target block itself are not included — only
+/// genuine cross-boundary neighbours are returned.
+fn load_border_points(
+    stubs_by_cell: &HashMap<(i32, i32), usize>,
+    all_stubs: &[BlockStub],
+    target: &BlockStub,
+    block_size: f64,
+    overlap: f64,
+) -> Result<Vec<LitePoint>> {
+    // Expanded bounding box of the target block in projection units.
+    let x_lo = target.origin_x - overlap;
+    let x_hi = target.origin_x + block_size + overlap;
+    let y_lo = target.origin_y - overlap;
+    let y_hi = target.origin_y + block_size + overlap;
+
+    let mut border: Vec<LitePoint> = Vec::new();
+
+    // Iterate over all 8 cardinal + diagonal neighbours.
+    for dc in -1_i32..=1 {
+        for dr in -1_i32..=1 {
+            if dc == 0 && dr == 0 {
+                continue; // skip the target block itself
+            }
+            let key = (target.col + dc, target.row + dr);
+            if let Some(&idx) = stubs_by_cell.get(&key) {
+                let neighbour = &all_stubs[idx];
+                // Read neighbour spill files without deleting them.
+                let pts = neighbour.read_points()?;
+                for pt in pts {
+                    // Keep only points that fall inside the expanded bbox.
+                    if pt.x >= x_lo && pt.x <= x_hi && pt.y >= y_lo && pt.y <= y_hi {
+                        border.push(pt);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(border)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -872,7 +1429,6 @@ mod tests {
             grid_rows: 4,
             grid_x_min: 0.0,
             grid_y_min: 0.0,
-            search_radii: vec![],
             outlier_removal: false,
             outlier_radius: 2.0,
             outlier_elev_diff: 50.0,
@@ -894,6 +1450,9 @@ mod tests {
 
     /// Older `blocks.json` files that pre-date Stage 08 lack `block_overlap`.
     /// Deserialisation must succeed and default to `0.0`.
+    // The default value is the literal 0.0 constant (serde's `#[serde(default)]`
+    // on an f64 field), so exact equality is deterministic and safe here.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_manifest_block_overlap_default_on_missing() {
         // Minimal JSON without block_overlap field.
@@ -918,21 +1477,23 @@ mod tests {
     /// path) must return an empty Vec without error.
     #[test]
     fn test_load_border_points_no_neighbours() {
+        use crate::preprocessing::block_partitioner::BlockPartitioner;
         use std::collections::HashMap;
-        use wblidar::PointRecord;
 
         let stubs_by_cell: HashMap<(i32, i32), usize> = HashMap::new();
         let all_stubs: Vec<crate::preprocessing::block_partitioner::BlockStub> = vec![];
 
         // Build a real stub via BlockPartitioner so we have a valid target.
         let dir = tempfile::tempdir().unwrap();
-        use crate::preprocessing::block_partitioner::BlockPartitioner;
         let mut partitioner = BlockPartitioner::new(0.0, 0.0, 50.0, 50.0, 50.0, dir.path());
-        let mut pt = PointRecord::default();
-        pt.x = 25.0;
-        pt.y = 25.0;
-        pt.z = 10.0;
-        partitioner.add_point(pt).unwrap();
+
+        let pt = LitePoint {
+            x: 25.0,
+            y: 25.0,
+            z: 10.0,
+            ..LitePoint::default()
+        };
+        partitioner.add_point(0, pt).unwrap();
         let stubs = partitioner.finalize_stubs().unwrap();
         assert_eq!(stubs.len(), 1);
 
@@ -945,6 +1506,9 @@ mod tests {
     // ── CLI validation ────────────────────────────────────────────────────────
 
     /// `block_overlap` defaults to `0.0` in `PreprocessConfig`.
+    // Exact-zero comparison against a `Default`-derived literal `0.0` constant;
+    // no floating-point arithmetic occurs, so this cannot be a precision issue.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_preprocess_config_default_overlap() {
         let cfg = crate::preprocessing::PreprocessConfig::default();
@@ -955,22 +1519,25 @@ mod tests {
 
     /// Write a set of PointRecords to a `.border` file and read them back.
     /// All serialised fields must survive the round-trip exactly.
+    // Test fixture field generation from a small index range (0..20); all
+    // casts here operate on small non-negative values well within the target
+    // types' ranges, so truncation/sign-loss is not a real concern.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[test]
     fn test_border_spill_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.border");
 
-        let pts: Vec<PointRecord> = (0..20)
-            .map(|i| PointRecord {
-                x: i as f64 * 1.5,
-                y: i as f64 * 0.7,
-                z: i as f64 * 0.3,
+        let pts: Vec<LitePoint> = (0..20)
+            .map(|i| LitePoint {
+                x: f64::from(i) * 1.5,
+                y: f64::from(i) * 0.7,
+                z: f64::from(i) * 0.3,
                 intensity: (i * 1000) as u16,
                 classification: (i % 8) as u8,
                 return_number: 1,
                 number_of_returns: 2,
                 scan_angle: (i as i16) - 10,
-                ..PointRecord::default()
             })
             .collect();
 
@@ -1005,55 +1572,277 @@ mod tests {
         let recovered = read_border_spill(&path).unwrap();
         assert!(recovered.is_empty(), "empty write → empty read");
     }
-}
 
-// ── Stage 08: border-point loader ────────────────────────────────────────────
+    // ── Eigenvalue pre-pass (Stage 30, Step 5b/5c) ────────────────────────────
 
-/// Collect points from the up-to-8 grid neighbours of `target` that fall
-/// within the expanded bounding box `[origin - overlap, origin + block_size + overlap]`.
-///
-/// This function is called **sequentially** before the Rayon parallel phase so
-/// that all spill files are guaranteed to exist (no concurrent `load()` calls
-/// have deleted them yet).  The returned `Vec<PointRecord>` is written to a
-/// `.border` spill file by the caller; it is not held in memory across blocks.
-///
-/// Points that belong to the target block itself are not included — only
-/// genuine cross-boundary neighbours are returned.
-fn load_border_points(
-    stubs_by_cell: &HashMap<(i32, i32), usize>,
-    all_stubs: &[BlockStub],
-    target: &BlockStub,
-    block_size: f64,
-    overlap: f64,
-) -> Result<Vec<PointRecord>> {
-    // Expanded bounding box of the target block in projection units.
-    let x_lo = target.origin_x - overlap;
-    let x_hi = target.origin_x + block_size + overlap;
-    let y_lo = target.origin_y - overlap;
-    let y_hi = target.origin_y + block_size + overlap;
-
-    let mut border: Vec<PointRecord> = Vec::new();
-
-    // Iterate over all 8 cardinal + diagonal neighbours.
-    for dc in -1_i32..=1 {
-        for dr in -1_i32..=1 {
-            if dc == 0 && dr == 0 {
-                continue; // skip the target block itself
-            }
-            let key = (target.col + dc, target.row + dr);
-            if let Some(&idx) = stubs_by_cell.get(&key) {
-                let neighbour = &all_stubs[idx];
-                // Read neighbour spill files without deleting them.
-                let pts = neighbour.read_points()?;
-                for pt in pts {
-                    // Keep only points that fall inside the expanded bbox.
-                    if pt.x >= x_lo && pt.x <= x_hi && pt.y >= y_lo && pt.y <= y_hi {
-                        border.push(pt);
-                    }
+    #[test]
+    fn test_read_eigen_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.eigen");
+        let rows: Vec<[f32; 10]> = (0..5)
+            .map(|i: usize| {
+                let mut r = [0.0f32; 10];
+                for (j, v) in r.iter_mut().enumerate() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let v_val = (i * 10 + j) as f32 * 0.1;
+                    *v = v_val;
                 }
+                r
+            })
+            .collect();
+
+        {
+            let mut writer = BufWriter::new(File::create(&path).unwrap());
+            for (point_num, row) in rows.iter().enumerate() {
+                writer.write_all(&(point_num as u64).to_le_bytes()).unwrap();
+                for v in row {
+                    writer.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
+            writer.flush().unwrap();
+        }
+
+        let table = read_eigen_file(&path, 5).unwrap();
+        assert_eq!(table.len(), 5);
+        for (a, b) in rows.iter().zip(table.iter()) {
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-6);
             }
         }
     }
 
-    Ok(border)
+    #[test]
+    fn test_run_eigenvalue_prepass_whole_file() {
+        use wblidar::io::PointWriter;
+        use wblidar::las::writer::{LasWriter, WriterConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.las");
+
+        let pts: Vec<PointRecord> = (0..20)
+            .map(|i: i32| PointRecord {
+                x: f64::from(i),
+                y: f64::from(i % 5),
+                z: f64::from(i % 3) * 0.5,
+                intensity: 100,
+                classification: 2,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            })
+            .collect();
+
+        {
+            let cfg = WriterConfig::default();
+            let mut writer =
+                LasWriter::new(BufWriter::new(File::create(&input_path).unwrap()), cfg).unwrap();
+            for pt in &pts {
+                writer.write_point(pt).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let config = PreprocessConfig {
+            search_radius: 5.0,
+            ..PreprocessConfig::default()
+        };
+
+        let bbox = (0.0, 0.0, 19.0, 4.0);
+        let table =
+            run_eigenvalue_prepass(&input_path, dir.path(), &config, pts.len() as u64, bbox)
+                .unwrap();
+        assert_eq!(table.len(), pts.len());
+
+        // Sidecar files must be cleaned up.
+        assert!(!dir.path().join("_eigen_prepass.eigen").exists());
+        assert!(!dir.path().join("_eigen_prepass.eigen.json").exists());
+    }
+
+    // ── Eigenvalue pre-pass memory-gated spatial split (Stage 30, Step 5d) ────
+
+    #[test]
+    fn test_compute_n_strips_ceils_and_clamps_to_two() {
+        assert_eq!(compute_n_strips(100, 40), 3); // ceil(2.5) = 3
+        assert_eq!(compute_n_strips(81, 40), 3); // ceil(2.025) = 3
+        assert_eq!(compute_n_strips(41, 40), 2); // ceil(1.025) = 2
+        assert_eq!(compute_n_strips(80, 40), 2); // exactly 2
+        assert_eq!(compute_n_strips(0, 40), 2); // clamped to minimum of 2
+    }
+
+    #[test]
+    fn test_run_eigenvalue_prepass_split_produces_full_length_table() {
+        use wblidar::io::PointWriter;
+        use wblidar::las::writer::{LasWriter, WriterConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.las");
+
+        // 60 points spread along X so a 3-way split has a clear "wider axis".
+        let pts: Vec<PointRecord> = (0..60)
+            .map(|i: i32| PointRecord {
+                x: f64::from(i),
+                y: f64::from(i % 4),
+                z: f64::from(i % 3) * 0.5,
+                intensity: 100,
+                classification: 2,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            })
+            .collect();
+
+        {
+            let cfg = WriterConfig::default();
+            let mut writer =
+                LasWriter::new(BufWriter::new(File::create(&input_path).unwrap()), cfg).unwrap();
+            for pt in &pts {
+                writer.write_point(pt).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let config = PreprocessConfig {
+            search_radius: 5.0,
+            ..PreprocessConfig::default()
+        };
+
+        let bbox = (0.0, 0.0, 59.0, 3.0);
+        let table = run_eigenvalue_prepass_split(
+            &input_path,
+            dir.path(),
+            &config,
+            pts.len() as u64,
+            bbox,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(table.len(), pts.len());
+
+        // The split cache directory contents must be cleaned up (each
+        // strip's temp LAS + sidecars are removed as soon as consumed).
+        let cache_dir = dir.path().join("_eigen_split_cache");
+        let remaining: Vec<_> = fs::read_dir(&cache_dir)
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            remaining.is_empty(),
+            "split cache must be emptied after use: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn test_run_eigenvalue_prepass_dispatches_to_split_when_over_budget() {
+        use wblidar::io::PointWriter;
+        use wblidar::las::writer::{LasWriter, WriterConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.las");
+
+        let pts: Vec<PointRecord> = (0..40)
+            .map(|i: i32| PointRecord {
+                x: f64::from(i),
+                y: f64::from(i % 5),
+                z: f64::from(i % 3) * 0.5,
+                intensity: 100,
+                classification: 2,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            })
+            .collect();
+
+        {
+            let cfg = WriterConfig::default();
+            let mut writer =
+                LasWriter::new(BufWriter::new(File::create(&input_path).unwrap()), cfg).unwrap();
+            for pt in &pts {
+                writer.write_point(pt).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        // Budget deliberately set to force exactly 2 strips:
+        // ceil((n * size_of::<PointRecord>()) / budget) == 2.
+        let point_record_size = std::mem::size_of::<PointRecord>();
+        let estimated = point_record_size * pts.len();
+        let budget = estimated / 2 + 1;
+
+        let config = PreprocessConfig {
+            search_radius: 5.0,
+            eigen_memory_budget_bytes: budget,
+            ..PreprocessConfig::default()
+        };
+
+        let bbox = (0.0, 0.0, 39.0, 4.0);
+        let table =
+            run_eigenvalue_prepass(&input_path, dir.path(), &config, pts.len() as u64, bbox)
+                .unwrap();
+        assert_eq!(table.len(), pts.len());
+    }
+
+    #[test]
+    fn test_run_eigenvalue_prepass_split_warns_about_stale_cache_files_but_does_not_delete_them() {
+        use wblidar::io::PointWriter;
+        use wblidar::las::writer::{LasWriter, WriterConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.las");
+
+        let pts: Vec<PointRecord> = (0..20)
+            .map(|i: i32| PointRecord {
+                x: f64::from(i),
+                y: f64::from(i % 4),
+                z: 0.0,
+                intensity: 50,
+                classification: 2,
+                return_number: 1,
+                number_of_returns: 1,
+                ..PointRecord::default()
+            })
+            .collect();
+
+        {
+            let cfg = WriterConfig::default();
+            let mut writer =
+                LasWriter::new(BufWriter::new(File::create(&input_path).unwrap()), cfg).unwrap();
+            for pt in &pts {
+                writer.write_point(pt).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        // Simulate a stale leftover from a prior interrupted run, using a
+        // filename that will not collide with this run's own strip files
+        // (which are always named `strip_%04d.las`) — this run only ever
+        // deletes files it itself created.
+        let cache_dir = dir.path().join("_eigen_split_cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let stale_path = cache_dir.join("leftover_from_prior_run.tmp");
+        fs::write(&stale_path, b"stale").unwrap();
+
+        let config = PreprocessConfig {
+            search_radius: 5.0,
+            ..PreprocessConfig::default()
+        };
+
+        let bbox = (0.0, 0.0, 19.0, 3.0);
+        let table = run_eigenvalue_prepass_split(
+            &input_path,
+            dir.path(),
+            &config,
+            pts.len() as u64,
+            bbox,
+            2,
+        )
+        .unwrap();
+        assert_eq!(table.len(), pts.len());
+
+        // The pre-existing stale file must still be present -- we only *warn*,
+        // never silently delete leftovers from a prior interrupted run.
+        assert!(
+            stale_path.exists(),
+            "stale leftover file must not be deleted"
+        );
+    }
 }

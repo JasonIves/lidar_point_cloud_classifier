@@ -375,6 +375,10 @@ mod tests {
         assert_eq!(cm[2][0], 1);
     }
 
+    // f64 -> f32 narrowing here is an intentional, expected precision
+    // reduction for a small hand-verified 3-class weight computation; the
+    // test only checks the result within a 1e-3 tolerance.
+    #[allow(clippy::cast_possible_truncation)]
     #[test]
     fn test_class_weight_computation() {
         // 3 classes, known counts: [100, 50, 25]
@@ -395,6 +399,9 @@ mod tests {
         assert!((weights[2] - 2.3333).abs() < 1e-3);
     }
 
+    // Deterministic small-fixture arithmetic (16 tiles, 0.25 fraction): the
+    // f64 -> usize cast here can never truncate or lose sign in practice.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[test]
     fn test_spatial_split_fraction() {
         // 16 macro-tiles (4x4 grid), val_split = 0.25 → expect ~4 val tiles

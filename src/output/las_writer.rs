@@ -233,7 +233,6 @@ mod tests {
             grid_rows: 1,
             grid_x_min: origin_x,
             grid_y_min: origin_y,
-            search_radii: vec![],
             outlier_removal: false,
             outlier_radius: 2.0,
             outlier_elev_diff: 50.0,
@@ -254,8 +253,10 @@ mod tests {
 
     /// Write a tiny synthetic LAS file with `n` points.
     fn write_synthetic_las(path: &Path, points: &[PointRecord]) -> Result<()> {
-        let mut cfg = WriterConfig::default();
-        cfg.point_data_format = PointDataFormat::Pdrf6;
+        let cfg = WriterConfig {
+            point_data_format: PointDataFormat::Pdrf6,
+            ..Default::default()
+        };
         let mut writer = LasWriter::new(BufWriter::new(File::create(path)?), cfg)
             .map_err(ClassifierError::Lidar)?;
         for pt in points {
@@ -313,7 +314,7 @@ mod tests {
         ];
 
         // Write synthetic LAS input
-        let input_tmp = NamedTempFile::new().map_err(|e| ClassifierError::Io(e.into()))?;
+        let input_tmp = NamedTempFile::new().map_err(ClassifierError::Io)?;
         write_synthetic_las(input_tmp.path(), &orig_pts)?;
 
         // Build inference map: block 0 covers [0,50)×[0,50), sampled points at exact input coords
@@ -329,7 +330,7 @@ mod tests {
         let manifest = single_block_manifest(50.0, 0.0, 0.0);
 
         // Run write_classified
-        let output_tmp = NamedTempFile::new().map_err(|e| ClassifierError::Io(e.into()))?;
+        let output_tmp = NamedTempFile::new().map_err(ClassifierError::Io)?;
         // Need a .las extension for format detection; rename tempfile
         let output_path = output_tmp.path().with_extension("las");
         write_classified(input_tmp.path(), &output_path, &inference_map, &manifest)?;

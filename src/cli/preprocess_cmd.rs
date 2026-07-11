@@ -77,16 +77,6 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                     "--search-radius",
                 )?;
             }
-            "--search-radii" => {
-                let s = next_value(args, &mut i, "--search-radii")?;
-                cfg.search_radii = s
-                    .split(',')
-                    .map(|v| {
-                        let v = v.trim();
-                        parse_f64(v, "--search-radii")
-                    })
-                    .collect::<Result<Vec<f64>>>()?;
-            }
             "--min-neighbors" => {
                 cfg.min_neighbors = parse_usize(
                     next_value(args, &mut i, "--min-neighbors")?,
@@ -135,6 +125,13 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                     "--oversample-jitter",
                 )?;
             }
+            "--eigen-memory-budget-mb" => {
+                let mb = parse_usize(
+                    next_value(args, &mut i, "--eigen-memory-budget-mb")?,
+                    "--eigen-memory-budget-mb",
+                )?;
+                cfg.eigen_memory_budget_bytes = mb.saturating_mul(1024 * 1024);
+            }
             unknown => {
                 return Err(ClassifierError::Pipeline(format!(
                     "unknown argument: '{unknown}'"
@@ -176,13 +173,6 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             "--search-radius must be a positive finite number".to_string(),
         ));
     }
-    for &r in &cfg.search_radii {
-        if r <= 0.0 || !r.is_finite() {
-            return Err(ClassifierError::Pipeline(
-                "--search-radii: all values must be positive finite numbers".to_string(),
-            ));
-        }
-    }
     if cfg.min_neighbors == 0 {
         return Err(ClassifierError::Pipeline(
             "--min-neighbors must be >= 1".to_string(),
@@ -211,6 +201,11 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     if cfg.oversample_jitter < 0.0 || !cfg.oversample_jitter.is_finite() {
         return Err(ClassifierError::Pipeline(
             "--oversample-jitter must be >= 0.0 and finite".to_string(),
+        ));
+    }
+    if cfg.eigen_memory_budget_bytes == 0 {
+        return Err(ClassifierError::Pipeline(
+            "--eigen-memory-budget-mb must be >= 1".to_string(),
         ));
     }
 
@@ -272,7 +267,6 @@ fn print_help() {
            --target-points <uint>  Points per block after sampling (default: 1024)\n\
            --min-density   <f64>   Minimum pts/m² to retain a block (default: 1.0)\n\
            --search-radius <f64>   Base neighbourhood radius for eigenvalue features (default: 1.0)
-           --search-radii  <f64,.> Comma-separated radii for multi-scale features; overrides --search-radius\n\
            --min-neighbors <uint>  Minimum neighbours; radius expands adaptively (default: 8)\n\
            --hag-model     <path>  DTM raster for Height Above Ground (default: block-min-z proxy)\n\
            --threads       <uint>  Rayon thread pool size (default: system cores)\n\
@@ -293,6 +287,11 @@ fn print_help() {
          JITTER-BASED OVERSAMPLING (disabled by default):\n\
            --oversample-jitter <f64>   Std-dev (projection units) of per-axis Gaussian jitter\n\
                                        applied to padding-only points when a block is\n\
-                                       oversampled. Offsets are clipped to ±3σ. (default: 0.0)\n"
+                                       oversampled. Offsets are clipped to ±3σ. (default: 0.0)\n\
+         \n\
+         EIGENVALUE-FEATURE PRE-PASS MEMORY BUDGET:\n\
+           --eigen-memory-budget-mb <uint>  Memory budget (MB) gating whether the whole-file\n\
+                                       eigenvalue-feature pre-pass runs in one pass or is\n\
+                                       split into memory-gated spatial strips (default: 2048)\n"
     );
 }

@@ -30,7 +30,7 @@ use crate::model::layers::{apply_bn2d, global_max_pool, relu, BatchNorm1d, Linea
 /// file; a mismatch is caught at load time, not at inference time.
 #[derive(Debug, Clone)]
 pub struct PointNetConfig {
-    /// Number of input features per point (must equal Stage 01 `N_FEATURES = 12`).
+    /// Number of input features per point (must equal Stage 01 `N_FEATURES = 17`).
     pub n_features_in: usize,
     /// Hidden dimensions for encoder MLP layers.
     /// `encoder_dims[0]` is the "local feature" width used in the segmentation concat.
@@ -204,17 +204,17 @@ mod tests {
     use crate::model::layers::Linear;
     use ndarray::{Array1, Array2};
 
-    /// Build a minimal PointNetClassifier with zero weights, no BN, no T-Nets.
+    /// Build a minimal `PointNetClassifier` with zero weights, no BN, no T-Nets.
     fn make_classifier(
         n_features_in: usize,
-        encoder_dims: Vec<usize>,
-        decoder_dims: Vec<usize>,
+        encoder_dims: &[usize],
+        decoder_dims: &[usize],
         n_classes: usize,
     ) -> PointNetClassifier {
         let config = PointNetConfig {
             n_features_in,
-            encoder_dims: encoder_dims.clone(),
-            decoder_dims: decoder_dims.clone(),
+            encoder_dims: encoder_dims.to_owned(),
+            decoder_dims: decoder_dims.to_owned(),
             n_classes,
             use_batch_norm: false,
             use_input_tnet: false,
@@ -224,7 +224,7 @@ mod tests {
         // Build encoder layers
         let mut encoder_layers = Vec::new();
         let mut prev = n_features_in;
-        for &dim in &encoder_dims {
+        for &dim in encoder_dims {
             let w = Array2::zeros((dim, prev));
             let b = Array1::zeros(dim);
             encoder_layers.push((Linear::new(w, b).unwrap(), None));
@@ -235,7 +235,7 @@ mod tests {
         let concat_dim = config.concat_dim();
         let mut decoder_layers = Vec::new();
         let mut prev_d = concat_dim;
-        for &dim in &decoder_dims {
+        for &dim in decoder_dims {
             let w = Array2::zeros((dim, prev_d));
             let b = Array1::zeros(dim);
             decoder_layers.push((Linear::new(w, b).unwrap(), None));
@@ -246,8 +246,13 @@ mod tests {
         let class_proj =
             Linear::new(Array2::zeros((n_classes, prev_d)), Array1::zeros(n_classes)).unwrap();
 
-        // Default label map: identity ASPRS codes 0..n_classes
-        let label_map: Vec<u8> = (0u8..n_classes as u8).collect();
+        // Default label map: identity ASPRS codes 0..n_classes.  `n_classes`
+        // is always a small test fixture value (well within `u8` range), so
+        // an out-of-range input safely (if surprisingly) saturates at
+        // `u8::MAX` rather than panicking or silently wrapping.
+        let label_map: Vec<u8> = (0..n_classes)
+            .map(|i| u8::try_from(i).unwrap_or(u8::MAX))
+            .collect();
 
         PointNetClassifier {
             config,
@@ -263,7 +268,7 @@ mod tests {
     // DoD #11 — forward output shape with input T-Net disabled
     #[test]
     fn test_forward_output_shape_no_tnet() {
-        let clf = make_classifier(12, vec![64, 128, 256], vec![256, 128], 8);
+        let clf = make_classifier(12, &[64, 128, 256], &[256, 128], 8);
         let input = Array2::<f32>::zeros((1024, 12));
         let logits = clf.forward(input).expect("forward failed");
         assert_eq!(logits.shape(), &[1024, 8]);
@@ -274,7 +279,7 @@ mod tests {
     fn test_forward_output_shape_with_tnets() {
         use crate::model::layers::TNet;
 
-        let mut clf = make_classifier(12, vec![64, 128, 256], vec![256, 128], 8);
+        let mut clf = make_classifier(12, &[64, 128, 256], &[256, 128], 8);
 
         // Build zero-weight STN3d and STN64d
         let stn3d = TNet {
@@ -319,7 +324,7 @@ mod tests {
     // DoD #14 — label mapping (argmax → ASPRS code)
     #[test]
     fn test_classify_label_mapping() {
-        let clf = make_classifier(12, vec![64, 128, 256], vec![256, 128], 3);
+        let clf = make_classifier(12, &[64, 128, 256], &[256, 128], 3);
         // Manually override label_map
         let mut clf = clf;
         clf.label_map = vec![2u8, 5u8, 6u8]; // Ground, Building, Water
@@ -345,8 +350,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
+                .map_or(0, |(idx, _)| idx);
             labels.push(clf.label_map[best]);
         }
         assert_eq!(labels, vec![5u8, 6u8, 2u8]);

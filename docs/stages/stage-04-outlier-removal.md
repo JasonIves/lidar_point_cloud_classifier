@@ -200,3 +200,27 @@ styles without breaking existing scripts that omit the value.
 | `src/cli/preprocess_labeled_cmd.rs` | Same three flags updated; helper added |
 
 **Verified:** `cargo build --features training` — `Finished` with zero errors. ✓
+
+---
+
+## Addendum — 2026-07-10: Superseded by Stage 30
+
+The 2026-06-17 workaround referenced throughout this document (`outlier_filter.rs`,
+a local re-implementation of the outlier-removal algorithm adopted to avoid a
+slow/unavailable `wbtools_oss` git dependency at the time) has been **reverted**
+as part of Stage 30 ("Whitebox Git Dependency Integration"). `wbtools_oss` is now
+pinned as a `git` dependency (see `Cargo.toml` and
+`docs/stages/stage-30-whitebox-git-dependency-integration.md`), and
+`src/preprocessing/pipeline.rs` once again calls
+`wbtools_oss::tools::LidarRemoveOutliersTool` directly via the `wbcore::Tool`
+trait, exactly as originally specified above in this document's **Algorithm**
+and **Steps & Specifications** sections. `outlier_filter.rs` has been deleted;
+its `pub mod` declaration has been removed from `src/preprocessing/mod.rs`.
+
+This addendum supersedes the "Implementation Note — wbtools_oss Removal"
+section above, which now describes a historical, reverted state rather than
+the current implementation. No further action is required on this document;
+it is retained for historical record of the original design and the
+temporary workaround's rationale.
+
+

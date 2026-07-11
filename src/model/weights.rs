@@ -423,6 +423,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Build a deterministically initialised small classifier (no T-Nets, no BN).
+    // Test fixture weight arrays are generated from small index ranges (<=768
+    // elements); precision loss converting the loop index to f32 is negligible
+    // and irrelevant to the round-trip correctness this test verifies.
+    #[allow(clippy::cast_precision_loss)]
     fn make_small_classifier() -> PointNetClassifier {
         let config = PointNetConfig {
             n_features_in: 12,
@@ -484,6 +488,9 @@ mod tests {
     }
 
     // DoD #13 — .wbmodel round-trip: save, reload, run identical input, bit-identical output
+    // Test fixture input generation from small index ranges (8x12=96 elements);
+    // precision loss converting the index to f32 is negligible here.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_wbmodel_round_trip() -> crate::error::Result<()> {
         let model = make_small_classifier();
@@ -493,7 +500,8 @@ mod tests {
         let logits_before = model.forward(input.clone())?;
 
         // Save to temp file
-        let tmp = NamedTempFile::new().map_err(|e| ClassifierError::Io(e.into()))?;
+        let tmp = NamedTempFile::new().map_err(ClassifierError::Io)?;
+
         save_model(tmp.path(), &model)?;
 
         // Reload
