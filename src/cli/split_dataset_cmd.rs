@@ -12,11 +12,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::dataset_split::{three_way_spatial_split_multi, MultiThreeWaySplit};
 use crate::preprocessing::labeled_pipeline::{LabeledBlockManifest, LabeledBlockMeta};
-use crate::preprocessing::validate_block_filename;
+use crate::preprocessing::{validate_block_filename, RAYON_MIN_CHUNK};
+
+/// Number of completed blocks between periodic progress log lines during
+/// large subset materialization (Stage 35) — chosen so large runs (hundreds
+/// of thousands of blocks) get periodic feedback on stderr without flooding
+/// it (e.g. 46 lines total for a 456,000-block subset).
+const PROGRESS_LOG_INTERVAL: usize = 10_000;
 
 pub fn run(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -178,10 +187,46 @@ fn materialize_split(
 ) -> Result<()> {
     fs::create_dir_all(output)?;
 
-    write_subset(inputs, output, "train", manifests, &split.train, move_files)?;
-    write_subset(inputs, output, "val", manifests, &split.val, move_files)?;
+    // Stage 35: build this full-manifest lookup exactly once and share it by
+    // reference across all (up to 3) `write_subset()` calls below, instead
+    // of each call redundantly rebuilding the same map from scratch (which
+    // is wasted work proportional to the *entire* merged dataset size, up
+    // to 3x per run).
+    let mut block_lookup: HashMap<(usize, u64), &LabeledBlockMeta> = HashMap::new();
+    for (dir_idx, manifest) in manifests.iter().enumerate() {
+        for b in &manifest.blocks {
+            block_lookup.insert((dir_idx, b.meta.id), b);
+        }
+    }
+
+    write_subset(
+        inputs,
+        output,
+        "train",
+        manifests,
+        &block_lookup,
+        &split.train,
+        move_files,
+    )?;
+    write_subset(
+        inputs,
+        output,
+        "val",
+        manifests,
+        &block_lookup,
+        &split.val,
+        move_files,
+    )?;
     if !split.test.is_empty() {
-        write_subset(inputs, output, "test", manifests, &split.test, move_files)?;
+        write_subset(
+            inputs,
+            output,
+            "test",
+            manifests,
+            &block_lookup,
+            &split.test,
+            move_files,
+        )?;
     }
 
     eprintln!(
@@ -209,19 +254,35 @@ fn materialize_split(
 /// to its own file's bounding box — never collide in the merged output
 /// directory. See `docs/stages/stage-33-multi-input-dataset-split.md`.
 ///
-/// `--move` semantics (`DoD` item 7, Stage 32/33): every block's pair of
-/// files is fully copied first; only after *both* files of a block have been
-/// successfully copied are the *source* files removed. If copying a block's
-/// `.lbl` file fails after its `.feat` file already succeeded, the
-/// already-copied `.feat` destination file is left in place (harmless — it
-/// will simply be re-copied/overwritten on a re-run) but neither source file
-/// for that block is deleted, so no data is ever lost to a partial failure.
+/// `--move` semantics (`DoD` item 7, Stage 32/33): for each block, either
+/// (a) a same-volume `fs::rename` atomically relocates a file in a single
+/// filesystem-metadata operation (no data physically copied, and the source
+/// is inherently gone the instant the destination exists — there is no
+/// intermediate "copied but not yet removed" window to protect), or (b) if
+/// rename fails (e.g. a cross-volume move), the pre-Stage-35 fallback of
+/// copy-then-remove-source is used, which only removes the source after the
+/// copy has confirmed succeeded. Either way, a single file's own source is
+/// never removed before that same file's own destination is confirmed
+/// written — see `move_or_copy_file` below. If a block's `.lbl` file fails
+/// (both rename and copy-fallback) after its `.feat` file already
+/// succeeded, the already-written `.feat` destination file is left in place
+/// (harmless — it will simply be re-written/overwritten on a re-run); no
+/// data is ever lost, since a file's contents exist at either its source or
+/// its destination (or both) at every point in time.
+///
+/// Stage 35: each block's file operations are fully independent of every
+/// other block's, so this loop runs as a `rayon` parallel map rather than
+/// sequentially — `new_id` is derived purely from each block's fixed
+/// position in the pre-sorted, immutable `sorted_refs`, so parallel
+/// execution order has no effect on the deterministic id/filename-
+/// assignment contract described above.
 #[allow(clippy::cast_possible_truncation)]
 fn write_subset(
     inputs: &[PathBuf],
     output: &Path,
     subset_name: &str,
     manifests: &[LabeledBlockManifest],
+    block_lookup: &HashMap<(usize, u64), &LabeledBlockMeta>,
     refs: &[(usize, u64)],
     move_files: bool,
 ) -> Result<()> {
@@ -238,69 +299,97 @@ fn write_subset(
     let mut sorted_refs: Vec<(usize, u64)> = refs.to_vec();
     sorted_refs.sort_unstable();
 
-    let mut block_lookup: HashMap<(usize, u64), &LabeledBlockMeta> = HashMap::new();
-    for (dir_idx, manifest) in manifests.iter().enumerate() {
-        for b in &manifest.blocks {
-            block_lookup.insert((dir_idx, b.meta.id), b);
-        }
-    }
+    let total_blocks = sorted_refs.len();
+    let completed = AtomicUsize::new(0);
 
-    let mut subset_blocks = Vec::with_capacity(sorted_refs.len());
+    // Each parallel task reads only shared immutable data (`inputs`,
+    // `block_lookup`, `sorted_refs`) and returns an owned
+    // `Result<Option<LabeledBlockMeta>>` — no `Mutex`/`RwLock` in this hot
+    // loop, per AGENTS.md's "Lock-Free Progress" guidance. `with_min_len`
+    // mirrors the existing `RAYON_MIN_CHUNK` convention used in
+    // `preprocessing/pipeline.rs`/`model/inference.rs`. `collect()`
+    // short-circuits and returns the first encountered error, exactly as
+    // the pre-Stage-35 sequential `?`-per-block code did.
+    //
+    // A per-block result of `Ok(None)` (rather than an outright `Err`)
+    // preserves the pre-Stage-35 defensive `continue`-on-missing-lookup
+    // behavior (should be unreachable in practice, since `refs` is always
+    // derived from these same manifests' block lists) without requiring a
+    // shared mutable accumulator across parallel tasks.
+    let subset_blocks: Vec<LabeledBlockMeta> = sorted_refs
+        .par_iter()
+        .enumerate()
+        .with_min_len(RAYON_MIN_CHUNK)
+        .map(
+            |(new_id, &(dir_idx, orig_id))| -> Result<Option<LabeledBlockMeta>> {
+                let Some(block) = block_lookup.get(&(dir_idx, orig_id)).copied() else {
+                    return Ok(None);
+                };
 
-    for (new_id, &(dir_idx, orig_id)) in sorted_refs.iter().enumerate() {
-        let Some(block) = block_lookup.get(&(dir_idx, orig_id)).copied() else {
-            // Defensive: should be unreachable, since `refs` is always
-            // derived from these same manifests' block lists.
-            continue;
-        };
+                validate_block_filename(&block.meta.file)?;
+                validate_block_filename(&block.lbl_file)?;
 
-        validate_block_filename(&block.meta.file)?;
-        validate_block_filename(&block.lbl_file)?;
+                let input_dir = inputs.get(dir_idx).ok_or_else(|| {
+                    ClassifierError::Pipeline(format!(
+                        "split-dataset: internal error — dir_idx {dir_idx} out of range for \
+                         {} inputs",
+                        inputs.len()
+                    ))
+                })?;
+                let src_feat = input_dir.join(&block.meta.file);
+                let src_lbl = input_dir.join(&block.lbl_file);
 
-        let input_dir = inputs.get(dir_idx).ok_or_else(|| {
-            ClassifierError::Pipeline(format!(
-                "split-dataset: internal error — dir_idx {dir_idx} out of range for {} inputs",
-                inputs.len()
-            ))
-        })?;
-        let src_feat = input_dir.join(&block.meta.file);
-        let src_lbl = input_dir.join(&block.lbl_file);
+                let new_id_u64 = new_id as u64;
+                let new_feat_name = format!("block_{new_id_u64:05}.feat");
+                let new_lbl_name = format!("block_{new_id_u64:05}.lbl");
+                let dst_feat = subset_dir.join(&new_feat_name);
+                let dst_lbl = subset_dir.join(&new_lbl_name);
 
-        let new_id_u64 = new_id as u64;
-        let new_feat_name = format!("block_{new_id_u64:05}.feat");
-        let new_lbl_name = format!("block_{new_id_u64:05}.lbl");
-        let dst_feat = subset_dir.join(&new_feat_name);
-        let dst_lbl = subset_dir.join(&new_lbl_name);
+                if move_files {
+                    move_or_copy_file(&src_feat, &dst_feat)?;
+                    move_or_copy_file(&src_lbl, &dst_lbl)?;
+                } else {
+                    fs::copy(&src_feat, &dst_feat).map_err(|e| {
+                        ClassifierError::Pipeline(format!(
+                            "split-dataset: failed to copy '{}' -> '{}': {e}",
+                            src_feat.display(),
+                            dst_feat.display()
+                        ))
+                    })?;
+                    fs::copy(&src_lbl, &dst_lbl).map_err(|e| {
+                        ClassifierError::Pipeline(format!(
+                            "split-dataset: failed to copy '{}' -> '{}': {e}",
+                            src_lbl.display(),
+                            dst_lbl.display()
+                        ))
+                    })?;
+                }
 
-        fs::copy(&src_feat, &dst_feat).map_err(|e| {
-            ClassifierError::Pipeline(format!(
-                "split-dataset: failed to copy '{}' -> '{}': {e}",
-                src_feat.display(),
-                dst_feat.display()
-            ))
-        })?;
-        fs::copy(&src_lbl, &dst_lbl).map_err(|e| {
-            ClassifierError::Pipeline(format!(
-                "split-dataset: failed to copy '{}' -> '{}': {e}",
-                src_lbl.display(),
-                dst_lbl.display()
-            ))
-        })?;
+                // Stage 35: periodic, low-overhead progress feedback for
+                // large subsets (e.g. hundreds of thousands of blocks) —
+                // fires at most once per `PROGRESS_LOG_INTERVAL` crossing
+                // regardless of how many threads are running, using a
+                // single atomic counter and a modulo check on the
+                // post-increment value (no extra synchronization).
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                    eprintln!("[split-dataset] {subset_name}: {n}/{total_blocks} blocks written");
+                }
 
-        // Only remove sources after both files of this block copied cleanly.
-        if move_files {
-            let _ = fs::remove_file(&src_feat);
-            let _ = fs::remove_file(&src_lbl);
-        }
-
-        let mut new_block = block.clone();
-        new_block.meta.id = new_id_u64;
-        new_block.meta.file = new_feat_name;
-        new_block.lbl_file = new_lbl_name;
-        subset_blocks.push(new_block);
-    }
+                let mut new_block = block.clone();
+                new_block.meta.id = new_id_u64;
+                new_block.meta.file = new_feat_name;
+                new_block.lbl_file = new_lbl_name;
+                Ok(Some(new_block))
+            },
+        )
+        .collect::<Result<Vec<Option<LabeledBlockMeta>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Combined manifest metadata: `block_size`/`target_points`/etc. were
+
     // already validated identical across all input manifests by
     // `validate_manifest_compatibility` (called inside
     // `three_way_spatial_split_multi`); `source` is a comma-joined list for
@@ -338,6 +427,54 @@ fn write_subset(
         ))
     })?;
 
+    Ok(())
+}
+
+/// Move `src` to `dst` (Stage 35), preferring a same-volume `fs::rename`
+/// fast path — a single filesystem-metadata operation, no data physically
+/// copied, and dramatically faster than copy+delete for large files — and
+/// falling back to [`copy_then_remove_source`] on **any** `fs::rename`
+/// error (covers the common cross-volume case as well as any other
+/// platform-specific rename failure).
+///
+/// This is applied independently to each of a block's `.feat` and `.lbl`
+/// files (a block's two files could in principle live on different
+/// underlying volumes only in exotic setups; treating them independently
+/// is simplest and correct in all cases). No `unwrap()`/`expect()`/
+/// `panic!` — every failure path returns `Result`.
+fn move_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    copy_then_remove_source(src, dst)
+}
+
+/// Copy `src` to `dst`, removing `src` only after the copy has confirmed
+/// succeeded (a copy failure is reported with the source left untouched; a
+/// copy success followed by a remove failure is silently ignored — the
+/// source becomes a harmless orphaned duplicate, never lost data). This is
+/// exactly the pre-Stage-35 sequential copy-then-delete behavior.
+///
+/// Extracted as its own function (rather than inlined in
+/// [`move_or_copy_file`]) so this fallback path can be exercised directly
+/// by a unit test: portably and reliably forcing a real `fs::rename`
+/// failure (e.g. a genuine cross-volume move) inside an automated,
+/// platform-agnostic test is not practical without adding a new
+/// dependency or resorting to brittle, platform-specific tricks, which
+/// would conflict with AGENTS.md's "Platform Agnostic" and "Minimal &
+/// Thoughtful Dependencies" principles — testing this extracted function
+/// directly verifies the exact same fallback logic `move_or_copy_file`
+/// invokes when `fs::rename` fails, without depending on being able to
+/// force that failure to occur.
+fn copy_then_remove_source(src: &Path, dst: &Path) -> Result<()> {
+    fs::copy(src, dst).map_err(|e| {
+        ClassifierError::Pipeline(format!(
+            "split-dataset: failed to move (copy fallback) '{}' -> '{}': {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    let _ = fs::remove_file(src);
     Ok(())
 }
 
@@ -913,6 +1050,182 @@ mod tests {
         assert_eq!(
             total_written, 12,
             "all 12 merged blocks (6 from --input-list + 6 from --input) must be written exactly once"
+        );
+    }
+
+    // ---- Stage 35: performance (parallel materialization, move_or_copy_file) ----
+
+    #[test]
+    fn test_scaled_up_parallel_materialization_with_move_is_correct() {
+        // 1,000 blocks split across two input directories (500 each, with
+        // locally-colliding ids 0..500 in both) — comfortably large enough
+        // to span multiple rayon work-stealing chunks under
+        // RAYON_MIN_CHUNK, and exercised with --move so this also confirms
+        // the parallel move path (move_or_copy_file's rename-fast-path,
+        // since both input and output tempdirs are typically on the same
+        // volume) preserves the pre-Stage-35 correctness guarantees:
+        // correct total count, zero filename collisions, source files
+        // gone, and a loadable result.
+        let input_dir_a = tempfile::tempdir().expect("input tempdir a");
+        let input_dir_b = tempfile::tempdir().expect("input tempdir b");
+        let output_dir = tempfile::tempdir().expect("output tempdir");
+
+        let manifest_a = make_manifest_fixture(500, "file_a.las");
+        let manifest_b = make_manifest_fixture(500, "file_b.las");
+        for b in &manifest_a.blocks {
+            make_block_fixture(input_dir_a.path(), b.meta.id, 4);
+        }
+        for b in &manifest_b.blocks {
+            make_block_fixture(input_dir_b.path(), b.meta.id, 4);
+        }
+
+        let manifest_refs: Vec<&LabeledBlockManifest> = vec![&manifest_a, &manifest_b];
+        let split = three_way_spatial_split_multi(&manifest_refs, 0.2, 0.1, 11, true)
+            .expect("three_way_spatial_split_multi should succeed for the scaled-up fixture");
+
+        let inputs = vec![
+            input_dir_a.path().to_path_buf(),
+            input_dir_b.path().to_path_buf(),
+        ];
+        let manifest_files: Vec<(PathBuf, String, String)> = manifest_a
+            .blocks
+            .iter()
+            .map(|b| {
+                (
+                    input_dir_a.path().to_path_buf(),
+                    b.meta.file.clone(),
+                    b.lbl_file.clone(),
+                )
+            })
+            .chain(manifest_b.blocks.iter().map(|b| {
+                (
+                    input_dir_b.path().to_path_buf(),
+                    b.meta.file.clone(),
+                    b.lbl_file.clone(),
+                )
+            }))
+            .collect();
+        let manifests = vec![manifest_a, manifest_b];
+
+        materialize_split(&inputs, output_dir.path(), &manifests, &split, true)
+            .expect("materialize_split (parallel, move) should succeed on the scaled-up fixture");
+
+        // Correct total count, zero filename collisions, across all three
+        // subsets.
+        let mut total_written = 0usize;
+        for subset in ["train", "val", "test"] {
+            let subset_dir = output_dir.path().join(subset);
+            if !subset_dir.is_dir() {
+                continue;
+            }
+            let mut seen: HashSet<String> = HashSet::new();
+            for entry in fs::read_dir(&subset_dir).expect("read_dir") {
+                let entry = entry.expect("dir entry");
+                let name = entry.file_name().to_string_lossy().to_string();
+                if std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("feat"))
+                {
+                    assert!(
+                        seen.insert(name.clone()),
+                        "duplicate .feat filename '{name}' found in {subset}/ under parallel \
+                         materialization"
+                    );
+                    total_written += 1;
+                }
+            }
+        }
+        assert_eq!(
+            total_written, 1000,
+            "all 1,000 merged blocks (500 + 500) must be written exactly once under parallel \
+             materialization"
+        );
+
+        // --move: every source file must be gone.
+        for (dir, feat, lbl) in &manifest_files {
+            assert!(
+                !dir.join(feat).exists(),
+                "source .feat should have been moved away under parallel materialization"
+            );
+            assert!(
+                !dir.join(lbl).exists(),
+                "source .lbl should have been moved away under parallel materialization"
+            );
+        }
+
+        // Loadable, with correct combined counts.
+        let dataset = LabeledBlockDataset::load_presplit(
+            &[output_dir.path().join("train")],
+            &[output_dir.path().join("val")],
+        )
+        .expect("load_presplit should succeed on the scaled-up parallel-materialized output");
+        assert_eq!(
+            dataset.train_ids.len() + dataset.val_ids.len() + split.test.len(),
+            1000
+        );
+    }
+
+    #[test]
+    fn test_move_or_copy_file_uses_rename_fast_path() {
+        // src and dst are both within the same tempdir (same volume), so
+        // fs::rename succeeds directly — the fast path move_or_copy_file
+        // is meant to prefer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        fs::write(&src, b"hello stage 35").expect("write source fixture");
+
+        move_or_copy_file(&src, &dst).expect("move_or_copy_file should succeed via rename");
+
+        assert!(!src.exists(), "source must be gone after a successful move");
+        assert!(
+            dst.exists(),
+            "destination must exist after a successful move"
+        );
+        let contents = fs::read(&dst).expect("read destination");
+        assert_eq!(contents, b"hello stage 35");
+    }
+
+    #[test]
+    fn test_copy_then_remove_source_fallback_logic() {
+        // Directly exercises the copy+delete fallback logic used by
+        // move_or_copy_file whenever fs::rename fails (see
+        // copy_then_remove_source's doc comment for why this is tested
+        // directly rather than by trying to force a real, portable
+        // fs::rename failure inside an automated cross-platform test).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        fs::write(&src, b"fallback path contents").expect("write source fixture");
+
+        copy_then_remove_source(&src, &dst).expect("copy_then_remove_source should succeed");
+
+        assert!(
+            !src.exists(),
+            "source must be removed only after the copy confirmed succeeded"
+        );
+        assert!(dst.exists(), "destination must exist after the copy");
+        let contents = fs::read(&dst).expect("read destination");
+        assert_eq!(contents, b"fallback path contents");
+    }
+
+    #[test]
+    fn test_copy_then_remove_source_reports_error_and_preserves_source_on_copy_failure() {
+        // If the copy itself fails (e.g. the source doesn't exist), the
+        // function must return an error and must not have touched anything
+        // (there is nothing to remove, since the copy never succeeded).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("does_not_exist.txt");
+        let dst = dir.path().join("dest.txt");
+
+        let result = copy_then_remove_source(&src, &dst);
+        assert!(
+            result.is_err(),
+            "a copy failure (missing source) must be reported as an error"
+        );
+        assert!(
+            !dst.exists(),
+            "no destination file should be created on copy failure"
         );
     }
 }

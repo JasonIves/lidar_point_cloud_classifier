@@ -25,6 +25,14 @@ use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
 const SIZE_WEIGHT: f64 = 4.0;
 const CLASS_WEIGHT: f64 = 1.0;
 
+/// Tolerance (in tile count) within which a split's achieved tile count is
+/// considered acceptably close to its target during the post-greedy
+/// rebalancing pass (Stage 36) — avoids pointless corrective "ping-pong"
+/// moves for a discrepancy of a single tile that generally cannot be
+/// improved further (a target tile count derived from `round(n_tiles *
+/// frac)` can rarely be hit exactly when tiles are indivisible units).
+const SIZE_TOLERANCE_TILES: i64 = 1;
+
 /// Local (non-global) block IDs assigned to each of the three subsets.
 ///
 /// Used for the single-manifest case; see [`MultiThreeWaySplit`] for the
@@ -388,6 +396,10 @@ fn stratified_assign_multi(
     seeded_shuffle(&mut tiles, seed);
     tiles.sort_by_key(|t| std::cmp::Reverse(t.total));
 
+    // Lookup used by the post-greedy rebalancing pass (Stage 36) to recover
+    // a tile's point/class counts by key without re-scanning `tiles`.
+    let tile_by_key: HashMap<(usize, u32), &TileInfo> = tiles.iter().map(|t| (t.key, t)).collect();
+
     let train_frac = 1.0 - val_split - test_split;
     let fracs = [train_frac, val_split, test_split]; // 0=train, 1=val, 2=test
 
@@ -437,7 +449,24 @@ fn stratified_assign_multi(
         assigned[best_split].push(tile.key);
     }
 
+    // Stage 36: the greedy pass above can, at scale, allow early
+    // class-balance pressure (before any split has enough running total for
+    // the size term to matter) to route large tiles into the wrong split,
+    // producing a severe overshoot of the requested size fraction with no
+    // way to self-correct. Run a deterministic corrective pass that moves
+    // tiles from over-target splits to under-target splits until every
+    // active split's tile count is within tolerance of its target.
+    rebalance_by_size(
+        &tile_by_key,
+        &fracs,
+        &global_props,
+        &mut assigned,
+        &mut split_totals,
+        &mut split_counts,
+    );
+
     let mut result = MultiThreeWaySplit::default();
+
     for key in &assigned[0] {
         result.train.extend(tile_to_blocks[key].clone());
     }
@@ -450,6 +479,179 @@ fn stratified_assign_multi(
     result
 }
 
+/// Sum of squared per-class proportion deviations from `global_props` for a
+/// split with the given `counts`/`total` — the exact same `class_cost` term
+/// used by the initial greedy pass, extracted as a standalone helper so the
+/// rebalancing pass (below) can re-use it to evaluate candidate moves.
+#[allow(clippy::cast_precision_loss)]
+fn class_cost_for(counts: &[u64], total: u64, global_props: &[f64]) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+
+    (0..counts.len())
+        .map(|c| {
+            let p = counts[c] as f64 / total as f64;
+            (p - global_props[c]).powi(2)
+        })
+        .sum()
+}
+
+/// Post-greedy corrective rebalancing pass (Stage 36).
+///
+/// The greedy, largest-tile-first assignment in `stratified_assign_multi`
+/// can, under real-world class imbalance, route several large tiles into
+/// the wrong split early on (before the size term has enough running total
+/// to dominate the per-tile cost), producing an unbounded overshoot of the
+/// requested size fraction with no way to self-correct. This pass runs
+/// afterward and repeatedly moves a tile from the most over-target split to
+/// the most under-target split until every active split's tile count is
+/// within `SIZE_TOLERANCE_TILES` of `round(n_tiles * frac)`, or no donor/
+/// recipient pair remains.
+///
+/// Which tile to move is chosen by re-using the same per-class squared
+/// deviation cost (`class_cost_for`) the initial greedy pass uses: among the
+/// donor's tiles, the one whose removal-from-donor +
+/// addition-to-recipient combination minimizes the summed post-move
+/// `class_cost` of both splits is preferred, so the size-correction does
+/// not gratuitously undo the class-balance benefit of the greedy pass
+/// (ties broken by preferring the smaller tile, for finer-grained
+/// correction). This directly implements the "reuse the cost formula"
+/// approach specified in
+/// `docs/stages/stage-36-stratified-split-size-accuracy.md`.
+///
+/// This is a pure, infallible computation over already-computed in-memory
+/// data (no I/O, no fallible parsing) — the `max_iterations` cap below is a
+/// defensive bound against pathological non-termination, not an expected
+/// code path, since each move strictly reduces the maximum deviation.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+fn rebalance_by_size(
+    tile_by_key: &HashMap<(usize, u32), &TileInfo>,
+
+    fracs: &[f64; 3],
+    global_props: &[f64],
+    assigned: &mut [Vec<(usize, u32)>; 3],
+    split_totals: &mut [u64; 3],
+    split_counts: &mut [Vec<u64>; 3],
+) {
+    let n_tiles: usize = assigned.iter().map(Vec::len).sum();
+    if n_tiles == 0 {
+        return;
+    }
+
+    // Target tile count per split, derived from the requested fractions.
+    // Splits with frac <= 0.0 (e.g. test disabled) are never a donor or
+    // recipient — their target is fixed at 0 and they are excluded below.
+    let target_tiles: [i64; 3] = std::array::from_fn(|s| {
+        if fracs[s] <= 0.0 {
+            0
+        } else {
+            (n_tiles as f64 * fracs[s]).round() as i64
+        }
+    });
+
+    // Each successful move strictly reduces the worst deviation, and there
+    // are at most n_tiles tiles that could ever move, so this bound is
+    // never expected to be hit in practice — it exists purely as a
+    // defensive guard against any unforeseen non-terminating edge case.
+    let max_iterations = n_tiles + 1;
+
+    for _ in 0..max_iterations {
+        let deviations: [i64; 3] =
+            std::array::from_fn(|s| assigned[s].len() as i64 - target_tiles[s]);
+
+        // Donor: the active (frac > 0.0), non-empty split furthest *over*
+        // its target. Recipient: the active split furthest *under* its
+        // target (may itself be empty).
+        let donor = (0..3)
+            .filter(|&s| fracs[s] > 0.0 && !assigned[s].is_empty())
+            .max_by_key(|&s| deviations[s]);
+        let recipient = (0..3)
+            .filter(|&s| fracs[s] > 0.0)
+            .min_by_key(|&s| deviations[s]);
+
+        let (Some(donor), Some(recipient)) = (donor, recipient) else {
+            break;
+        };
+        if donor == recipient {
+            break;
+        }
+        // Converged: donor is not meaningfully over target and recipient is
+        // not meaningfully under target.
+        if deviations[donor] <= SIZE_TOLERANCE_TILES
+            && deviations[recipient] >= -SIZE_TOLERANCE_TILES
+        {
+            break;
+        }
+
+        // Among the donor's tiles, pick the one whose move to `recipient`
+        // minimizes the combined post-move class_cost of both splits
+        // (ties broken by preferring the smaller tile).
+        let mut best: Option<(usize, f64, u64)> = None; // (index, combined_cost, tile.total)
+        for (i, key) in assigned[donor].iter().enumerate() {
+            let Some(&tile) = tile_by_key.get(key) else {
+                continue;
+            };
+
+            let mut donor_counts_after = split_counts[donor].clone();
+            for (dst, src) in donor_counts_after.iter_mut().zip(tile.counts.iter()) {
+                *dst -= src;
+            }
+            let donor_total_after = split_totals[donor] - tile.total;
+
+            let mut recipient_counts_after = split_counts[recipient].clone();
+            for (dst, src) in recipient_counts_after.iter_mut().zip(tile.counts.iter()) {
+                *dst += src;
+            }
+            let recipient_total_after = split_totals[recipient] + tile.total;
+
+            let combined_cost =
+                class_cost_for(&donor_counts_after, donor_total_after, global_props)
+                    + class_cost_for(&recipient_counts_after, recipient_total_after, global_props);
+
+            let is_better = match best {
+                None => true,
+                Some((_, best_cost, best_total)) => {
+                    combined_cost < best_cost - 1e-12
+                        || ((combined_cost - best_cost).abs() <= 1e-12 && tile.total < best_total)
+                }
+            };
+            if is_better {
+                best = Some((i, combined_cost, tile.total));
+            }
+        }
+
+        let Some((move_idx, _, _)) = best else {
+            // Donor's tiles are all missing from the lookup — should be
+            // unreachable (every assigned key originated from `tiles`), but
+            // bail out rather than looping with no possible progress.
+            break;
+        };
+
+        let key = assigned[donor].remove(move_idx);
+        let Some(&tile) = tile_by_key.get(&key) else {
+            // Should be unreachable (see above) — restore and stop.
+            assigned[donor].push(key);
+            break;
+        };
+
+        split_totals[donor] -= tile.total;
+        for (dst, src) in split_counts[donor].iter_mut().zip(tile.counts.iter()) {
+            *dst -= src;
+        }
+        split_totals[recipient] += tile.total;
+        for (dst, src) in split_counts[recipient].iter_mut().zip(tile.counts.iter()) {
+            *dst += src;
+        }
+        assigned[recipient].push(key);
+    }
+}
+
 /// Derive the model class count from a manifest's label map. Falls back to
 /// `8` (matching `TrainConfig::default().n_classes`) if the label map is
 /// empty. Unlike `training::dataset::LabeledBlockDataset::load`, this does
@@ -458,6 +660,7 @@ fn stratified_assign_multi(
 /// per-class loss weights, so a best-effort count is acceptable.
 fn derive_n_classes(manifest: &LabeledBlockManifest) -> usize {
     let distinct: BTreeSet<u8> = manifest.label_map.values().copied().collect();
+
     if distinct.is_empty() {
         8
     } else {
@@ -497,9 +700,11 @@ fn seeded_shuffle<T>(items: &mut [T], seed: u64) {
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
 )]
 mod tests {
+
     use super::*;
     use crate::preprocessing::labeled_pipeline::{LabeledBlockMeta, SpatialTileGrid};
     use crate::preprocessing::pipeline::BlockMeta;
@@ -660,6 +865,165 @@ mod tests {
             "stratified val-set class-proportion deviation ({dev_strat}) should be \
              lower than the non-stratified deviation ({dev_non_strat})"
         );
+    }
+
+    // ── Stage 36: rebalancing regression / isolation / determinism ─────
+
+    #[test]
+    fn test_rebalance_fixes_severe_greedy_size_overshoot() {
+        // Regression test for the real-world overshoot (see
+        // docs/stages/stage-36-stratified-split-size-accuracy.md). 50
+        // macro-tiles, one block each, all identically sized (100 points,
+        // single class) so the outcome is fully deterministic and
+        // independent of the seeded tie-break shuffle. With val_split=0.2
+        // (train_frac=0.8), the *pre-Stage-36* greedy-only cost formula
+        // pathologically favors whichever split has the smaller target
+        // fraction whenever running totals are near zero (since
+        // `size_cost` compares each split's own accumulated total against
+        // its target, not against how much of the tile stream remains) —
+        // hand-computing the cost sequence shows the greedy pass alone
+        // (without the Stage 36 rebalancing pass) assigns 49 of the 50
+        // tiles to val and only 1 to train, a massive overshoot of the
+        // requested ~10-tile (20%) val target. After the Stage 36
+        // rebalancing pass, the result must land within tolerance of the
+        // target (10 tiles, tolerance ±1 => 11 tiles is the exact
+        // convergence point derived by hand for this fixture).
+        let blocks: Vec<_> = (0..50u64)
+            .map(|i| make_block(i, i as u32, &[(0, 100)]))
+            .collect();
+        let manifest = dummy_manifest(blocks, 1);
+
+        let split = three_way_spatial_split(&manifest, 0.2, 0.0, 42, true).unwrap();
+
+        assert_eq!(
+            split.train_ids.len() + split.val_ids.len(),
+            50,
+            "all 50 blocks must be assigned"
+        );
+
+        let target_val_tiles = 10i64; // round(50 * 0.2)
+        let actual_val_tiles = split.val_ids.len() as i64;
+        assert!(
+            (actual_val_tiles - target_val_tiles).abs() <= SIZE_TOLERANCE_TILES,
+            "post-rebalance val tile count ({actual_val_tiles}) must be within \
+             {SIZE_TOLERANCE_TILES} of the target ({target_val_tiles}) — the \
+             pre-Stage-36 greedy-only pass would have produced 49 val tiles here, \
+             a severe overshoot this stage exists to fix"
+        );
+    }
+
+    #[test]
+    fn test_rebalance_by_size_isolated_donor_to_recipient() {
+        // Directly exercises `rebalance_by_size` on a small hand-built
+        // fixture, bypassing the greedy first pass entirely: 5 identical
+        // tiles (total=100, single class, so class_cost plays no role),
+        // all initially (deliberately, artificially) assigned to val, none
+        // to train. With fracs = [0.8, 0.2, 0.0] (train/val/test) and
+        // n_tiles=5, targets are train=4, val=1, but the tolerance-based
+        // convergence check stops as soon as *both* the donor and
+        // recipient deviations are within ±SIZE_TOLERANCE_TILES(=1) of
+        // their targets — which happens at train=3 (deviation -1) / val=2
+        // (deviation +1), one move short of hitting the targets exactly.
+
+        let tiles: Vec<TileInfo> = (0..5u32)
+            .map(|i| TileInfo {
+                key: (0, i),
+                counts: vec![100],
+                total: 100,
+            })
+            .collect();
+        let tile_by_key: HashMap<(usize, u32), &TileInfo> =
+            tiles.iter().map(|t| (t.key, t)).collect();
+
+        let fracs = [0.8, 0.2, 0.0];
+        let global_props = [1.0]; // single class -> class_cost is always 0
+        let mut assigned: [Vec<(usize, u32)>; 3] = [
+            Vec::new(),
+            tiles.iter().map(|t| t.key).collect(),
+            Vec::new(),
+        ];
+        let mut split_totals: [u64; 3] = [0, 500, 0];
+        let mut split_counts: [Vec<u64>; 3] = [vec![0], vec![500], vec![0]];
+
+        rebalance_by_size(
+            &tile_by_key,
+            &fracs,
+            &global_props,
+            &mut assigned,
+            &mut split_totals,
+            &mut split_counts,
+        );
+
+        assert_eq!(
+            assigned[0].len(),
+            3,
+            "train (the recipient) should have received exactly 3 tiles \
+             (converges at train=3/val=2, both within ±1 of their 4/1 targets)"
+        );
+        assert_eq!(
+            assigned[1].len(),
+            2,
+            "val (the donor) should have been drained down to exactly 2 tiles"
+        );
+        assert_eq!(
+            assigned[2].len(),
+            0,
+            "test was disabled and must stay empty"
+        );
+
+        // Running totals/counts must have been kept consistent with the
+        // moves (each moved tile carries its total=100/counts=[100] with
+        // it from val to train).
+        assert_eq!(split_totals[0], 300);
+        assert_eq!(split_totals[1], 200);
+        assert_eq!(split_counts[0][0], 300);
+        assert_eq!(split_counts[1][0], 200);
+
+        // No tile key was duplicated or lost across the move.
+        let mut all_keys: Vec<(usize, u32)> = Vec::new();
+        all_keys.extend(&assigned[0]);
+        all_keys.extend(&assigned[1]);
+        all_keys.extend(&assigned[2]);
+        all_keys.sort_unstable();
+        let mut expected_keys: Vec<(usize, u32)> = tiles.iter().map(|t| t.key).collect();
+        expected_keys.sort_unstable();
+        assert_eq!(all_keys, expected_keys);
+    }
+
+    #[test]
+    fn test_stratified_split_rebalancing_is_deterministic() {
+        // Two independent calls with identical inputs/seed (exercising the
+        // full greedy-pass-then-rebalance pipeline end-to-end) must
+        // produce byte-identical (order-independent-compared) train/val/
+        // test assignments.
+        let mut blocks = Vec::new();
+        for i in 0..7u64 {
+            blocks.push(make_block(i, i as u32, &[(0, 100), (1, 1)]));
+        }
+        for i in 7..40u64 {
+            blocks.push(make_block(i, i as u32, &[(0, 1), (1, 100)]));
+        }
+        let manifest = dummy_manifest(blocks, 2);
+
+        let a = three_way_spatial_split(&manifest, 0.2, 0.1, 99, true).unwrap();
+        let b = three_way_spatial_split(&manifest, 0.2, 0.1, 99, true).unwrap();
+
+        let mut a_train = a.train_ids.clone();
+        let mut a_val = a.val_ids.clone();
+        let mut a_test = a.test_ids.clone();
+        let mut b_train = b.train_ids.clone();
+        let mut b_val = b.val_ids.clone();
+        let mut b_test = b.test_ids.clone();
+        a_train.sort_unstable();
+        a_val.sort_unstable();
+        a_test.sort_unstable();
+        b_train.sort_unstable();
+        b_val.sort_unstable();
+        b_test.sort_unstable();
+
+        assert_eq!(a_train, b_train, "train assignment must be deterministic");
+        assert_eq!(a_val, b_val, "val assignment must be deterministic");
+        assert_eq!(a_test, b_test, "test assignment must be deterministic");
     }
 
     // ── multi-input (Stage 33) tests ────────────────────────────────────
