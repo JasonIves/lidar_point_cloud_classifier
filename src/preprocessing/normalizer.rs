@@ -29,6 +29,43 @@ use wbraster::{NodataPolicy, ResampleMethod};
 
 use crate::preprocessing::lite_point::LitePoint;
 
+/// Default fixed absolute reference height (projection z-units, metres for a
+/// metric CRS) used to normalise Height-Above-Ground into the `[0, 1]` feature
+/// range. See `docs/stages/stage-37-absolute-hag-normalization.md`.
+pub const DEFAULT_HAG_MAX_METERS: f64 = 50.0;
+
+/// Default cell size (projection units) for the auto-generated bare-earth
+/// ground DTM produced when no external `--hag-model` is supplied. See
+/// `docs/stages/stage-38-automatic-ground-dtm.md`.
+pub const DEFAULT_DTM_RESOLUTION: f64 = 1.0;
+
+/// Strategy for normalising raw Height-Above-Ground values (`z − z_ground`,
+/// in projection units) into the `[0, 1]` feature range consumed by the model.
+///
+/// **Stage 37.** The default [`HagNormalization::FixedMeters`] preserves the
+/// *absolute* vertical scale across blocks, so a point at a given physical
+/// height above ground always maps to the same feature value regardless of its
+/// block's neighbours. This restores the class-separating signal that
+/// distinguishes ASPRS low / medium / high vegetation (defined by absolute
+/// height bands). The legacy [`HagNormalization::BlockPercentile99`] is
+/// retained for reproducibility and A/B comparison only — it divides by each
+/// block's own 99th-percentile HAG, which destroys absolute scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HagNormalization {
+    /// Divide raw HAG by a fixed absolute reference height (projection
+    /// z-units). Points at or above the reference saturate at `1.0`. Default.
+    FixedMeters(f64),
+    /// Legacy (pre-Stage-37): divide by the 99th percentile of the block's own
+    /// HAG values. Retained for reproducibility / comparison only.
+    BlockPercentile99,
+}
+
+impl Default for HagNormalization {
+    fn default() -> Self {
+        Self::FixedMeters(DEFAULT_HAG_MAX_METERS)
+    }
+}
+
 /// Resample `pts` to exactly `target` points.
 ///
 /// - If `pts.len() >= target`: random sample without replacement.
@@ -123,6 +160,11 @@ fn jitter_offset(rng: &mut impl Rng, sigma: f64) -> f64 {
 /// - `block_size` — cell edge length (denominator for x/y normalisation)
 /// - `hag_values` — pre-computed raw HAG values (z - `z_ground`) for each point,
 ///   same length as `pts`
+/// - `hag_norm`   — HAG normalisation strategy (Stage 37). The default
+///   [`HagNormalization::FixedMeters`] divides by a fixed absolute reference
+///   height so identical physical heights map to identical feature values
+///   across blocks; [`HagNormalization::BlockPercentile99`] reproduces the
+///   legacy per-block behaviour.
 ///
 /// # Panics
 /// Panics if `pts.len() != hag_values.len()`.
@@ -132,6 +174,7 @@ pub fn normalise_scalar_features(
     origin_y: f64,
     block_size: f64,
     hag_values: &[f64],
+    hag_norm: HagNormalization,
 ) -> Vec<[f32; 7]> {
     assert_eq!(
         pts.len(),
@@ -144,8 +187,13 @@ pub fn normalise_scalar_features(
     let z_max = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
     let z_range = (z_max - z_min).max(1e-9); // avoid divide-by-zero on flat blocks
 
-    // Compute h_max = 99th percentile of hag_values (clamped > 0).
-    let h_max = percentile_99(hag_values).max(1e-9);
+    // HAG denominator (Stage 37). A fixed absolute reference preserves vertical
+    // scale across blocks; the legacy percentile mode divides by the block's
+    // own 99th-percentile HAG. Clamped > 0 to avoid divide-by-zero.
+    let h_max = match hag_norm {
+        HagNormalization::FixedMeters(m) => m.max(1e-9),
+        HagNormalization::BlockPercentile99 => percentile_99(hag_values).max(1e-9),
+    };
 
     pts.iter()
         .zip(hag_values.iter())
@@ -362,12 +410,123 @@ mod tests {
             make_pt(50.0, 50.0, 20.0, 65535, 2, 2),
         ];
         let hag = vec![0.0, 5.0, 10.0];
-        let feats = normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag);
+        let feats =
+            normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag, HagNormalization::default());
         for f in &feats {
             for &v in f {
                 assert!((0.0..=1.0).contains(&v), "feature out of [0,1]: {v}");
             }
         }
+    }
+
+    // ── Stage 37: absolute HAG normalisation ───────────────────────────────
+
+    /// `HagNormalization::default()` is the fixed absolute 50 m reference.
+    #[test]
+    fn test_hag_normalization_default_is_fixed_50m() {
+        assert_eq!(
+            HagNormalization::default(),
+            HagNormalization::FixedMeters(DEFAULT_HAG_MAX_METERS)
+        );
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(DEFAULT_HAG_MAX_METERS, 50.0);
+        }
+    }
+
+    /// Core Stage 37 guarantee: with `FixedMeters`, a point at a fixed physical
+    /// HAG maps to the **same** feature value regardless of what other heights
+    /// share its block. The legacy percentile mode does **not** have this
+    /// property (it is neighbour-dependent).
+    #[test]
+    fn test_fixed_meters_is_neighbour_invariant() {
+        // HAG index within the [f32; 7] scalar row.
+        const HAG_IDX: usize = 6;
+        let fixed = HagNormalization::FixedMeters(50.0);
+
+        // Two "blocks" each containing a 1 m target point, but with very
+        // different tallest-object heights (2 m vs 40 m).
+        let short_block = vec![
+            make_pt(0.0, 0.0, 0.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 2.0, 0, 1, 1),
+        ];
+        let short_hag = vec![1.0, 2.0];
+        let tall_block = vec![
+            make_pt(0.0, 0.0, 0.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 40.0, 0, 1, 1),
+        ];
+        let tall_hag = vec![1.0, 40.0];
+
+        let short_feats =
+            normalise_scalar_features(&short_block, 0.0, 0.0, 50.0, &short_hag, fixed);
+        let tall_feats = normalise_scalar_features(&tall_block, 0.0, 0.0, 50.0, &tall_hag, fixed);
+
+        // The 1 m point (index 0) must map to the same HAG value in both blocks.
+        assert!(
+            (short_feats[0][HAG_IDX] - tall_feats[0][HAG_IDX]).abs() < 1e-6,
+            "fixed-meters HAG must be neighbour-invariant: {} vs {}",
+            short_feats[0][HAG_IDX],
+            tall_feats[0][HAG_IDX]
+        );
+        // And it must equal 1.0 / 50.0.
+        assert!((short_feats[0][HAG_IDX] - (1.0 / 50.0)).abs() < 1e-6);
+    }
+
+    /// With the legacy `BlockPercentile99` mode, the same physical height maps
+    /// to different feature values in different blocks — confirming this mode
+    /// still behaves as before (and why Stage 37 changed the default).
+    #[test]
+    fn test_percentile_mode_is_neighbour_dependent() {
+        const HAG_IDX: usize = 6;
+        let pctl = HagNormalization::BlockPercentile99;
+
+        // Use 100-point blocks so the 99th-percentile index lands near the
+        // top of the distribution (idx = floor((100-1) * 0.99) = 98). Both
+        // blocks share an identical 1 m "target" point at index 0, but differ
+        // in the height of the rest of their points (tallest ≈ 2 m vs ≈ 40 m).
+        // Under percentile normalisation the target's HAG feature must differ
+        // between the two blocks — the neighbour-dependence Stage 37 removes.
+        let n = 100usize;
+        let short_block: Vec<LitePoint> = (0..n).map(|_| make_pt(0.0, 0.0, 0.0, 0, 1, 1)).collect();
+        let tall_block = short_block.clone();
+
+        // Index 0 is the shared 1 m target; the remaining points ramp up to
+        // the block's tallest object.
+        let mut short_hag = vec![1.0f64];
+        let mut tall_hag = vec![1.0f64];
+        for i in 1..n {
+            #[allow(clippy::cast_precision_loss)]
+            let frac = i as f64 / (n - 1) as f64;
+            short_hag.push(frac * 2.0);
+            tall_hag.push(frac * 40.0);
+        }
+
+        let short_feats = normalise_scalar_features(&short_block, 0.0, 0.0, 50.0, &short_hag, pctl);
+        let tall_feats = normalise_scalar_features(&tall_block, 0.0, 0.0, 50.0, &tall_hag, pctl);
+
+        assert!(
+            (short_feats[0][HAG_IDX] - tall_feats[0][HAG_IDX]).abs() > 1e-3,
+            "percentile HAG is expected to be neighbour-dependent: {} vs {}",
+            short_feats[0][HAG_IDX],
+            tall_feats[0][HAG_IDX]
+        );
+    }
+
+    /// Points at or above the fixed reference height saturate at 1.0.
+    #[test]
+    fn test_fixed_meters_saturates_at_reference() {
+        const HAG_IDX: usize = 6;
+        let fixed = HagNormalization::FixedMeters(50.0);
+        let pts = vec![
+            make_pt(0.0, 0.0, 0.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 80.0, 0, 1, 1),
+        ];
+        let hag = vec![0.0, 80.0]; // second point is well above the 50 m reference
+        let feats = normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag, fixed);
+        assert!(
+            (feats[1][HAG_IDX] - 1.0).abs() < 1e-6,
+            "HAG must clamp to 1.0"
+        );
     }
 
     // ── Stage 29: jitter-based oversampling ────────────────────────────────

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::error::{ClassifierError, Result};
 use crate::preprocessing::labeled_pipeline::{run_labeled_pipeline, LabeledPreprocessConfig};
-use crate::preprocessing::PreprocessConfig;
+use crate::preprocessing::{HagNormalization, PreprocessConfig};
 
 pub fn run(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -35,8 +35,16 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut oversample_jitter: f64 = 0.0;
     let mut eigen_memory_budget_bytes: usize =
         crate::preprocessing::DEFAULT_EIGEN_MEMORY_BUDGET_BYTES;
+    // HAG normalisation (Stage 37): resolved after the parse loop.
+    let mut hag_max: f64 = crate::preprocessing::DEFAULT_HAG_MAX_METERS;
+    let mut hag_use_percentile: bool = false;
+    // Automatic ground DTM (Stage 38): default ON; only --dtm-resolution exposed.
+    let mut auto_dtm: bool = true;
+    let mut auto_dtm_resolution: f64 = crate::preprocessing::DEFAULT_DTM_RESOLUTION;
+    let mut keep_auto_dtm: bool = false;
 
     let mut i = 0;
+
     while i < args.len() {
         match args[i].as_str() {
             "--input" => {
@@ -72,6 +80,24 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--hag-model" => {
                 hag_model = Some(PathBuf::from(next_value(args, &mut i, "--hag-model")?));
+            }
+            "--hag-max" => {
+                hag_max = parse_f64(next_value(args, &mut i, "--hag-max")?, "--hag-max")?;
+            }
+            "--hag-norm-percentile" => {
+                hag_use_percentile = parse_optional_bool(args, &mut i, true);
+            }
+            "--no-auto-dtm" => {
+                auto_dtm = !parse_optional_bool(args, &mut i, true);
+            }
+            "--dtm-resolution" => {
+                auto_dtm_resolution = parse_f64(
+                    next_value(args, &mut i, "--dtm-resolution")?,
+                    "--dtm-resolution",
+                )?;
+            }
+            "--keep-auto-dtm" => {
+                keep_auto_dtm = parse_optional_bool(args, &mut i, true);
             }
             "--label-map" => {
                 label_map_path = Some(PathBuf::from(next_value(args, &mut i, "--label-map")?));
@@ -205,6 +231,27 @@ pub fn run(args: &[String]) -> Result<()> {
             "--eigen-memory-budget-mb must be >= 1".to_string(),
         ));
     }
+    // Stage 38: auto-DTM resolution must be positive & finite regardless of
+    // whether auto-DTM is enabled, so bad input is rejected early.
+    if auto_dtm_resolution <= 0.0 || !auto_dtm_resolution.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--dtm-resolution must be a positive finite number".to_string(),
+        ));
+    }
+    // HAG normalisation resolution + validation (Stage 37). `--hag-max` must
+
+    // be positive/finite even in percentile mode to reject bad input early;
+    // `--hag-norm-percentile` selects the legacy per-block mode.
+    if hag_max <= 0.0 || !hag_max.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--hag-max must be a positive finite number".to_string(),
+        ));
+    }
+    let hag_normalization = if hag_use_percentile {
+        HagNormalization::BlockPercentile99
+    } else {
+        HagNormalization::FixedMeters(hag_max)
+    };
 
     // Load label map from JSON file, or use default.
 
@@ -228,6 +275,7 @@ pub fn run(args: &[String]) -> Result<()> {
         search_radius,
         min_neighbors,
         hag_model,
+        hag_normalization,
         threads,
         debug_csv,
         outlier_removal,
@@ -237,6 +285,9 @@ pub fn run(args: &[String]) -> Result<()> {
         block_overlap,
         oversample_jitter,
         eigen_memory_budget_bytes,
+        auto_dtm,
+        auto_dtm_resolution,
+        keep_auto_dtm,
     };
 
     let config = LabeledPreprocessConfig {
@@ -264,10 +315,21 @@ fn print_usage() {
            --search-radius <f64>    Base eigenvalue query radius (default: 1.0)\n\
            --min-neighbors <usize>  Min neighbours for adaptive radius (default: 8)\n\
            --hag-model     <path>   DTM raster for Height Above Ground\n\
+           --hag-max       <f64>    Fixed absolute reference height (projection units) to\n\
+                                    normalise HAG into [0,1]; preserves absolute vertical\n\
+                                    scale (default: 50.0 — Stage 37)\n\
+           --hag-norm-percentile    Opt into legacy per-block 99th-percentile HAG\n\
+                                    normalisation (ignores --hag-max)\n\
            --label-map     <path>   JSON ASPRS→class-index remapping\n\
            --tile-grid     <usize>  NxN macro-tile grid for spatial split (default: 4)\n\
            --threads       <usize>  Rayon thread pool size\n\
            --debug-csv              Also emit per-block .csv files\n\
+         \n\
+         Automatic ground DTM (Stage 38 — enabled by default):\n\
+           A bare-earth DTM is auto-generated and used for HAG; --hag-model overrides it.\n\
+           --dtm-resolution <f64>   Grid cell size for the auto-generated DTM (default: 1.0)\n\
+           --no-auto-dtm            Disable auto-DTM; fall back to block-min-z HAG proxy\n\
+           --keep-auto-dtm          Keep intermediate _auto_dtm.tif / _auto_ground.las files\n\
          \n\
          Block overlap (disabled by default):\n\
            --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\

@@ -82,6 +82,14 @@ pub struct BlockManifest {
     pub blocks: Vec<BlockMeta>,
 }
 
+/// File name of the intermediate ground-only LAS produced by the Stage 38
+/// auto-DTM ground filter, written under `PreprocessConfig::output_dir`.
+const AUTO_GROUND_LAS: &str = "_auto_ground.las";
+
+/// File name of the auto-generated bare-earth DTM raster (Stage 38), written
+/// under `PreprocessConfig::output_dir`.
+const AUTO_DTM_TIF: &str = "_auto_dtm.tif";
+
 // Serde default helpers for outlier fields — used when deserialising older
 // `blocks.json` files that pre-date Stage 04.
 fn default_outlier_radius() -> f64 {
@@ -348,17 +356,38 @@ impl PreprocessingPipeline {
             vec![None; retained.len()]
         };
 
-        // ── 6. Optionally load the DTM raster ─────────────────────────────
-        let dtm: Option<Arc<DtmView>> = config
-            .hag_model
-            .as_ref()
-            .map(|path| -> Result<Arc<DtmView>> {
-                let r = wbraster::Raster::read(path).map_err(|e| {
-                    ClassifierError::Raster(format!("failed to load DTM '{}': {e}", path.display()))
-                })?;
-                Ok(Arc::new(DtmView::from_raster(&r)))
-            })
-            .transpose()?;
+        // ── 6. Resolve the DTM raster (Stage 38 — 3-way priority) ─────────
+        // Priority: (1) explicit --hag-model wins; (2) else if auto_dtm is on,
+        // auto-generate a bare-earth DTM from the (possibly outlier-cleaned)
+        // input; (3) else None → block-min-z proxy.
+        //
+        // `auto_dtm_path` tracks the auto-generated `_auto_dtm.tif` so it (and
+        // its `_auto_ground.las` sibling) can be cleaned up in Step 9 unless
+        // `config.keep_auto_dtm` is set.
+        let mut auto_dtm_path: Option<PathBuf> = None;
+        let dtm: Option<Arc<DtmView>> = if let Some(path) = config.hag_model.as_ref() {
+            let r = wbraster::Raster::read(path).map_err(|e| {
+                ClassifierError::Raster(format!("failed to load DTM '{}': {e}", path.display()))
+            })?;
+            Some(Arc::new(DtmView::from_raster(&r)))
+        } else if config.auto_dtm {
+            eprintln!(
+                "[preprocessing] auto-DTM: generating bare-earth DTM (resolution={:.3})",
+                config.auto_dtm_resolution
+            );
+            let dtm_path = run_auto_dtm(input_path, &config.output_dir, config)?;
+            eprintln!("[preprocessing] auto-DTM: wrote {}", dtm_path.display());
+            let r = wbraster::Raster::read(&dtm_path).map_err(|e| {
+                ClassifierError::Raster(format!(
+                    "failed to load auto-generated DTM '{}': {e}",
+                    dtm_path.display()
+                ))
+            })?;
+            auto_dtm_path = Some(dtm_path);
+            Some(Arc::new(DtmView::from_raster(&r)))
+        } else {
+            None
+        };
 
         // ── 7. Per-block parallel processing ─────────────────────────────
         // Zip each stub with its border-spill path.  The closure loads the
@@ -440,6 +469,7 @@ impl PreprocessingPipeline {
                     origin_x,
                     origin_y,
                     config.block_size,
+                    config.hag_normalization,
                 );
                 let n_features = features.first().map_or(0, Vec::len);
 
@@ -528,6 +558,22 @@ impl PreprocessingPipeline {
         // ── 9. Clean up the outlier-removal temp file, if one was created ─────────
         if config.outlier_removal {
             let _ = fs::remove_file(&outlier_cleaned_path);
+        }
+
+        // ── 9b. Clean up auto-DTM intermediates (Stage 38) ────────────────
+        // The auto-generated `_auto_dtm.tif` (and its `_auto_ground.las`
+        // sibling) are transient artifacts; delete them unless the user asked
+        // to keep them via `--keep-auto-dtm`.
+        if let Some(dtm_path) = auto_dtm_path {
+            if config.keep_auto_dtm {
+                eprintln!(
+                    "[preprocessing] auto-DTM: keeping intermediates ({} + _auto_ground.las)",
+                    dtm_path.display()
+                );
+            } else {
+                let _ = fs::remove_file(&dtm_path);
+                let _ = fs::remove_file(config.output_dir.join(AUTO_GROUND_LAS));
+            }
         }
 
         Ok((manifest, process_results))
@@ -681,6 +727,88 @@ fn run_outlier_removal(input: &Path, output_path: &Path, config: &PreprocessConf
     tool.run(&args, &ctx)?;
 
     Ok(())
+}
+
+// ── Automatic ground DTM helper (Stage 38) ────────────────────────────────────
+
+/// Auto-generate a bare-earth DTM raster from `input`, returning the path to
+/// the written `_auto_dtm.tif` under `output_dir` (Stage 38 — Option A).
+///
+/// Two Whitebox tools are invoked directly via the `wbcore::Tool` trait,
+/// mirroring the invocation pattern established by [`run_outlier_removal`]:
+///
+/// 1. `wbtools_oss::ImprovedGroundPointFilterTool` in *filter* mode
+///    (`classify = false`) writes a ground-only LAS (`_auto_ground.las`) —
+///    only points the progressive-morphology filter judges to be bare earth
+///    are retained.  All ground-filter parameters other than `block_size`
+///    are intentionally left at the tool's own defaults per the Stage 38
+///    "streamlined surface" decision; only `--dtm-resolution` is exposed to
+///    users (mapped to both `block_size` here and `resolution` below).
+/// 2. `wbtools_oss::LidarTinGriddingTool` interpolates the ground-only LAS's
+///    `elevation` onto a regular grid at `config.auto_dtm_resolution`,
+///    writing the `_auto_dtm.tif` raster consumed by `DtmView::from_raster`.
+///
+/// The caller (`run_internal`) is responsible for deleting both intermediate
+/// files unless `config.keep_auto_dtm` is set (Step 9b).
+///
+/// # Errors
+/// Returns [`ClassifierError::Tool`] if validation or execution of either
+/// underlying tool fails.
+fn run_auto_dtm(input: &Path, output_dir: &Path, config: &PreprocessConfig) -> Result<PathBuf> {
+    use serde_json::json;
+    use wbcore::{AllowAllCapabilities, RecordingProgressSink, Tool, ToolArgs, ToolContext};
+    use wbtools_oss::tools::{ImprovedGroundPointFilterTool, LidarTinGriddingTool};
+
+    let ground_path = output_dir.join(AUTO_GROUND_LAS);
+    let dtm_path = output_dir.join(AUTO_DTM_TIF);
+
+    let progress = RecordingProgressSink::new();
+    let capabilities = AllowAllCapabilities;
+
+    // ── Stage 1: extract bare-earth points into a ground-only LAS ─────────
+    {
+        let mut args: ToolArgs = ToolArgs::new();
+        args.insert("input".to_string(), json!(input.display().to_string()));
+        args.insert(
+            "output".to_string(),
+            json!(ground_path.display().to_string()),
+        );
+        args.insert("block_size".to_string(), json!(config.auto_dtm_resolution));
+        // Filter mode (not classify): write only the retained ground points.
+        args.insert("classify".to_string(), json!(false));
+
+        let ctx = ToolContext {
+            progress: &progress,
+            capabilities: &capabilities,
+        };
+
+        let tool = ImprovedGroundPointFilterTool;
+        tool.validate(&args)?;
+        tool.run(&args, &ctx)?;
+    }
+
+    // ── Stage 2: TIN-grid the ground points into a bare-earth DTM raster ──
+    {
+        let mut args: ToolArgs = ToolArgs::new();
+        args.insert(
+            "input".to_string(),
+            json!(ground_path.display().to_string()),
+        );
+        args.insert("output".to_string(), json!(dtm_path.display().to_string()));
+        args.insert("resolution".to_string(), json!(config.auto_dtm_resolution));
+        args.insert("interpolation_parameter".to_string(), json!("elevation"));
+
+        let ctx = ToolContext {
+            progress: &progress,
+            capabilities: &capabilities,
+        };
+
+        let tool = LidarTinGriddingTool;
+        tool.validate(&args)?;
+        tool.run(&args, &ctx)?;
+    }
+
+    Ok(dtm_path)
 }
 
 // ── Eigenvalue-feature pre-pass helper (Stage 30, Step 5b/5c/5d) ─────────────
@@ -1844,5 +1972,96 @@ mod tests {
             stale_path.exists(),
             "stale leftover file must not be deleted"
         );
+    }
+
+    // ── Automatic ground DTM (Stage 38) ───────────────────────────────────────
+
+    /// Auto-DTM is the default no-external-DTM path: `auto_dtm` defaults to
+    /// `true`, `auto_dtm_resolution` to `DEFAULT_DTM_RESOLUTION` (1.0), and
+    /// `keep_auto_dtm` to `false`.
+    // Exact comparison against the `Default`-derived literal `1.0` constant;
+    // no floating-point arithmetic occurs, so precision is not a concern.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn test_preprocess_config_default_auto_dtm() {
+        let cfg = PreprocessConfig::default();
+        assert!(cfg.auto_dtm, "auto-DTM must default to enabled");
+        assert_eq!(
+            cfg.auto_dtm_resolution,
+            crate::preprocessing::DEFAULT_DTM_RESOLUTION,
+            "default resolution must be DEFAULT_DTM_RESOLUTION"
+        );
+        assert_eq!(
+            crate::preprocessing::DEFAULT_DTM_RESOLUTION,
+            1.0,
+            "DEFAULT_DTM_RESOLUTION must be 1.0"
+        );
+        assert!(
+            !cfg.keep_auto_dtm,
+            "intermediates must be deleted by default"
+        );
+    }
+
+    /// `run_auto_dtm` on a small synthetic bare-earth cloud produces a raster
+    /// that is readable by `wbraster::Raster::read` and wrappable in a
+    /// `DtmView` (the exact consumption path used by `run_internal`).
+    #[test]
+    fn test_run_auto_dtm_produces_readable_raster() {
+        use wblidar::io::PointWriter;
+        use wblidar::las::writer::{LasWriter, WriterConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("ground.las");
+
+        // Dense, gently sloped bare-earth grid (26×26 = 676 points over a
+        // 25×25 m footprint at 1 m spacing) so the ground filter retains a
+        // solid ground surface and TIN gridding yields a populated raster.
+        let mut pts: Vec<PointRecord> = Vec::with_capacity(26 * 26);
+        for ix in 0..26_i32 {
+            for iy in 0..26_i32 {
+                pts.push(PointRecord {
+                    x: f64::from(ix),
+                    y: f64::from(iy),
+                    z: 100.0 + f64::from(ix) * 0.05,
+                    intensity: 100,
+                    classification: 2,
+                    return_number: 1,
+                    number_of_returns: 1,
+                    ..PointRecord::default()
+                });
+            }
+        }
+
+        {
+            let cfg = WriterConfig::default();
+            let mut writer =
+                LasWriter::new(BufWriter::new(File::create(&input_path).unwrap()), cfg).unwrap();
+            for pt in &pts {
+                writer.write_point(pt).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let config = PreprocessConfig {
+            auto_dtm: true,
+            auto_dtm_resolution: 1.0,
+            ..PreprocessConfig::default()
+        };
+
+        let dtm_path = run_auto_dtm(&input_path, dir.path(), &config).unwrap();
+        assert!(dtm_path.exists(), "auto-DTM raster must be written");
+        assert_eq!(dtm_path, dir.path().join(AUTO_DTM_TIF));
+
+        // The raster must be readable and wrappable exactly as run_internal does.
+        let raster = wbraster::Raster::read(&dtm_path).unwrap();
+        let _view = DtmView::from_raster(&raster);
+
+        // The intermediate ground-only LAS must also have been produced.
+        assert!(
+            dir.path().join(AUTO_GROUND_LAS).exists(),
+            "intermediate ground LAS must exist after run_auto_dtm"
+        );
+
+        drop(pts);
     }
 }

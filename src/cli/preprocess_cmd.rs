@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use crate::error::{ClassifierError, Result};
-use crate::preprocessing::{PreprocessConfig, PreprocessingPipeline};
+use crate::preprocessing::{HagNormalization, PreprocessConfig, PreprocessingPipeline};
 
 /// Parse `args` and run the preprocessing pipeline.
 ///
@@ -48,6 +48,13 @@ pub fn run(args: &[String]) -> Result<()> {
 fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     let mut cfg = PreprocessConfig::default();
     let mut i = 0_usize;
+
+    // HAG normalisation (Stage 37) is resolved after the parse loop so the
+    // two flags interact deterministically regardless of order:
+    // `--hag-norm-percentile` selects the legacy mode; otherwise `--hag-max`
+    // (or its default) selects the fixed-absolute-metre mode.
+    let mut hag_max = crate::preprocessing::DEFAULT_HAG_MAX_METERS;
+    let mut hag_use_percentile = false;
 
     while i < args.len() {
         match args[i].as_str() {
@@ -85,6 +92,25 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             }
             "--hag-model" => {
                 cfg.hag_model = Some(PathBuf::from(next_value(args, &mut i, "--hag-model")?));
+            }
+            "--no-auto-dtm" => {
+                // Invert: presence (or explicit `true`) disables auto-DTM.
+                cfg.auto_dtm = !parse_optional_bool(args, &mut i, true);
+            }
+            "--dtm-resolution" => {
+                cfg.auto_dtm_resolution = parse_f64(
+                    next_value(args, &mut i, "--dtm-resolution")?,
+                    "--dtm-resolution",
+                )?;
+            }
+            "--keep-auto-dtm" => {
+                cfg.keep_auto_dtm = parse_optional_bool(args, &mut i, true);
+            }
+            "--hag-max" => {
+                hag_max = parse_f64(next_value(args, &mut i, "--hag-max")?, "--hag-max")?;
+            }
+            "--hag-norm-percentile" => {
+                hag_use_percentile = parse_optional_bool(args, &mut i, true);
             }
             "--threads" => {
                 cfg.threads = Some(parse_usize(
@@ -208,6 +234,31 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             "--eigen-memory-budget-mb must be >= 1".to_string(),
         ));
     }
+    // Stage 38: auto-DTM resolution must be positive & finite, even when
+    // auto-DTM is disabled or an external --hag-model overrides it, so that
+    // obviously bad input is rejected early.
+    if cfg.auto_dtm_resolution <= 0.0 || !cfg.auto_dtm_resolution.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--dtm-resolution must be a positive finite number".to_string(),
+        ));
+    }
+
+    // ── HAG normalisation resolution + validation (Stage 37) ──────────────
+
+    // `--hag-norm-percentile` selects the legacy per-block mode and takes
+    // precedence over `--hag-max`; otherwise the fixed-absolute-metre mode
+    // is used (default 50.0 m). `--hag-max` must be positive and finite even
+    // when percentile mode is selected, to reject obviously bad input early.
+    if hag_max <= 0.0 || !hag_max.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--hag-max must be a positive finite number".to_string(),
+        ));
+    }
+    cfg.hag_normalization = if hag_use_percentile {
+        HagNormalization::BlockPercentile99
+    } else {
+        HagNormalization::FixedMeters(hag_max)
+    };
 
     Ok(cfg)
 }
@@ -269,8 +320,25 @@ fn print_help() {
            --search-radius <f64>   Base neighbourhood radius for eigenvalue features (default: 1.0)
            --min-neighbors <uint>  Minimum neighbours; radius expands adaptively (default: 8)\n\
            --hag-model     <path>  DTM raster for Height Above Ground (default: block-min-z proxy)\n\
+           --hag-max       <f64>   Fixed absolute reference height (projection units) used to\n\
+                                   normalise HAG into [0,1]; preserves absolute vertical scale\n\
+                                   so identical physical heights map to identical features.\n\
+                                   (default: 50.0 — Stage 37)\n\
+           --hag-norm-percentile   Opt into the legacy per-block 99th-percentile HAG\n\
+                                   normalisation (ignores --hag-max). Neighbour-dependent;\n\
+                                   retained for reproducibility/comparison only.\n\
            --threads       <uint>  Rayon thread pool size (default: system cores)\n\
            --debug-csv             Also emit per-block .csv files alongside .feat files\n\
+         \n\
+         AUTOMATIC GROUND DTM (Stage 38 — enabled by default):\n\
+           A bare-earth DTM is auto-generated from the input and used for HAG.\n\
+           An explicit --hag-model always takes priority over auto-generation.\n\
+           --dtm-resolution <f64>  Grid cell size (projection units) for the auto-generated\n\
+                                   bare-earth DTM (default: 1.0)\n\
+           --no-auto-dtm           Disable auto-DTM; fall back to the block-min-z HAG proxy\n\
+                                   (unless --hag-model is given)\n\
+           --keep-auto-dtm         Keep the intermediate _auto_dtm.tif / _auto_ground.las\n\
+                                   files instead of deleting them after the run\n\
          \n\
          BLOCK OVERLAP (disabled by default):\n\
            --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
@@ -294,4 +362,73 @@ fn print_help() {
                                        eigenvalue-feature pre-pass runs in one pass or is\n\
                                        split into memory-gated spatial strips (default: 2048)\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> Vec<String> {
+        vec![
+            "--input".to_string(),
+            "in.las".to_string(),
+            "--output".to_string(),
+            "out_dir".to_string(),
+        ]
+    }
+
+    // Stage 38: auto-DTM is enabled by default with a 1.0 resolution.
+    // Exact comparison against the `Default`-derived literal 1.0 constant;
+    // no floating-point arithmetic occurs, so precision is not a concern.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn test_auto_dtm_defaults() {
+        let cfg = parse_args(&base_args()).unwrap();
+        assert!(cfg.auto_dtm, "auto-DTM must default on");
+        assert_eq!(cfg.auto_dtm_resolution, 1.0);
+        assert!(!cfg.keep_auto_dtm);
+    }
+
+    // Stage 38: `--no-auto-dtm` clears the flag.
+    #[test]
+    fn test_no_auto_dtm_disables() {
+        let mut args = base_args();
+        args.push("--no-auto-dtm".to_string());
+        let cfg = parse_args(&args).unwrap();
+        assert!(!cfg.auto_dtm, "--no-auto-dtm must disable auto-DTM");
+    }
+
+    // Stage 38: `--dtm-resolution` is parsed into `auto_dtm_resolution`.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn test_dtm_resolution_parsed() {
+        let mut args = base_args();
+        args.push("--dtm-resolution".to_string());
+        args.push("0.5".to_string());
+        let cfg = parse_args(&args).unwrap();
+        assert_eq!(cfg.auto_dtm_resolution, 0.5);
+    }
+
+    // Stage 38: `--keep-auto-dtm` retains intermediates.
+    #[test]
+    fn test_keep_auto_dtm_flag() {
+        let mut args = base_args();
+        args.push("--keep-auto-dtm".to_string());
+        let cfg = parse_args(&args).unwrap();
+        assert!(cfg.keep_auto_dtm);
+    }
+
+    // Stage 38: a non-positive `--dtm-resolution` is rejected.
+    #[test]
+    fn test_bad_dtm_resolution_rejected() {
+        let mut args = base_args();
+        args.push("--dtm-resolution".to_string());
+        args.push("0".to_string());
+        assert!(parse_args(&args).is_err());
+
+        let mut neg = base_args();
+        neg.push("--dtm-resolution".to_string());
+        neg.push("-2.0".to_string());
+        assert!(parse_args(&neg).is_err());
+    }
 }

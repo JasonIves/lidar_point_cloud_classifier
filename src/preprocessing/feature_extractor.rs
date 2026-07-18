@@ -27,7 +27,9 @@
 //! than `wblidar::PointRecord` — see `docs/stages/stage-31-lean-point-record.md`.
 
 use crate::preprocessing::lite_point::LitePoint;
-use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, DtmView};
+use crate::preprocessing::normalizer::{
+    compute_hag, normalise_scalar_features, DtmView, HagNormalization,
+};
 
 /// Extract the full feature vector for every point in `pts`.
 ///
@@ -44,6 +46,8 @@ use crate::preprocessing::normalizer::{compute_hag, normalise_scalar_features, D
 /// - `dtm`        — optional DTM view for HAG; `None` → block-min-z proxy
 /// - `origin_x/y` — block south-west corner
 /// - `block_size` — cell edge length
+/// - `hag_norm`   — HAG normalisation strategy (Stage 37); forwarded to
+///   `normalise_scalar_features`. Default is a fixed absolute metre reference.
 ///
 /// # Panics
 /// This function does not panic, but callers must ensure
@@ -58,12 +62,14 @@ pub fn extract_features(
     origin_x: f64,
     origin_y: f64,
     block_size: f64,
+    hag_norm: HagNormalization,
 ) -> Vec<Vec<f32>> {
     // Step 1: HAG
     let hag_values = compute_hag(pts, dtm);
 
     // Step 2: Scalar features (indices 0–6)
-    let scalar = normalise_scalar_features(pts, origin_x, origin_y, block_size, &hag_values);
+    let scalar =
+        normalise_scalar_features(pts, origin_x, origin_y, block_size, &hag_values, hag_norm);
 
     // Step 3: Combine scalar + precomputed eigenvalue rows (indices 7–16).
     scalar
@@ -127,9 +133,18 @@ mod tests {
             })
             .collect();
 
-        let feats = extract_features(&pts, &eigen_rows, None, 0.0, 0.0, 50.0);
+        let feats = extract_features(
+            &pts,
+            &eigen_rows,
+            None,
+            0.0,
+            0.0,
+            50.0,
+            HagNormalization::default(),
+        );
 
         assert_eq!(feats.len(), pts.len());
+
         for row in &feats {
             assert_eq!(
                 row.len(),
@@ -164,7 +179,15 @@ mod tests {
             })
             .collect();
 
-        let feats = extract_features(&pts, &eigen_rows, None, 0.0, 0.0, 50.0);
+        let feats = extract_features(
+            &pts,
+            &eigen_rows,
+            None,
+            0.0,
+            0.0,
+            50.0,
+            HagNormalization::default(),
+        );
         for (row, eig) in feats.iter().zip(eigen_rows.iter()) {
             assert_eq!(&row[7..17], eig.as_slice());
         }

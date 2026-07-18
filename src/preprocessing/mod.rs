@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod spatial_index;
 
 pub use lite_point::LitePoint;
+pub use normalizer::{HagNormalization, DEFAULT_DTM_RESOLUTION, DEFAULT_HAG_MAX_METERS};
 pub use pipeline::{BlockManifest, BlockMeta, BlockProcessResult, PreprocessingPipeline};
 
 /// Minimum Rayon chunk size before spawning parallel tasks pays off.
@@ -107,6 +108,13 @@ pub fn block_id(row: i64, col: i64, grid_cols: i64) -> u64 {
 }
 
 /// Configuration for the full preprocessing pipeline.
+// This is a flat CLI-mirroring configuration bag, not a state machine: each
+// bool is an independent on/off pipeline toggle (`debug_csv`, `outlier_removal`,
+// `outlier_use_median`, `auto_dtm`, `keep_auto_dtm`) that maps 1:1 to a CLI
+// flag. Collapsing them into an enum/bitflags would obscure that direct
+// mapping and gain nothing, so the excessive-bools lint is intentionally
+// allowed here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PreprocessConfig {
     /// Path to the input LAS/LAZ/COPC file.
@@ -140,6 +148,23 @@ pub struct PreprocessConfig {
     /// Optional path to a DTM raster for Height Above Ground computation.
     /// When `None`, the block-minimum-z proxy is used.
     pub hag_model: Option<std::path::PathBuf>,
+
+    // ── HAG normalisation strategy (Stage 37) ─────────────────────────────
+    /// How the Height-Above-Ground scalar feature (index 6) is normalised
+    /// into `[0, 1]`.
+    ///
+    /// - [`HagNormalization::FixedMeters`] (default, `50.0` m) — divides HAG
+    ///   by a fixed absolute reference height, preserving the *absolute*
+    ///   vertical scale so identical physical heights map to identical
+    ///   feature values regardless of a block's neighbouring points. This is
+    ///   the Stage 37 fix for low/medium/high vegetation confusion.
+    /// - [`HagNormalization::BlockPercentile99`] — the legacy per-block
+    ///   99th-percentile normalisation, retained behind an opt-in flag for
+    ///   backward comparison. This mode is *neighbour-dependent*: the same
+    ///   physical height yields different feature values across blocks.
+    ///
+    /// See `docs/stages/stage-37-absolute-hag-normalization.md`.
+    pub hag_normalization: HagNormalization,
 
     /// Rayon thread pool size (`None` = use the system default).
     pub threads: Option<usize>,
@@ -208,6 +233,28 @@ pub struct PreprocessConfig {
     /// Default: 2 GiB (`2 * 1024 * 1024 * 1024` bytes). Overridable via
     /// `--eigen-memory-budget-mb <usize>`.
     pub eigen_memory_budget_bytes: usize,
+
+    // ── Automatic ground DTM generation (Stage 38) ────────────────────────
+    /// When `true` (default) and [`hag_model`](Self::hag_model) is `None`,
+    /// auto-generate a bare-earth DTM from the input cloud
+    /// (`improved_ground_point_filter` → `lidar_tin_gridding`) and use it for
+    /// Height-Above-Ground, rather than falling back to the block-min-z proxy.
+    /// Disable with `--no-auto-dtm` to restore the historical proxy.
+    ///
+    /// An explicit `--hag-model` always takes priority over auto-DTM.
+    ///
+    /// See `docs/stages/stage-38-automatic-ground-dtm.md`.
+    pub auto_dtm: bool,
+
+    /// Output raster cell size (projection units) for the auto-generated DTM.
+    /// Default: [`DEFAULT_DTM_RESOLUTION`] (`1.0`). Overridable via
+    /// `--dtm-resolution <f64>` (must be positive and finite).
+    pub auto_dtm_resolution: f64,
+
+    /// When `true`, retain the intermediate `_auto_ground.las` /
+    /// `_auto_dtm.tif` artifacts for inspection instead of deleting them once
+    /// the run completes. Default `false`. Enable via `--keep-auto-dtm`.
+    pub keep_auto_dtm: bool,
 }
 
 /// Default eigenvalue-feature pre-pass memory budget: 2 GiB.
@@ -225,6 +272,7 @@ impl Default for PreprocessConfig {
             min_neighbors: 8,
 
             hag_model: None,
+            hag_normalization: HagNormalization::default(),
             threads: None,
             debug_csv: false,
             outlier_removal: false,
@@ -234,6 +282,9 @@ impl Default for PreprocessConfig {
             block_overlap: 0.0,
             oversample_jitter: 0.0,
             eigen_memory_budget_bytes: DEFAULT_EIGEN_MEMORY_BUDGET_BYTES,
+            auto_dtm: true,
+            auto_dtm_resolution: DEFAULT_DTM_RESOLUTION,
+            keep_auto_dtm: false,
         }
     }
 }
