@@ -241,7 +241,15 @@ where
         use_input_tnet: true,
         use_feature_tnet: config.use_feature_tnet,
     };
-    let label_map: Vec<u8> = (0u8..config.n_classes as u8).collect();
+    // Stage 41 (Model label_map identity bug fix): derive the saved model's
+    // label_map from the *dataset's actual* ASPRS-code <-> model-index
+    // mapping (whatever was used at `preprocess-labeled` time — the
+    // built-in default or a custom `--label-map`) instead of hardcoding
+    // identity. `classify()` uses this exact field to translate a predicted
+    // model index back into a real ASPRS code for the output LAS
+    // `Classification` field, so an incorrect (identity) map here silently
+    // corrupts every deployed model's classification output.
+    let label_map: Vec<u8> = dataset.inverse_label_map()?;
 
     let mut model: BurnPointNet<B> = BurnPointNet::new(&net_cfg, device)?;
 

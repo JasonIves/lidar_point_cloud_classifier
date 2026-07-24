@@ -379,6 +379,81 @@ impl LabeledBlockDataset {
         self.n_features_inner
     }
 
+    /// Return the raw ASPRS-code-string → model-class-index label map
+    /// declared in the **first** loaded directory's `labeled_blocks.json`
+    /// manifest (Stage 40).
+    ///
+    /// All loaded directories are already validated (in
+    /// [`load_dir_entries`]) to share the same class *count*
+    /// ([`n_classes`](Self::n_classes)); this accessor exposes the actual
+    /// ASPRS-code ↔ model-index mapping so callers (e.g. `wb_lidar_train
+    /// evaluate`'s `reconcile_n_classes`) can additionally verify that the
+    /// model's own `label_map` (model index → ASPRS code) agrees with this
+    /// mapping in *content*, not merely in count — two label maps with the
+    /// same number of classes can still assign different ASPRS codes to the
+    /// same model index, which would silently corrupt every evaluation
+    /// metric without this check.
+    ///
+    /// Directories are guaranteed non-empty by [`load`](Self::load) and
+    /// [`load_presplit`](Self::load_presplit), so indexing the first
+    /// directory never panics. If multiple directories are loaded, only the
+    /// first directory's label map is returned; directory-to-directory
+    /// label-map *content* agreement is not currently cross-validated here
+    /// (only the class count is, in [`load_dir_entries`]).
+    #[must_use]
+    pub fn label_map(&self) -> &HashMap<String, u8> {
+        &self.dirs[0].manifest.label_map
+    }
+
+    /// Invert this dataset's ASPRS-code(string) → model-class-index label
+    /// map (`label_map`) into a dense model-index → ASPRS-code `Vec<u8>` of
+    /// length `n_classes()`, suitable for embedding directly as a
+    /// `.wbmodel`'s `label_map` field (Stage 41).
+    ///
+    /// # Why this exists
+    ///
+    /// `preprocess-labeled` records whichever ASPRS-code ↔ model-index
+    /// mapping was actually used to encode the `.lbl` files — either the
+    /// built-in [`LabeledPreprocessConfig::default_label_map`] or a custom
+    /// `--label-map` file — in `labeled_blocks.json`'s `label_map` field
+    /// (ASPRS code → model index). `PointNetClassifier::classify()` needs
+    /// the *inverse* direction (model index → ASPRS code) to translate a
+    /// predicted class index back into a real ASPRS code for the output
+    /// LAS `Classification` field. This method performs that inversion
+    /// from the dataset's actual recorded mapping — never a hardcoded
+    /// default — so training on data preprocessed with a custom
+    /// `--label-map` correctly propagates that same custom mapping into
+    /// the saved model.
+    ///
+    /// # Errors
+    /// Returns an error if any ASPRS code key in the dataset's label map is
+    /// not a valid `u8` string, or if any model-class-index value is out of
+    /// range for `n_classes()`.
+    ///
+    /// Any model index with no corresponding entry in the dataset's label
+    /// map (which should not occur for a validated, contiguous label map —
+    /// see [`load_dir_entries`]) falls back to ASPRS code `1` (Unassigned),
+    /// matching `PointNetClassifier::classify()`'s existing `.unwrap_or(1)`
+    /// fallback convention for absent `label_map` entries.
+    pub fn inverse_label_map(&self) -> Result<Vec<u8>> {
+        let n = self.n_classes_inner;
+        let mut derived: Vec<Option<u8>> = vec![None; n];
+        for (code_str, &idx) in self.label_map() {
+            let code: u8 = code_str.parse().map_err(|_| {
+                ClassifierError::Pipeline(format!(
+                    "dataset label_map has a non-numeric ASPRS code key {code_str:?}"
+                ))
+            })?;
+            let slot = derived.get_mut(idx as usize).ok_or_else(|| {
+                ClassifierError::Pipeline(format!(
+                    "dataset label_map model index {idx} is out of range for {n} classes"
+                ))
+            })?;
+            *slot = Some(code);
+        }
+        Ok(derived.into_iter().map(|c| c.unwrap_or(1)).collect())
+    }
+
     /// Return the largest sampled block size recorded in the loaded manifests.
     ///
     /// GPU pre-flight and `CubeCL` memory-pool sizing need a representative
@@ -393,6 +468,25 @@ impl LabeledBlockDataset {
             .map(|block| block.meta.sampled_point_count)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Enumerate the `GlobalBlockId` of **every** block across all loaded
+    /// directories, independent of any train/val split.
+    ///
+    /// [`load`](Self::load) always partitions blocks into `train_ids` /
+    /// `val_ids` (and `spatial_split` forces at least one held-out macro-tile
+    /// even when `val_split == 0.0`). Consumers that must score the entire
+    /// dataset — e.g. held-out evaluation — should iterate this list instead of
+    /// relying on `train_ids ∪ val_ids`. Each block is returned exactly once.
+    #[must_use]
+    pub fn all_block_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for (dir_idx, entry) in self.dirs.iter().enumerate() {
+            for b in &entry.manifest.blocks {
+                ids.push(make_global_id(dir_idx, b.meta.id));
+            }
+        }
+        ids
     }
 
     /// Compute per-class point counts from the **training** blocks only.
@@ -919,6 +1013,47 @@ mod tests {
         assert_eq!(dataset.max_sampled_points_per_block(), 8192);
     }
 
+    #[test]
+    fn test_all_block_ids_covers_every_block_once_across_dirs() {
+        // Two dirs with colliding local IDs (0,1 in each). all_block_ids()
+        // must return every block exactly once with distinct GlobalBlockIds,
+        // independent of any train/val split.
+        let manifest_a = dummy_manifest(vec![make_lbm(0, 0), make_lbm(1, 0)]);
+        let manifest_b = dummy_manifest(vec![make_lbm(0, 1), make_lbm(1, 1)]);
+        let block_index_a = build_block_index(&manifest_a);
+        let block_index_b = build_block_index(&manifest_b);
+
+        let dataset = LabeledBlockDataset {
+            dirs: vec![
+                DirEntry {
+                    path: PathBuf::from("a"),
+                    manifest: manifest_a,
+                    block_index: block_index_a,
+                },
+                DirEntry {
+                    path: PathBuf::from("b"),
+                    manifest: manifest_b,
+                    block_index: block_index_b,
+                },
+            ],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        };
+
+        let ids = dataset.all_block_ids();
+        assert_eq!(ids.len(), 4, "all four blocks must be enumerated");
+        let unique: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 4, "GlobalBlockIds must be distinct");
+        assert!(unique.contains(&make_global_id(0, 0)));
+        assert!(unique.contains(&make_global_id(0, 1)));
+        assert!(unique.contains(&make_global_id(1, 0)));
+        assert!(unique.contains(&make_global_id(1, 1)));
+    }
+
     /// Stage 21 (Performance): the `HashMap`-backed `load_block()` lookup
     /// must find an existing block ID and return `None` (via the outer
     /// `Option` chain) for a missing one, matching the pre-optimization
@@ -1024,6 +1159,102 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("parse error"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    // ── Stage 41 (Model label_map identity bug fix): inverse_label_map() ──
+
+    #[test]
+    fn test_inverse_label_map_non_identity_mapping() {
+        // Mirrors LabeledPreprocessConfig::default_label_map()'s inversion:
+        // ASPRS code (string) -> model index, inverted into model index ->
+        // ASPRS code. Deliberately non-identity so a regression to hardcoded
+        // identity would be caught.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut label_map = HM::new();
+        label_map.insert("2".to_string(), 0u8); // Ground
+        label_map.insert("3".to_string(), 1u8); // Low Veg
+        label_map.insert("6".to_string(), 2u8); // Building
+        let mut manifest = dummy_manifest(vec![make_lbm(0, 0)]);
+        manifest.label_map = label_map;
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write fixture");
+
+        let dataset = LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.2, None, 0)
+            .expect("load dataset");
+
+        let inverted = dataset.inverse_label_map().expect("inverse_label_map");
+        assert_eq!(inverted, vec![2u8, 3u8, 6u8]);
+    }
+
+    #[test]
+    fn test_inverse_label_map_rejects_non_numeric_asprs_code() {
+        let manifest_label_map = {
+            let mut m = HM::new();
+            m.insert("not-a-number".to_string(), 0u8);
+            m
+        };
+        let block_index = HashMap::new();
+        let mut manifest = dummy_manifest(vec![]);
+        manifest.label_map = manifest_label_map;
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 1,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        };
+
+        let result = dataset.inverse_label_map();
+        assert!(result.is_err(), "non-numeric ASPRS code must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("non-numeric"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_inverse_label_map_rejects_out_of_range_model_index() {
+        let manifest_label_map = {
+            let mut m = HM::new();
+            // n_classes_inner will be set to 1 below, but this label map
+            // claims model index 5 — out of range.
+            m.insert("2".to_string(), 5u8);
+            m
+        };
+        let block_index = HashMap::new();
+        let mut manifest = dummy_manifest(vec![]);
+        manifest.label_map = manifest_label_map;
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 1,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+        };
+
+        let result = dataset.inverse_label_map();
+        assert!(result.is_err(), "out-of-range model index must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("out of range"),
             "unexpected error message: {msg}"
         );
     }

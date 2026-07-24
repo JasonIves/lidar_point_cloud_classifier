@@ -335,10 +335,30 @@ impl TNet {
 
     /// Apply the `[k, k]` transform matrix to an `[N, k]` feature slice.
     ///
-    /// `output = input @ T^T`
+    /// `output = input @ T` (no transpose).
+    ///
+    /// # Bug history (Stage 40)
+    /// This previously computed `input @ T^T`, copying the transpose
+    /// convention used by [`Linear::forward`] (whose weight is stored
+    /// `[dim_out, dim_in]`, PyTorch-style). `T` is **not** a `Linear`
+    /// weight — it is a genuine `[k, k]` spatial-transform matrix
+    /// (`T = I + learned_residual`), and must be applied directly, exactly
+    /// as the training-time twin does (`BurnPointNet::forward`:
+    /// `xyz.matmul(t1)`, no transpose) and as the canonical Qi et al. 2017
+    /// reference implementation does (`torch.bmm(x, trans)`, no transpose).
+    ///
+    /// Because the learned residual is generally *asymmetric* (`T ≠ T^T`),
+    /// the erroneous transpose silently applied a different, wrong spatial
+    /// transform to every point at deployed-inference time — identical
+    /// weights and identical input data as training-time validation, but a
+    /// systematically corrupted first processing stage. This was the root
+    /// cause of a catastrophic held-out `evaluate` mIoU collapse (~0.60
+    /// training-time validation vs ~0.02 deployed `evaluate`) despite
+    /// bit-identical model weights and data. See
+    /// `docs/stages/stage-40-tnet-transpose-fix.md`.
     #[must_use]
     pub fn apply(features: &Array2<f32>, transform: &Array2<f32>) -> Array2<f32> {
-        features.dot(&transform.t().to_owned())
+        features.dot(transform)
     }
 }
 
@@ -556,5 +576,44 @@ mod tests {
             bn_fc0: None,
             bn_fc1: None,
         })
+    }
+
+    // ── Stage 40: T-Net transform application (transpose bug regression) ─────
+
+    /// Regression guard for the Stage 40 transpose bug: `TNet::apply` must
+    /// apply the transform matrix directly (`input @ T`), matching the
+    /// training-time twin's `xyz.matmul(t1)` convention, NOT `input @ T^T`.
+    /// This test uses a deliberately **asymmetric** transform (`T != T^T`)
+    /// so that a transpose error would change the result — a symmetric `T`
+    /// would incorrectly pass even with the old buggy code.
+    #[test]
+    fn test_tnet_apply_uses_transform_directly_not_transposed() {
+        // Deliberately asymmetric 3x3 transform (T != T^T).
+        let t = Array2::from_shape_vec(
+            (3, 3),
+            vec![
+                1.0f32, 2.0, 3.0, //
+                0.0, 1.0, 4.0, //
+                0.0, 0.0, 1.0,
+            ],
+        )
+        .unwrap();
+        let t_transpose = t.t().to_owned();
+        // Sanity check: t is indeed asymmetric.
+        assert_ne!(t, t_transpose);
+
+        let x = Array2::from_shape_vec((2, 3), vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
+
+        let expected_no_transpose = x.dot(&t);
+        let expected_with_transpose = x.dot(&t_transpose);
+        // These must differ for the test to be meaningful.
+        assert_ne!(expected_no_transpose, expected_with_transpose);
+
+        let actual = TNet::apply(&x, &t);
+        assert_eq!(
+            actual, expected_no_transpose,
+            "TNet::apply must compute input @ T (no transpose), matching \
+             BurnPointNet's training-time xyz.matmul(t1) convention"
+        );
     }
 }

@@ -118,9 +118,14 @@ fn test_training_loop_reduces_loss_on_synthetic_dataset() {
         });
     }
 
+    // Stage 41 (Model label_map identity bug fix): deliberately non-identity
+    // — ASPRS code "0" maps to model index 1, and ASPRS code "1" maps to
+    // model index 0 — so a regression to `trainer::train()` hardcoding an
+    // identity label_map (`[0, 1, ..., n-1]`) into the saved `.wbmodel`
+    // would be caught below rather than silently passing.
     let mut label_map = HashMap::new();
-    label_map.insert("0".to_string(), 0u8);
-    label_map.insert("1".to_string(), 1u8);
+    label_map.insert("0".to_string(), 1u8);
+    label_map.insert("1".to_string(), 0u8);
 
     let manifest = LabeledBlockManifest {
         source: "synthetic.las".to_string(),
@@ -183,6 +188,21 @@ fn test_training_loop_reduces_loss_on_synthetic_dataset() {
     let output_path = train::<CpuBackend>(&dataset, &config, &device)
         .expect("training run must succeed end-to-end");
     assert!(output_path.exists(), "trained model file must be written");
+
+    // Stage 41 (Model label_map identity bug fix): the saved model's
+    // label_map must be the *inverse* of the dataset's real ASPRS<->index
+    // mapping (here [1, 0], since ASPRS "0"->idx1 and "1"->idx0) — NOT the
+    // hardcoded identity [0, 1] the pre-fix trainer always wrote.
+    let saved_model = lidar_point_cloud_classifier::model::weights::load_model(&output_path)
+        .expect("saved model must load");
+    let expected_label_map = dataset
+        .inverse_label_map()
+        .expect("inverse_label_map must succeed");
+    assert_eq!(
+        saved_model.label_map, expected_label_map,
+        "trained model's label_map must match the dataset's inverted label map, \
+         not a hardcoded identity mapping"
+    );
 
     let csv = fs::read_to_string(&metrics_path).expect("metrics.csv must be written");
     let mut train_losses = Vec::new();

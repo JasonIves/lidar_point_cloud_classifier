@@ -321,4 +321,86 @@ mod tests {
         // Verify elementwise mean
         assert!((avg[[0, 0]] - f32::midpoint(w1[[0, 0]], w2[[0, 0]])).abs() < 1e-6);
     }
+
+    // ── Stage 40: Burn ↔ ndarray forward-equivalence regression test ─────────
+
+    /// Cross-framework forward-equivalence regression test (Stage 40).
+    ///
+    /// Bridges a freshly-constructed `BurnPointNet` (untrained, `use_input_tnet:
+    /// true`) to a `.wbmodel` and asserts that `BurnPointNet::valid().forward()`
+    /// (the training-time validation path, `trainer::validate_epoch`) and the
+    /// bridged `PointNetClassifier::forward()` (the deployed ndarray inference
+    /// path) produce numerically equivalent logits on the same input.
+    ///
+    /// Burn's `Linear` layers use non-zero random initialization by default, so
+    /// the Input T-Net's learned transform `T = I + learned_residual` is already
+    /// asymmetric (`T != T^T`) on a freshly constructed model — no training
+    /// steps are needed to exercise the Stage 40 transpose bug. Before the
+    /// Stage 40 fix (`TNet::apply` computing `input @ T^T` instead of
+    /// `input @ T`), this test would fail because the ndarray path applied a
+    /// systematically different spatial transform to the input xyz coordinates
+    /// than the burn path, exactly reproducing the mIoU 0.60 (training
+    /// validation) vs 0.02 (deployed `evaluate`) collapse observed on
+    /// bit-identical model weights and data. See
+    /// `docs/stages/stage-40-tnet-transpose-fix.md`.
+    #[test]
+    fn test_burn_and_ndarray_forward_outputs_agree_after_bridge() {
+        use crate::training::burn_model::features_to_tensor;
+        use burn::module::AutodiffModule;
+
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let cfg = default_cfg();
+        assert!(
+            cfg.use_input_tnet,
+            "this test only exercises the Stage 40 bug when the Input T-Net is enabled"
+        );
+
+        let model = BurnPointNet::<B>::new(&cfg, &device).unwrap();
+        let label_map: Vec<u8> = (0u8..8).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("equiv.wbmodel");
+        save_model_from_burn(&model, &cfg, &label_map, &path).unwrap();
+        let loaded = load_model(&path).unwrap();
+
+        // Deterministic, non-trivial input (values spread across [-0.5, 0.5)).
+        let n = 16usize;
+        let flat: Vec<f32> = (0..(n * N_FEATURES))
+            .map(|i| (i % 37) as f32 / 37.0 - 0.5)
+            .collect();
+
+        // Burn-side: inference-mode forward pass, matching trainer.rs's
+        // `validate_epoch` path (`model.valid()` on the inner backend).
+        let val_model = model.valid();
+        let inner_input = features_to_tensor::<<B as AutodiffBackend>::InnerBackend>(
+            flat.clone(),
+            n,
+            N_FEATURES,
+            &device,
+        );
+        let burn_logits: Vec<f32> = val_model
+            .forward(inner_input)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        // ndarray-side: deployed inference path via the bridged `.wbmodel`.
+        let features = Array2::from_shape_vec((n, N_FEATURES), flat).unwrap();
+        let ndarray_logits = loaded.forward(features).unwrap();
+        let ndarray_flat: Vec<f32> = ndarray_logits.iter().copied().collect();
+
+        assert_eq!(
+            burn_logits.len(),
+            ndarray_flat.len(),
+            "burn and ndarray logit vectors must have the same length"
+        );
+        for (i, (b, nd)) in burn_logits.iter().zip(ndarray_flat.iter()).enumerate() {
+            assert!(
+                (b - nd).abs() < 1e-3,
+                "Burn vs ndarray forward mismatch at flat index {i}: burn={b}, ndarray={nd} \
+                 (this indicates the training-time and deployed-inference forward passes have \
+                 diverged — see the Stage 40 T-Net transpose bug)"
+            );
+        }
+    }
 }

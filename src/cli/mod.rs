@@ -4,6 +4,10 @@ pub mod classify_cmd;
 pub mod preprocess_cmd;
 
 #[cfg(feature = "training")]
+pub mod evaluate_cmd;
+#[cfg(feature = "training")]
+pub mod fix_label_map_cmd;
+#[cfg(feature = "training")]
 pub mod preprocess_labeled_cmd;
 #[cfg(feature = "training")]
 pub mod split_dataset_cmd;

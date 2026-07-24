@@ -18,6 +18,7 @@
    - [5.1 `preprocess-labeled` — Labeled Preprocessing](#51-preprocess-labeled--labeled-preprocessing)
    - [5.2 `split-dataset` — Dataset Split Materialization](#52-split-dataset--dataset-split-materialization)
    - [5.3 `train` — PointNet Training](#53-train--pointnet-training)
+   - [5.4 `evaluate` — Held-Out Test Evaluation](#54-evaluate--held-out-test-evaluation)
 6. [GPU Acceleration & Device Selection](#6-gpu-acceleration--device-selection)
 7. [Model Architecture: PointNet](#7-model-architecture-pointnet)
 8. [The `.feat` Binary Format](#8-the-feat-binary-format)
@@ -206,7 +207,6 @@ Transforms a raw LiDAR point cloud into block-based feature files ready for infe
 |---|---|---|
 | `--search-radius <f64>` | `1.0` | Base neighbourhood radius (projection units) for the whole-file eigenvalue feature pre-pass. |
 | `--min-neighbors <uint>` | `8` | Minimum number of neighbours for adaptive radius expansion. |
-| `--hag-model <path>` | *(block-min-z proxy)* | Path to a DTM raster file for computing Height Above Ground. If not provided, a per-block Z-min proxy is used. |
 | `--eigen-memory-budget-mb <uint>` | `2048` | Memory budget (in MB) for the whole-file eigenvalue feature pre-pass. When the estimated point-record buffer exceeds this budget, the pre-pass is split into spatial strips. |
 
 #### Optional Arguments — Outlier Removal
@@ -225,6 +225,17 @@ All outlier arguments are disabled by default (`--outlier-removal` must be expli
 | Argument | Default | Description |
 |---|---|---|
 | `--oversample-jitter <f64>` | `0.0` | Standard deviation (projection units) of per-axis Gaussian jitter applied to padding-only points when a block has fewer than `--target-points` raw points. Offsets are clipped to ±3σ. When 0.0 (default), exact-duplicate padding is used. |
+
+#### Optional Arguments — Height Above Ground (HAG)
+
+| Argument | Default | Description |
+|---|---|---|
+| `--hag-model <path>` | *(auto-DTM)* | Path to an external DTM raster file. When provided, it takes priority over auto-DTM. When not provided, a bare-earth DTM is auto-generated from the input cloud. |
+| `--hag-max <f64>` | `50.0` | Fixed absolute reference height (projection z-units) for normalising raw HAG into `[0,1]`. Raw HAG is clamped to `raw / hag_max`. Must be positive and finite. |
+| `--hag-norm-percentile` | *(off)* | Opt into the legacy per-block-99th-percentile HAG normalisation instead of the fixed-absolute-reference default. Ignores `--hag-max`. Retained for reproducibility and A/B comparison only. |
+| `--no-auto-dtm` | *(off)* | Disable auto-DTM generation. When set and no `--hag-model` is provided, falls back to the per-block Z-min proxy for ground elevation. |
+| `--dtm-resolution <f64>` | `1.0` | Cell size (projection units) for the auto-generated ground DTM raster. Controls the spatial grain of the bare-earth surface. See [Auto-DTM](#auto-dtm) for tuning guidance. |
+| `--keep-auto-dtm` | *(off)* | Retain the intermediate `_auto_ground.las` and `_auto_dtm.tif` files after the run instead of deleting them. Useful for inspection and diagnostics. |
 
 #### Optional Arguments — Diagnostics & Performance
 
@@ -315,6 +326,7 @@ wb_lidar_train <sub-command> [options]
 | `preprocess-labeled` | Preprocess labeled LiDAR ⇒ `.feat` + `.lbl` block pairs |
 | `split-dataset` | Materialize a physical train/val/test directory split |
 | `train` | Train a PointNet model and produce a `.wbmodel` file |
+| `evaluate` | Score a trained model against a held-out labeled dataset |
 | `help` | Show usage information |
 
 ---
@@ -629,6 +641,65 @@ wb_lidar_train train \
     --device auto
 ```
 
+### 5.4 `evaluate` — Held-Out Test Evaluation
+
+Measures a trained model's classification performance on a labeled, held-out dataset (e.g., the `test/` split produced by `split-dataset`, or any `preprocess-labeled` output directory the model never saw during training).
+
+Evaluation runs through the **pure-Rust inference engine** (`PointNetClassifier`), the same engine used by `wb_lidar_classify classify`. This ensures the metrics reflect the actually-deployed model's performance.
+
+> [!NOTE]
+> The `evaluate` sub-command is CPU-only, pure-Rust, and requires no GPU. Unlike `train`, it does not use the `burn` framework.
+
+#### Required Arguments
+
+| Argument | Description |
+|---|---|
+| `--model <path>` | Path to a trained `.wbmodel` file to evaluate. |
+| `--data-dir <dir>` | One or more labeled data directories from `preprocess-labeled` or the `test/` subdirectory from `split-dataset`. **Repeatable.** |
+| `--metrics-out <path>` | Path for the per-class metrics CSV file. |
+| `--confusion-out <path>` | Path for the confusion matrix CSV file. |
+
+#### Optional Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--n-classes <uint>` | *(auto)* | Optional cross-check against the model and data. If supplied, must agree with both `model.config.n_classes` and `dataset.n_classes()`. |
+| `--threads <uint>` | *(system cores)* | Size of the Rayon thread pool for parallel block evaluation. |
+
+#### Output CSV: `--metrics-out`
+
+One row per class, plus a header:
+
+```
+class_idx,asprs_code,tp,fp,tn,fn,precision,recall,f1,iou
+```
+
+`asprs_code` is the ASPRS classification code from the model's label map for human readability. Aggregate scores (mean IoU, overall accuracy, macro-F1) are printed to stderr.
+
+#### Output CSV: `--confusion-out`
+
+A confusion matrix written by the existing `write_confusion_matrix_csv` utility: rows = true class (model index), columns = predicted class (model index). Cell values are point counts.
+
+#### Workflow
+
+1. The `.wbmodel` file is loaded via `model::weights::load_model`.
+2. The labeled data directory is loaded via `LabeledBlockDataset::load` with `val_split=0.0` so **every** block is evaluated.
+3. Model class count (`model.config.n_classes`) is validated against the dataset's class count derived from the manifest label map. A mismatch produces a hard error.
+4. Each block is processed in parallel (Rayon): features → `model.forward()` → argmax → class predictions.
+5. Predictions and ground-truth labels (from `.lbl` files) are accumulated into a `MetricsAccumulator`.
+6. Two CSV files are written; a summary is printed to stderr.
+
+#### Example
+
+```bash
+wb_lidar_train evaluate \
+    --model "C:/data/models/urban_model.wbmodel" \
+    --data-dir "C:/data/split/merged/test" \
+    --metrics-out "C:/data/eval/per_class_metrics.csv" \
+    --confusion-out "C:/data/eval/confusion_matrix.csv" \
+    --threads 8
+```
+
 ---
 
 ## 6. GPU Acceleration & Device Selection
@@ -941,6 +1012,41 @@ Multiple LiDAR files covering different areas can be combined into a single trai
 
 When `--no-stratify-classes` is **not** set (the default), the `split-dataset` command uses class-stratified assignment: macro-tiles are allocated to train/val/test in a way that balances the class distributions across all splits. This is particularly important for datasets with rare classes (e.g., water, bridge decks) that might otherwise be entirely absent from the validation set.
 
+### Auto-DTM (Automatic Ground DTM Generation)
+
+When no `--hag-model` is supplied, the preprocessing pipeline automatically generates a bare-earth DTM from the input point cloud. This replaces the historical block-minimum-Z proxy for ground elevation, which suffered from slope bias, block-boundary discontinuities, and empty-ground-block artefacts.
+
+The auto-DTM pipeline uses two Whitebox tools in sequence:
+
+1. **`improved_ground_point_filter`** — a multi-stage ground classifier (percentile filter → TIN grid → pit fill → off-terrain removal → reference-surface filter) that extracts bare-earth returns, explicitly removing buildings and large flat roofs.
+2. **`lidar_tin_gridding`** — Delaunay triangulation-based linear interpolation of the filtered ground points into a continuous raster surface. Produces nodata cells over large areas without ground returns (safe worst-case: falls back to the block-min-Z proxy per `NodataPolicy::Strict`).
+
+**Priority order:** `--hag-model` (external DTM) → auto-DTM → block-min-Z proxy (legacy fallback). If an external DTM is supplied, auto-DTM is skipped entirely.
+
+#### Choosing `--dtm-resolution`
+
+`--dtm-resolution` sets the cell size of the auto-generated DTM raster (in projection units — e.g., metres for a metric CRS). It controls the spatial grain of the bare-earth surface against which every point's HAG is measured.
+
+| Scenario | Suggested Resolution | Rationale |
+|---|---|---|
+| Typical airborne (5–20 pts/m²) | `1.0` (default) | Matches ground spacing; balanced |
+| High-density / drone (>50 pts/m²) | `0.3–0.5` | Data supports finer relief |
+| Sparse / older ALS (1–3 pts/m²) | `2.0–3.0` | Avoids nodata holes |
+| Flat terrain (floodplain, playa) | `2.0–5.0` | Little relief to resolve; faster |
+| Steep / dissected terrain | `1.0` (don't go coarser) | Coarse cells smooth away needed slope |
+
+**Diagnosing a bad choice:** Run with `--keep-auto-dtm` and inspect `_auto_dtm.tif`. Speckled/nodata holes → too fine → increase resolution. Flat terraced surface → too coarse → decrease resolution.
+
+#### Intermediate Files
+
+Auto-generated intermediates are deleted after the run unless `--keep-auto-dtm` is passed:
+- `_auto_ground.las` — ground-only point cloud from the filter stage.
+- `_auto_dtm.tif` — bare-earth DTM raster.
+
+#### Breaking Change
+
+Auto-DTM being the default changes the HAG column values compared to the legacy block-min-Z proxy. Any model trained against pre-Stage-38 features must be retrained with features produced using auto-DTM.
+
 ### Block Caching
 
 During training, each epoch reloads blocks from disk. When `--cache-blocks-max-mb` is set, the trainer maintains an in-memory LRU cache of recently loaded blocks. This can dramatically reduce I/O when:
@@ -996,6 +1102,9 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 > [!WARNING]
 > The `.feat` file format changed in Stage 30. Previously, files contained 12 features per point (7 scalar + 5 eigenvalue features). The current format contains 17 features per point (7 scalar + 10 eigenvalue features). Any `.feat` files or `.wbmodel` files generated before Stage 30 **must be regenerated**.
 
+> [!WARNING]
+> **Stage 37 (HAG normalisation) and Stage 38 (auto-DTM) both changed HAG column semantics.** The HAG feature (index 5) and normalised HAG (index 6) values differ from earlier runs. Any model trained against pre-Stage-37 or pre-Stage-38 features must be retrained with features produced under the current default settings.
+
 ---
 
 ## 12. Appendix
@@ -1014,6 +1123,11 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 | `--search-radius` | f64 | 1.0 | |
 | `--min-neighbors` | usize | 8 | |
 | `--hag-model` | Path | None | |
+| `--hag-max` | f64 | 50.0 | |
+| `--hag-norm-percentile` | bool flag | false | |
+| `--no-auto-dtm` | bool flag | false | |
+| `--dtm-resolution` | f64 | 1.0 | |
+| `--keep-auto-dtm` | bool flag | false | |
 | `--threads` | usize | System cores | |
 | `--debug-csv` | bool flag | false | |
 | `--block-overlap` | f64 | 0.0 | |
@@ -1087,6 +1201,17 @@ All `preprocess` flags plus:
 | `--grad-clip-norm` | f32 | None | |
 | `--cache-blocks-max-mb` | usize | None | |
 
+#### `wb_lidar_train evaluate`
+
+| Flag | Type | Default | Required |
+|---|---|---|---|
+| `--model` | Path | — | ✓ |
+| `--data-dir` | Path (repeatable) | — | ✓ |
+| `--metrics-out` | Path | — | ✓ |
+| `--confusion-out` | Path | — | ✓ |
+| `--n-classes` | usize | *(auto)* | |
+| `--threads` | usize | System cores | |
+
 ### B. ASPRS LAS Classification Standard (Common Codes)
 
 | Code | Meaning |
@@ -1139,10 +1264,12 @@ All `preprocess` flags plus:
 | Labeled manifest | `labeled_blocks.json` | `preprocess-labeled` / `split-dataset` | `train` | Block metadata + class distributions + label map |
 | Model weights | `.wbmodel` | `train` | `classify` / `train` (resume) | Network config + serialized weight tensors |
 | Training metrics | `metrics.csv` | `train` | *(analysis)* | Per-epoch loss, IoU, accuracy, confusion matrix |
+| Evaluation per-class metrics | *(user-specified)* | `evaluate` | *(analysis)* | Per-class TP/FP/TN/FN, precision, recall, F1, IoU |
+| Evaluation confusion matrix | *(user-specified)* | `evaluate` | *(analysis)* | Row-major confusion matrix (true × predicted class) |
 | Validation tile blocks | *(JSON array)* | *(manual or script)* | `train` | Explicit list of `u64` block IDs for validation |
 
 ---
 
-> **Document Version:** 1.1  
-> **Last Updated:** 2026-07-16  
-> **Corresponding Code Revision:** `18a5faf`
+> **Document Version:** 1.3  
+> **Last Updated:** 2026-07-23  
+> **Corresponding Code Revision:** `c6c092b`
