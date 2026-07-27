@@ -28,7 +28,10 @@ from the requested `0.20` fraction. Investigation (see chat record,
   before the size penalty grows large enough to push back.
 - **There is no correction step afterward** — once a tile is assigned, the
   decision is final, so an early size/class trade-off that turns out badly
-  for the overall size fraction is never revisited.
+  for the overall size fraction is never revisited. The rebalancing pass
+  added by this stage (a post-hoc iterative refinement moving tiles between
+  splits to improve size adherence) is conceptually analogous to the
+  Kernighan–Lin heuristic for graph partitioning (Kernighan & Lin, 1970).
 
 This is a real, current design gap in the greedy heuristic (not a bug in the
 sense of code not matching its own logic — the code does exactly what it was

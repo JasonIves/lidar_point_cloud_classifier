@@ -10,7 +10,9 @@ pub mod pipeline;
 pub mod spatial_index;
 
 pub use lite_point::LitePoint;
-pub use normalizer::{HagNormalization, DEFAULT_DTM_RESOLUTION, DEFAULT_HAG_MAX_METERS};
+pub use normalizer::{
+    HagNormalization, ZNormalization, DEFAULT_DTM_RESOLUTION, DEFAULT_HAG_MAX_METERS,
+};
 pub use pipeline::{BlockManifest, BlockMeta, BlockProcessResult, PreprocessingPipeline};
 
 /// Minimum Rayon chunk size before spawning parallel tasks pays off.
@@ -20,8 +22,12 @@ pub(crate) const RAYON_MIN_CHUNK: usize = 64;
 /// Magic bytes written at the start of every `.feat` file.
 pub const FEAT_MAGIC: &[u8; 4] = b"WBFT";
 
-/// Current `.feat` format version.
-pub const FEAT_VERSION: u8 = 1;
+/// Current `.feat` format version (Stage 45 — fixed-N halo split).
+pub const FEAT_VERSION: u8 = 2;
+
+/// Legacy `.feat` format version 1 (37-byte header, all-core rows).
+/// Readers must accept both v1 and v2 (Stage 45).
+pub const FEAT_VERSION_V1: u8 = 1;
 
 /// Number of scalar (non-eigenvalue) features per point.
 pub const N_SCALAR_FEATURES: usize = 7;
@@ -166,6 +172,26 @@ pub struct PreprocessConfig {
     /// See `docs/stages/stage-37-absolute-hag-normalization.md`.
     pub hag_normalization: HagNormalization,
 
+    // ── Z-elevation normalisation strategy (z_norm bug fix, Stage 37 follow-up) ──
+    /// How the raw-elevation scalar feature `z_norm` (index 2) is normalised
+    /// into `[0, 1]`.
+    ///
+    /// - `false` (default) — use [`crate::preprocessing::ZNormalization::Global`],
+    ///   normalising against a single whole-file elevation range (the
+    ///   LAS/LAZ/COPC header's own `min_z`/`max_z`, resolved once in
+    ///   `pipeline.rs`). A point at a given absolute elevation always maps to
+    ///   the same `z_norm` feature value regardless of which block it lands
+    ///   in. This is the fix for the "patchwork quilt" tile-boundary
+    ///   discontinuity caused by the legacy per-block behaviour.
+    /// - `true` — opt into [`crate::preprocessing::ZNormalization::BlockMinMax`],
+    ///   the legacy per-block min/max normalisation. *Neighbour-dependent*:
+    ///   the same absolute elevation yields different feature values across
+    ///   blocks. Retained for reproducibility/comparison only.
+    ///
+    /// See the `z_norm` stage doc for details (follow-up to
+    /// `docs/stages/stage-37-absolute-hag-normalization.md`).
+    pub z_norm_use_block_relative: bool,
+
     /// Rayon thread pool size (`None` = use the system default).
     pub threads: Option<usize>,
 
@@ -246,6 +272,22 @@ pub struct PreprocessConfig {
     /// See `docs/stages/stage-38-automatic-ground-dtm.md`.
     pub auto_dtm: bool,
 
+    // ── Fixed-N halo split (Stage 45) ─────────────────────────────────────
+    /// Fraction φ ∈ `[0.0, 0.5]` of each block's `target_points` rows
+    /// reserved for **halo rows** — points sampled from the block's
+    /// `block_overlap` margin (the Stage 08 border strip) and fed through
+    /// the model as genuine cross-boundary context and fusion votes.
+    /// Rows per block: `n_halo_target = round(φ · target_points)`;
+    /// `core target = target_points − n_halo_actual` (core backfills when
+    /// the border strip is sparse, so the tensor is always exactly N).
+    ///
+    /// - `0.0` (default) — disabled; `.feat` payloads identical to
+    ///   pre-Stage-45 (header version is still v2 with `n_halo = 0`).
+    /// - Recommended: `0.25`, paired with `--block-overlap = block_size / 4`.
+    /// - Requires `block_overlap > 0.0` — halo rows are drawn from the
+    ///   border strip, which only exists when overlap is enabled.
+    pub halo_fraction: f64,
+
     /// Output raster cell size (projection units) for the auto-generated DTM.
     /// Default: [`DEFAULT_DTM_RESOLUTION`] (`1.0`). Overridable via
     /// `--dtm-resolution <f64>` (must be positive and finite).
@@ -273,7 +315,9 @@ impl Default for PreprocessConfig {
 
             hag_model: None,
             hag_normalization: HagNormalization::default(),
+            z_norm_use_block_relative: false,
             threads: None,
+
             debug_csv: false,
             outlier_removal: false,
             outlier_radius: 2.0,
@@ -285,6 +329,7 @@ impl Default for PreprocessConfig {
             auto_dtm: true,
             auto_dtm_resolution: DEFAULT_DTM_RESOLUTION,
             keep_auto_dtm: false,
+            halo_fraction: 0.0,
         }
     }
 }
@@ -315,5 +360,12 @@ mod tests {
     #[test]
     fn test_validate_block_filename_accepts_bare_name() {
         assert!(validate_block_filename("block_00042.feat").is_ok());
+    }
+
+    /// `z_norm` bug fix (Stage 37 follow-up): `z_norm_use_block_relative`
+    /// defaults to `false`, i.e. the fixed/global (neighbour-invariant) mode.
+    #[test]
+    fn test_preprocess_config_default_z_norm_uses_global() {
+        assert!(!PreprocessConfig::default().z_norm_use_block_relative);
     }
 }

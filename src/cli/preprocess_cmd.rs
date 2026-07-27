@@ -112,6 +112,9 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
             "--hag-norm-percentile" => {
                 hag_use_percentile = parse_optional_bool(args, &mut i, true);
             }
+            "--z-norm-block-relative" => {
+                cfg.z_norm_use_block_relative = parse_optional_bool(args, &mut i, true);
+            }
             "--threads" => {
                 cfg.threads = Some(parse_usize(
                     next_value(args, &mut i, "--threads")?,
@@ -143,6 +146,12 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
                 cfg.block_overlap = parse_f64(
                     next_value(args, &mut i, "--block-overlap")?,
                     "--block-overlap",
+                )?;
+            }
+            "--halo-fraction" => {
+                cfg.halo_fraction = parse_f64(
+                    next_value(args, &mut i, "--halo-fraction")?,
+                    "--halo-fraction",
                 )?;
             }
             "--oversample-jitter" => {
@@ -227,6 +236,20 @@ fn parse_args(args: &[String]) -> Result<PreprocessConfig> {
     if cfg.oversample_jitter < 0.0 || !cfg.oversample_jitter.is_finite() {
         return Err(ClassifierError::Pipeline(
             "--oversample-jitter must be >= 0.0 and finite".to_string(),
+        ));
+    }
+    // Stage 45: halo budget fraction must be in [0, 0.5] and requires the
+    // border strip (block_overlap > 0) that halo rows are drawn from.
+    if cfg.halo_fraction < 0.0 || cfg.halo_fraction > 0.5 || !cfg.halo_fraction.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--halo-fraction must be finite and within [0.0, 0.5]".to_string(),
+        ));
+    }
+    if cfg.halo_fraction > 0.0 && cfg.block_overlap <= 0.0 {
+        return Err(ClassifierError::Pipeline(
+            "--halo-fraction > 0 requires --block-overlap > 0.0: halo rows are drawn \
+             from the Stage 08 border strip, which only exists when overlap is enabled"
+                .to_string(),
         ));
     }
     if cfg.eigen_memory_budget_bytes == 0 {
@@ -327,6 +350,12 @@ fn print_help() {
            --hag-norm-percentile   Opt into the legacy per-block 99th-percentile HAG\n\
                                    normalisation (ignores --hag-max). Neighbour-dependent;\n\
                                    retained for reproducibility/comparison only.\n\
+           --z-norm-block-relative Opt into the legacy per-block z_norm normalisation\n\
+                                   (elevation feature index 2). Neighbour-dependent — the\n\
+                                   same absolute elevation maps to different feature values\n\
+                                   depending on block neighbours, causing tile-boundary\n\
+                                   discontinuities. Default normalises against the whole\n\
+                                   file's header min_z/max_z (absolute, neighbour-invariant).\n\
            --threads       <uint>  Rayon thread pool size (default: system cores)\n\
            --debug-csv             Also emit per-block .csv files alongside .feat files\n\
          \n\
@@ -340,11 +369,18 @@ fn print_help() {
            --keep-auto-dtm         Keep the intermediate _auto_dtm.tif / _auto_ground.las\n\
                                    files instead of deleting them after the run\n\
          \n\
-         BLOCK OVERLAP (disabled by default):\n\
-           --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
-                                       Recommended: block-size / 2.  Must be < block-size.\n\
-                                       Border points augment the k-d tree for edge-accurate features\n\
-                                       but are never written to .feat output files.\n\
+         BLOCK OVERLAP + HALO (disabled by default):\n\
+           --block-overlap   <f64>     Radius (projection units) of the border strip collected\n\
+                                       from neighbouring blocks (default: 0.0). Must be < block-size.\n\
+                                       The strip is only material for halo sampling and the\n\
+                                       classify --fusion-radius default — with halo off it does\n\
+                                       not change .feat contents. Pair with --halo-fraction;\n\
+                                       recommended: block-size / 4.\n\
+           --halo-fraction   <f64>     Fraction of each block's rows reserved for halo\n\
+                                       (overlap-margin) samples, 0.0–0.5 (Stage 45; default: 0.0).\n\
+                                       Requires --block-overlap > 0. Recommended: 0.25.\n\
+                                       Halo rows ARE written to .feat (v2) as model input,\n\
+                                       giving blocks cross-boundary context at seams.\n\
          \n\
          OUTLIER REMOVAL (disabled by default):\n\
            --outlier-removal           Enable lidar_remove_outliers pre-pass (whole-file)\n\
@@ -430,5 +466,22 @@ mod tests {
         neg.push("--dtm-resolution".to_string());
         neg.push("-2.0".to_string());
         assert!(parse_args(&neg).is_err());
+    }
+
+    // z_norm bug fix (Stage 37 follow-up): `z_norm_use_block_relative`
+    // defaults to `false` (the fixed/global mode), and `--z-norm-block-relative`
+    // opts into the legacy per-block mode.
+    #[test]
+    fn test_z_norm_use_block_relative_defaults_false() {
+        let cfg = parse_args(&base_args()).unwrap();
+        assert!(!cfg.z_norm_use_block_relative);
+    }
+
+    #[test]
+    fn test_z_norm_block_relative_flag_enables_legacy_mode() {
+        let mut args = base_args();
+        args.push("--z-norm-block-relative".to_string());
+        let cfg = parse_args(&args).unwrap();
+        assert!(cfg.z_norm_use_block_relative);
     }
 }

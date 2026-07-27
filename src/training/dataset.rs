@@ -20,9 +20,12 @@ use std::sync::{Arc, Mutex};
 use ndarray::Array2;
 
 use crate::error::{ClassifierError, Result};
-use crate::preprocessing::labeled_pipeline::LabeledBlockManifest;
+use crate::preprocessing::labeled_pipeline::{
+    compute_macro_tile_id, LabeledBlockManifest, SpatialTileGrid,
+};
 use crate::preprocessing::{
-    validate_block_filename, FEAT_MAGIC, FEAT_VERSION, MAX_FEAT_PAYLOAD_BYTES, N_FEATURES,
+    validate_block_filename, FEAT_MAGIC, FEAT_VERSION, FEAT_VERSION_V1, MAX_FEAT_PAYLOAD_BYTES,
+    N_FEATURES,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,6 +61,25 @@ pub struct LoadedBlock {
     /// Per-point class labels (remapped model indices).
     pub labels: Vec<u8>,
     pub block_id: u64,
+    /// Per-point training-loss weights (Stage 45): `1.0` for core rows; for
+    /// halo rows, the dataset's `halo_loss_weight` when the row's
+    /// reconstructed macro-tile equals this block's, `0.0` when it differs
+    /// (cross-split label-leakage masking — see [`compute_loss_weights`]).
+    /// All-ones for v1 (all-core) blocks.
+    pub loss_weights: Vec<f32>,
+}
+
+/// Spatial metadata for one block: canonical-cell origin and the grid's block
+/// size.  Used to reconstruct absolute point coordinates for cross-block
+/// prediction fusion (`evaluate --fused-eval`, Stage 44).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSpatialMeta {
+    /// X coordinate of the block's south-west origin (projection units).
+    pub origin_x: f64,
+    /// Y coordinate of the block's south-west origin (projection units).
+    pub origin_y: f64,
+    /// Grid cell edge length (projection units).
+    pub block_size: f64,
 }
 
 /// One preprocessed-LiDAR-file directory: path + parsed manifest.
@@ -104,11 +126,15 @@ impl BlockCache {
     }
 
     /// Exact in-memory footprint of a loaded block: `n_points × n_features`
-    /// `f32` feature bytes plus `n_points` `u8` label bytes.
+    /// `f32` feature bytes plus `n_points` `u8` label bytes plus `n_points`
+    /// `f32` loss-weight bytes (Stage 45).
     fn block_bytes(block: &LoadedBlock) -> usize {
         let n_points = block.features.nrows();
         let n_features = block.features.ncols();
-        n_points.saturating_mul(n_features).saturating_mul(4) + n_points
+        n_points
+            .saturating_mul(n_features)
+            .saturating_mul(4)
+            .saturating_add(n_points.saturating_mul(2))
     }
 
     /// Attempt to insert a freshly-loaded block. Best-effort: silently
@@ -132,13 +158,14 @@ impl BlockCache {
 }
 
 /// Clone a cached block's data into a fresh, independently-owned
-/// `LoadedBlock`. `Array2<f32>`/`Vec<u8>` clones are cheap relative to the
-/// disk read + `.feat`/`.lbl` parse they replace.
+/// `LoadedBlock`. `Array2<f32>`/`Vec<u8>`/`Vec<f32>` clones are cheap
+/// relative to the disk read + `.feat`/`.lbl` parse they replace.
 fn clone_loaded_block(block: &LoadedBlock) -> LoadedBlock {
     LoadedBlock {
         features: block.features.clone(),
         labels: block.labels.clone(),
         block_id: block.block_id,
+        loss_weights: block.loss_weights.clone(),
     }
 }
 
@@ -166,6 +193,11 @@ pub struct LabeledBlockDataset {
     /// `load()`) disables caching entirely — `load_block()` behaves exactly
     /// as it did before Stage 27.
     cache: Option<Mutex<BlockCache>>,
+    /// Per-point loss weight applied to **same-tile** halo rows (Stage 45).
+    /// Cross-tile halo rows are always masked to 0.0 regardless of this
+    /// value (see [`compute_loss_weights`]). Default `1.0` (halo rows are
+    /// full training samples); set via [`with_halo_loss_weight`].
+    halo_loss_weight: f32,
 }
 
 impl LabeledBlockDataset {
@@ -274,6 +306,7 @@ impl LabeledBlockDataset {
             val_ids,
             train_set,
             cache: None,
+            halo_loss_weight: 1.0,
         })
     }
 
@@ -351,6 +384,7 @@ impl LabeledBlockDataset {
             val_ids,
             train_set,
             cache: None,
+            halo_loss_weight: 1.0,
         })
     }
 
@@ -367,6 +401,18 @@ impl LabeledBlockDataset {
         self
     }
 
+    /// Set the per-point loss weight applied to **same-tile** halo rows
+    /// (Stage 45). Default is `1.0` (halo rows are full training samples).
+    /// `0.0` masks all halo rows from the loss (context-only mode);
+    /// intermediate values down-weight them. Cross-tile halo rows are
+    /// always masked to 0.0 regardless of this value (see
+    /// [`compute_loss_weights`]).
+    #[must_use]
+    pub fn with_halo_loss_weight(mut self, weight: f32) -> Self {
+        self.halo_loss_weight = weight;
+        self
+    }
+
     /// Return the validated common class count across all loaded directories.
     #[must_use]
     pub fn n_classes(&self) -> usize {
@@ -377,6 +423,17 @@ impl LabeledBlockDataset {
     #[must_use]
     pub fn n_features(&self) -> usize {
         self.n_features_inner
+    }
+
+    /// Return the configured per-block sample count (`target_points`) from
+    /// the first loaded directory's manifest.  For single-directory loads —
+    /// e.g. each iteration of `evaluate --fused-eval` (Stage 44) — this is
+    /// exactly that directory's value; used to derive the fusion proximity
+    /// bandwidth (`block_size / √target_points`).  Directories are
+    /// guaranteed non-empty by the constructors.
+    #[must_use]
+    pub fn target_points(&self) -> usize {
+        self.dirs[0].manifest.target_points
     }
 
     /// Return the raw ASPRS-code-string → model-class-index label map
@@ -569,16 +626,31 @@ impl LabeledBlockDataset {
         validate_block_filename(&bm.lbl_file)?;
 
         let feat_path = entry.path.join(&bm.meta.file);
-        let features = load_feat_file(&feat_path)?;
+        let (features, n_halo) = load_feat_file(&feat_path)?;
 
         let lbl_path = entry.path.join(&bm.lbl_file);
         let n_points = features.nrows();
         let labels = load_lbl_file(&lbl_path, n_points)?;
 
+        // Stage 45 (Amendment 1): per-row loss weights — cross-tile halo
+        // rows are masked to 0.0 so their labels cannot leak across the
+        // train/val/test macro-tile boundary (see `compute_loss_weights`).
+        let loss_weights = compute_loss_weights(
+            &features,
+            n_halo,
+            bm.meta.origin_x,
+            bm.meta.origin_y,
+            entry.manifest.block_size,
+            bm.macro_tile_id,
+            &entry.manifest.spatial_tile_grid,
+            self.halo_loss_weight,
+        );
+
         let loaded = LoadedBlock {
             features,
             labels,
             block_id,
+            loss_weights,
         };
 
         // Stage 27 (Block Caching, audit finding 5.2): best-effort cache
@@ -591,6 +663,38 @@ impl LabeledBlockDataset {
         }
 
         Ok(loaded)
+    }
+
+    /// Look up the spatial metadata (origin + block size) of one block by
+    /// composite `GlobalBlockId`.  Pure metadata lookup — no disk I/O.
+    ///
+    /// # Errors
+    /// Returns an error if the composite ID refers to an out-of-range
+    /// directory or a local block ID absent from that directory's manifest.
+    pub fn block_spatial_meta(&self, block_id: u64) -> Result<BlockSpatialMeta> {
+        let (dir_idx, local_id) = decode_global_id(block_id);
+        let entry = self.dirs.get(dir_idx).ok_or_else(|| {
+            ClassifierError::Pipeline(format!(
+                "block_spatial_meta: directory index {dir_idx} out of range \
+                 (only {} directories loaded)",
+                self.dirs.len()
+            ))
+        })?;
+        let bm = entry
+            .block_index
+            .get(&local_id)
+            .and_then(|&i| entry.manifest.blocks.get(i))
+            .ok_or_else(|| {
+                ClassifierError::Pipeline(format!(
+                    "block {local_id} not found in manifest for '{}'",
+                    entry.path.display()
+                ))
+            })?;
+        Ok(BlockSpatialMeta {
+            origin_x: bm.meta.origin_x,
+            origin_y: bm.meta.origin_y,
+            block_size: entry.manifest.block_size,
+        })
     }
 }
 
@@ -780,8 +884,12 @@ fn spatial_split(
 // File loaders
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse a `.feat` binary file into an `Array2<f32>` of shape `[n_points, N_FEATURES]`.
-fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
+/// Parse a `.feat` binary file into an `Array2<f32>` of shape `[n_points, N_FEATURES]`,
+/// plus the header's `n_halo` field (0 for v1 files).
+///
+/// Accepts v1 (37-byte header) and v2 (41-byte header with trailing
+/// `n_halo`, Stage 45); anything else is rejected as an unsupported version.
+fn load_feat_file(path: &Path) -> Result<(Array2<f32>, usize)> {
     let mut f = File::open(path)
         .map_err(|e| ClassifierError::Pipeline(format!("feat open {}: {e}", path.display())))?;
 
@@ -809,11 +917,30 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
     let n_features =
         u32::from_le_bytes(<[u8; 4]>::try_from(&hdr[5..9]).map_err(|_| corrupt())?) as usize;
 
-    if version != FEAT_VERSION {
+    if version != FEAT_VERSION && version != FEAT_VERSION_V1 {
         return Err(ClassifierError::Pipeline(format!(
-            "feat: unsupported version {version}"
+            "feat: unsupported version {version} (supported: {FEAT_VERSION_V1}, {FEAT_VERSION})"
         )));
     }
+
+    // v2 (Stage 45) carries a trailing n_halo field; v1 implies all-core.
+    let n_halo = if version == FEAT_VERSION {
+        let mut b = [0u8; 4];
+        f.read_exact(&mut b)
+            .map_err(|e| ClassifierError::Pipeline(e.to_string()))?;
+        u32::from_le_bytes(b) as usize
+    } else {
+        0
+    };
+
+    // Corruption guard (Stage 45): n_halo can never consume the whole payload.
+    if n_halo >= n_points {
+        return Err(ClassifierError::Pipeline(format!(
+            "feat '{}': n_halo={n_halo} must be less than n_points={n_points}",
+            path.display()
+        )));
+    }
+
     // Fixed-width validation (Stage 30, Step 5e+5f+5g): n_features must equal
     // the fixed N_FEATURES constant (7 scalar + 10 pre-pass eigenvalue features).
     if n_features != N_FEATURES {
@@ -868,8 +995,65 @@ fn load_feat_file(path: &Path) -> Result<Array2<f32>> {
             .collect(),
     };
 
-    Array2::from_shape_vec((n_points, n_features), floats)
-        .map_err(|e| ClassifierError::Pipeline(format!("feat reshape: {e}")))
+    let features = Array2::from_shape_vec((n_points, n_features), floats)
+        .map_err(|e| ClassifierError::Pipeline(format!("feat reshape: {e}")))?;
+    Ok((features, n_halo))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Halo loss weights (Stage 45, Amendment 1 — split-aware masking)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the per-row training-loss weights for one loaded block.
+///
+/// Layout: `1.0` for every **core** row; for each of the trailing `n_halo`
+/// **halo** rows, `halo_loss_weight` when the row's reconstructed macro-tile
+/// equals the block's own `block_macro_tile`, **`0.0` when it differs**.
+///
+/// ## Why cross-tile halo rows are masked to 0.0 — read this before changing
+///
+/// Halo rows are sampled from *neighbouring* blocks' territory (the block's
+/// `block_overlap` margin). For a training block sitting near a train/val/
+/// test **macro-tile split boundary**, some halo rows physically lie in a
+/// *different* split's macro-tile — their ground-truth labels come from
+/// validation/test territory. If those labels entered the training loss, the
+/// model would silently train on held-out labels near split boundaries: a
+/// genuine cross-split **label-leakage channel**, beyond the feature-level
+/// boundary smoothing Stage 32 deliberately accepted for eigenvalue context
+/// (whole-file pre-pass) and for the global max-pool (which is unlabeled
+/// context, not supervision). Masking those rows to weight 0.0 closes the
+/// leak at the loss layer: cross-tile halo rows still contribute to the
+/// block's **global max-pool context** (Stage 32 precedent — unlabeled
+/// geometric context is fine), but their `.lbl` values never supervise the
+/// model. Same-tile halo rows are legitimately-labelled neighbour points and
+/// receive `halo_loss_weight` (default 1.0 — full training samples).
+///
+/// With `n_halo == 0` (all v1 blocks) this returns all-ones at O(1) cost.
+#[allow(clippy::too_many_arguments)]
+fn compute_loss_weights(
+    features: &Array2<f32>,
+    n_halo: usize,
+    block_origin_x: f64,
+    block_origin_y: f64,
+    block_size: f64,
+    block_macro_tile: u32,
+    grid: &SpatialTileGrid,
+    halo_loss_weight: f32,
+) -> Vec<f32> {
+    let n = features.nrows();
+    let n_core = n.saturating_sub(n_halo);
+    let mut weights = vec![1.0f32; n];
+    for i in n_core..n {
+        let abs_x = f64::from(features[[i, 0]]) * block_size + block_origin_x;
+        let abs_y = f64::from(features[[i, 1]]) * block_size + block_origin_y;
+        let tile = compute_macro_tile_id(abs_x, abs_y, grid, grid.cols);
+        weights[i] = if tile == block_macro_tile {
+            halo_loss_weight
+        } else {
+            0.0
+        };
+    }
+    weights
 }
 
 /// Read a raw `.lbl` file — just `u8[n_points]`.
@@ -1008,6 +1192,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         assert_eq!(dataset.max_sampled_points_per_block(), 8192);
@@ -1042,6 +1227,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         let ids = dataset.all_block_ids();
@@ -1091,7 +1277,7 @@ mod tests {
         let n_features: u32 = N_FEATURES as u32; // valid fixed-width count
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FEAT_MAGIC);
-        bytes.push(FEAT_VERSION);
+        bytes.push(FEAT_VERSION_V1);
         bytes.extend_from_slice(&n_points.to_le_bytes());
         bytes.extend_from_slice(&n_features.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes()); // block_id
@@ -1213,6 +1399,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         let result = dataset.inverse_label_map();
@@ -1248,6 +1435,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         let result = dataset.inverse_label_map();
@@ -1445,6 +1633,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         // dir index 5 does not exist (only 1 directory loaded).
@@ -1476,6 +1665,7 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         };
 
         // Local block id 999 is absent from the manifest.
@@ -1486,6 +1676,45 @@ mod tests {
             msg.contains("not found in manifest"),
             "unexpected error message: {msg}"
         );
+    }
+
+    // ── Stage 44 (Prediction Fusion): block_spatial_meta accessor ─────────
+
+    // Fixture origins are constructed as exact multiples of 50.0, so strict
+    // float equality is intentional and safe.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn test_block_spatial_meta_hit_and_miss() {
+        let manifest = dummy_manifest(vec![make_lbm(10, 0)]);
+        let block_index = build_block_index(&manifest);
+        let dataset = LabeledBlockDataset {
+            dirs: vec![DirEntry {
+                path: PathBuf::from("only-dir"),
+                manifest,
+                block_index,
+            }],
+            n_classes_inner: 8,
+            n_features_inner: N_FEATURES,
+            train_ids: Vec::new(),
+            val_ids: Vec::new(),
+            train_set: HashSet::new(),
+            cache: None,
+            halo_loss_weight: 1.0,
+        };
+
+        // make_lbm(10, 0) → origin ((10%4)·50, (10/4)·50) = (100, 100);
+        // dummy_manifest block_size = 50.
+        let sm = dataset
+            .block_spatial_meta(make_global_id(0, 10))
+            .expect("known block must resolve");
+        assert_eq!(sm.origin_x, 100.0);
+        assert_eq!(sm.origin_y, 100.0);
+        assert_eq!(sm.block_size, 50.0);
+
+        // Unknown local id and out-of-range directory index must error
+        // (never panic).
+        assert!(dataset.block_spatial_meta(make_global_id(0, 999)).is_err());
+        assert!(dataset.block_spatial_meta(make_global_id(5, 0)).is_err());
     }
 
     // ── Stage 27 (Block Caching, audit finding 5.2): cache behavior ───────────
@@ -1505,7 +1734,7 @@ mod tests {
         let feat_path = dir.path().join("block_00000.feat");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FEAT_MAGIC);
-        bytes.push(FEAT_VERSION);
+        bytes.push(FEAT_VERSION_V1);
         // n_points/n_features are tiny test-fixture constants (4 and
         // N_FEATURES), nowhere near u32::MAX — truncation is not possible.
         #[allow(clippy::cast_possible_truncation)]
@@ -1568,6 +1797,7 @@ mod tests {
             features: Array2::from_elem((4, N_FEATURES), 1.0f32),
             labels: vec![0u8; 4],
             block_id: 0,
+            loss_weights: vec![1.0; 4],
         };
         let mut cache = BlockCache::new(0);
         assert!(!cache.warned_budget_exceeded);
@@ -1590,6 +1820,7 @@ mod tests {
             features: Array2::from_elem((4, N_FEATURES), 2.0f32),
             labels: vec![1u8; 4],
             block_id: 1,
+            loss_weights: vec![1.0; 4],
         };
         cache.try_insert(Arc::new(clone_loaded_block(&block2)));
         assert!(cache.entries.is_empty());
@@ -1614,10 +1845,140 @@ mod tests {
             val_ids: Vec::new(),
             train_set: HashSet::new(),
             cache: None,
+            halo_loss_weight: 1.0,
         }
         .with_block_cache(None);
 
         assert!(dataset.cache.is_none());
+    }
+
+    // ── Stage 45: halo loss weights + v2 .feat format ──────────────────────
+
+    /// 4×4 macro-tile grid over [0,200)² (tile size 50) for weight tests:
+    /// block at origin (0,0) sits in tile 0; points across x=50 are in tile 1.
+    fn weight_test_grid() -> SpatialTileGrid {
+        SpatialTileGrid {
+            cols: 4,
+            rows: 4,
+            bbox_min_x: 0.0,
+            bbox_min_y: 0.0,
+            bbox_max_x: 200.0,
+            bbox_max_y: 200.0,
+        }
+    }
+
+    #[test]
+    fn test_loss_weights_all_ones_for_v1_block() {
+        // n_halo = 0 (v1): all-ones, and no per-row work happens.
+        let features = Array2::zeros((4, N_FEATURES));
+        let w = compute_loss_weights(&features, 0, 0.0, 0.0, 50.0, 0, &weight_test_grid(), 0.5);
+        assert_eq!(w, vec![1.0f32; 4]);
+    }
+
+    #[test]
+    fn test_loss_weights_same_tile_halo_gets_configured_weight() {
+        // 2 core + 2 halo rows; halo rows at xn=0.1 (abs x=5, tile 0 — same
+        // tile as the block at origin (0,0)).
+        let mut features = Array2::zeros((4, N_FEATURES));
+        features[[2, 0]] = 0.1;
+        features[[3, 0]] = 0.1;
+        let w = compute_loss_weights(&features, 2, 0.0, 0.0, 50.0, 0, &weight_test_grid(), 0.7);
+        assert_eq!(w, vec![1.0, 1.0, 0.7, 0.7]);
+    }
+
+    #[test]
+    fn test_loss_weights_cross_tile_halo_masked_to_zero() {
+        // 2 core + 2 halo rows; halo rows at xn=-0.1 (abs x=-5 → tile 0 after
+        // clamping? No: x=-5 < bbox_min_x=0 → col floor clamps to 0 → tile 0!
+        // Use xn=1.1 instead: abs x=55 → col 1 → tile 1 ≠ block's tile 0.)
+        let mut features = Array2::zeros((4, N_FEATURES));
+        features[[2, 0]] = 1.1; // abs x = 55 → macro-tile 1 (cross-tile)
+        features[[3, 0]] = 0.1; // abs x = 5  → macro-tile 0 (same tile)
+        let w = compute_loss_weights(&features, 2, 0.0, 0.0, 50.0, 0, &weight_test_grid(), 0.7);
+        assert_eq!(w, vec![1.0, 1.0, 0.0, 0.7]);
+    }
+
+    #[test]
+    fn test_loss_weights_zero_config_masks_all_halo() {
+        let mut features = Array2::zeros((3, N_FEATURES));
+        features[[2, 0]] = 0.1; // same-tile halo
+        let w = compute_loss_weights(&features, 1, 0.0, 0.0, 50.0, 0, &weight_test_grid(), 0.0);
+        assert_eq!(w, vec![1.0, 1.0, 0.0]);
+    }
+
+    // Tiny fixture constants (5 points, 17 features) — casts cannot lose
+    // precision or truncate in practice.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    #[test]
+    fn test_load_feat_file_v2_round_trip_with_n_halo() {
+        // Write a v2 header (n_halo=2) + payload, read back: n_halo==2 and
+        // payload intact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v2.feat");
+        let n_points = 5usize;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION);
+        bytes.extend_from_slice(&(n_points as u32).to_le_bytes());
+        bytes.extend_from_slice(&(N_FEATURES as u32).to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&1.5f64.to_le_bytes());
+        bytes.extend_from_slice(&2.5f64.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // n_halo
+        for i in 0..(n_points * N_FEATURES) {
+            bytes.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let (features, n_halo) = load_feat_file(&path).expect("v2 must load");
+        assert_eq!(n_halo, 2);
+        assert_eq!(features.nrows(), n_points);
+        assert!((features[[3, 2]] - (3 * N_FEATURES + 2) as f32).abs() < 1e-6);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[test]
+    fn test_load_feat_file_v1_reads_as_all_core() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v1.feat");
+        let n_points = 3usize;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION_V1);
+        bytes.extend_from_slice(&(n_points as u32).to_le_bytes());
+        bytes.extend_from_slice(&(N_FEATURES as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        for _ in 0..(n_points * N_FEATURES) {
+            bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let (features, n_halo) = load_feat_file(&path).expect("v1 must load");
+        assert_eq!(n_halo, 0);
+        assert_eq!(features.nrows(), n_points);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[test]
+    fn test_load_feat_file_rejects_n_halo_consuming_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corrupt.feat");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FEAT_MAGIC);
+        bytes.push(FEAT_VERSION);
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // n_points
+        bytes.extend_from_slice(&(N_FEATURES as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        bytes.extend_from_slice(&0f64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // n_halo == n_points → corrupt
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let result = load_feat_file(&path);
+        assert!(result.is_err(), "n_halo >= n_points must be rejected");
+        assert!(result.unwrap_err().to_string().contains("n_halo"));
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -1652,6 +2013,7 @@ mod tests {
                 raw_point_count: 1024,
                 sampled_point_count: 1024,
                 oversampled: false,
+                n_halo: 0,
             },
             lbl_file: format!("block_{id:05}.lbl"),
             macro_tile_id,
@@ -1677,6 +2039,7 @@ mod tests {
                 bbox_max_x: 200.0,
                 bbox_max_y: 200.0,
             },
+            halo_fraction: 0.0,
             blocks,
         }
     }

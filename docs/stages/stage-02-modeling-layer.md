@@ -105,7 +105,7 @@ has no mechanism to correct for arbitrary scan orientation — omitting it would
 accuracy on any dataset where scan geometry varies between acquisitions.
 
 ```
-Input:  N × 12   (N sampled points, 12 features each — from .feat file)
+Input:  N × 17   (N sampled points, 17 features each — from .feat file)
 
 ── Input T-Net (STN3d) ────────────────────────────────────────────────────────
   Extract cols [0,1,2]: N × 3 (x_norm, y_norm, z_norm)
@@ -119,10 +119,10 @@ Input:  N × 12   (N sampled points, 12 features each — from .feat file)
     Linear(512 → 256)  → BN → ReLU
     Linear(256 → 9)    → reshape to 3×3, then += I₃  (identity initialisation)
   Apply: xyz_cols = xyz_cols @ T1ᵀ
-  Replace cols [0,1,2] in feature matrix  →  N × 12 (unchanged shape)
+  Replace cols [0,1,2] in feature matrix  →  N × 17 (unchanged shape)
 
 ── Encoder Layer 0 ────────────────────────────────────────────────────────────
-  Linear(12 → 64) → BN → ReLU
+  Linear(17 → 64) → BN → ReLU
   → local_feat: N × 64        ← saved; will be concatenated with global descriptor
 
 ── Feature T-Net (STN64d, enabled when `use_feature_tnet = true`) ─────────────
@@ -138,34 +138,41 @@ Input:  N × 12   (N sampled points, 12 features each — from .feat file)
   Apply: local_feat = local_feat @ T2ᵀ  →  N × 64
 
 ── Encoder Layers 1+ ──────────────────────────────────────────────────────────
-  Linear(64 → 128) → BN → ReLU
-  Linear(128 → 256)→ BN → ReLU
-  → deep_feat: N × 256
+  Linear(64 → 64)   → BN → ReLU
+  Linear(64 → 64)   → BN → ReLU
+  Linear(64 → 128)  → BN → ReLU
+  Linear(128 → 1024)→ BN → ReLU
+  → deep_feat: N × 1024
 
 ── Global Max Pooling ─────────────────────────────────────────────────────────
-  MaxPool over N dimension  →  (256,) global descriptor
-  Broadcast: repeat to N × 256
+  MaxPool over N dimension  →  (1024,) global descriptor
+  Broadcast: repeat to N × 1024
 
 ── Segmentation Concat ────────────────────────────────────────────────────────
-  Concat(local_feat: N × 64, global: N × 256)  →  N × 320
+  Concat(local_feat: N × 64, global: N × 1024)  →  N × 1088
   Note: local_feat here is the (optionally T2-transformed) 64-dim features from
   Encoder Layer 0, not the deep encoder output.  This is the architecturally
   correct formulation from the PointNet segmentation paper.
 
 ── Shared MLP Decoder (applied independently to each of the N points) ─────────
-  Linear(320 → 256) → BN → ReLU
-  Linear(256 → 128) → BN → ReLU
-  Linear(128 → n_classes)   ← no activation; raw logits
+  Linear(1088 → 512) → BN → ReLU
+  Linear(512 → 256)  → BN → ReLU
+  Linear(256 → n_classes)   ← no activation; raw logits
 
 ── Output ─────────────────────────────────────────────────────────────────────
   Argmax over class dimension  →  N class indices  (u8 ASPRS codes via label map)
 ```
 
-**Why 320, not 512?**  Concatenating `local_feat (64) + global (256) = 320`.  The
-original spec incorrectly concatenated the deep encoder output with its own global max
-pooled version (256+256=512), which adds no information.  Concatenating the shallow
-local features (post T-Net, pre deep encoder) with the global context is what gives
-PointNet its local-global reasoning ability.
+**Why 1088, not 2048?**  Concatenating `local_feat (64) + global (1024) = 1088`.  A
+naive (incorrect) implementation might concatenate the deep encoder output with its
+own global max-pooled version (1024+1024=2048), which adds no new information beyond
+what the global vector already contains. Concatenating the shallow local features
+(post T-Net, pre deep encoder) with the global context is what gives PointNet its
+local-global reasoning ability — this is the canonical formulation from the PointNet
+segmentation paper (Qi et al., 2017). See Stage 43 for the restoration of these
+canonical dimensions; the encoder/decoder had previously been reduced to a
+non-canonical `[64, 128, 256]` / `[256, 128]` shape (256-dim global descriptor,
+320-dim concat) as an undocumented deviation from Stage 02 through Stage 42.
 
 **T-Net architecture is fixed** (not configurable) — the mini-encoder/decoder dims
 `[64, 128, 1024, 512, 256]` are canonical PointNet values and are not stored in the
@@ -184,9 +191,9 @@ Both functions take `&Array` references rather than owned values (see deviation 
 
 | Parameter | Default | Description |
 |---|---|---|
-| `n_features_in` | `12` | Input feature count (must match Stage 01 `N_FEATURES`) |
-| `encoder_dims` | `[64, 128, 256]` | Hidden units for each encoder MLP layer; `encoder_dims[0]` (64) is the local feature dim used in the segmentation concat |
-| `decoder_dims` | `[256, 128]` | Hidden units for each decoder MLP layer (before the final class projection); decoder input dim = `encoder_dims[0] + encoder_dims.last()` = 64+256 = 320 |
+| `n_features_in` | `17` | Input feature count (must match Stage 01 `N_FEATURES`; expanded from 12 to 17 in Stage 30) |
+| `encoder_dims` | `[64, 64, 64, 128, 1024]` | Hidden units for each encoder MLP layer (canonical PointNet dims, restored in Stage 43); `encoder_dims[0]` (64) is the local feature dim used in the segmentation concat |
+| `decoder_dims` | `[512, 256]` | Hidden units for each decoder MLP layer (before the final class projection; canonical PointNet dims, restored in Stage 43); decoder input dim = `encoder_dims[0] + encoder_dims.last()` = 64+1024 = 1088 |
 | `n_classes` | configurable | Number of output classes |
 | `use_batch_norm` | `true` | When `false`, BatchNorm layers are identity (useful for unit-test scenarios) |
 | `use_input_tnet` | `true` | Must be `true` for any correctly trained PointNet model; `false` disables STN3d and is only valid for debugging |
@@ -233,9 +240,9 @@ A **layer block** is the repeated unit used for every Linear layer:
 [Header — variable length]
   magic:             4 bytes  = b"WBML"
   version:           u8       = 1
-  n_features_in:     u8       (must equal N_FEATURES = 12 from Stage 01)
-  n_encoder_layers:  u8       (length of encoder_dims array, e.g. 3 for [64,128,256])
-  n_decoder_layers:  u8       (length of decoder_dims array, e.g. 2 for [256,128])
+  n_features_in:     u8       (must equal N_FEATURES = 17 from Stage 01/Stage 30)
+  n_encoder_layers:  u8       (length of encoder_dims array, e.g. 5 for [64,64,64,128,1024])
+  n_decoder_layers:  u8       (length of decoder_dims array, e.g. 2 for [512,256])
   n_classes:         u8
   use_batch_norm:    u8       (0 = false, 1 = true)
   use_input_tnet:    u8       (0 = disabled, 1 = STN3d present; must be 1 for valid models)
@@ -310,7 +317,7 @@ Parse the WBFT header (magic `b"WBFT"`, version, `n_points`, `n_features`, `bloc
 **(b) Run PointNet Forward Pass**
 
 ```
-features: Array2<f32> shape [N, 12]
+features: Array2<f32> shape [N, 17]
 
 // ── Input T-Net ──────────────────────────────────────────────────────────────
 if use_input_tnet:
@@ -334,7 +341,7 @@ if use_input_tnet:
   features.slice_mut(s![.., 0..3]).assign(&xyz.dot(&T1.t()))
 
 // ── Encoder Layer 0 ──────────────────────────────────────────────────────────
-local_feat = features.dot(&W0.T) + &b0                    // [N, 64]
+local_feat = features.dot(&W0.T) + &b0                    // [N, 64]  (input dim 17)
 if use_batch_norm: local_feat = bn(local_feat)
 local_feat = local_feat.mapv(|x| x.max(0.0))
 
@@ -355,20 +362,20 @@ if use_feature_tnet:
 
 // ── Encoder Layers 1+ ────────────────────────────────────────────────────────
 deep = local_feat.clone()
-for each (W, b, opt_bn) in encoder_layers[1..]:           // [64→128→256]
+for each (W, b, opt_bn) in encoder_layers[1..]:           // [64→64→64→128→1024]
   deep = deep.dot(&W.T) + &b
   if opt_bn: deep = bn(deep)
   deep = deep.mapv(|x| x.max(0.0))
 
 // ── Global Max Pooling ───────────────────────────────────────────────────────
-global_vec = deep.fold_axis(Axis(0), f32::NEG_INFINITY, f32::max)  // [256]
-global_mat = global_vec broadcast to [N, 256]
+global_vec = deep.fold_axis(Axis(0), f32::NEG_INFINITY, f32::max)  // [1024]
+global_mat = global_vec broadcast to [N, 1024]
 
 // ── Segmentation Concat ──────────────────────────────────────────────────────
-seg_in = concatenate(Axis(1), &[local_feat.view(), global_mat.view()])  // [N, 320]
+seg_in = concatenate(Axis(1), &[local_feat.view(), global_mat.view()])  // [N, 1088]
 
 // ── Decoder ──────────────────────────────────────────────────────────────────
-for (j, (W, b, opt_bn)) in decoder_layers.enumerate():    // [320→256→128→n_classes]
+for (j, (W, b, opt_bn)) in decoder_layers.enumerate():    // [1088→512→256→n_classes]
   seg_in = seg_in.dot(&W.T) + &b
   if opt_bn && j < n_decoder_layers: seg_in = bn(seg_in)  // no BN on final
   if j < n_decoder_layers: seg_in = seg_in.mapv(|x| x.max(0.0))
@@ -507,8 +514,8 @@ Emit a progress summary to stderr:
 | 8 | Unit: `Stn3d::forward` on a `[N, 3]` input returns a `3×3` matrix that, when applied, leaves an already-canonical point cloud numerically close to identity (identity-initialised weights + zero net → pure identity transform) | `cargo test` | ✅ Pass |
 | 9 | Unit: `Stn3d::forward` on a known rotated `[N, 3]` synthetic set with hand-crafted weights produces the expected corrective rotation matrix | `cargo test` | ✅ Pass (see deviation #4 in results) |
 | 10 | Unit: `Stn64d::forward` output shape is `[64, 64]` for any `[N, 64]` input | `cargo test` | ✅ Pass |
-| 11 | Unit: full `PointNetClassifier::forward` with `use_input_tnet=true`, `use_feature_tnet=false` on a `[1024, 12]` input produces output shape `[1024, n_classes]` | `cargo test` | ✅ Pass |
-| 12 | Unit: full `PointNetClassifier::forward` with both T-Nets enabled on a `[1024, 12]` input produces output shape `[1024, n_classes]` | `cargo test` | ✅ Pass |
+| 11 | Unit: full `PointNetClassifier::forward` with `use_input_tnet=true`, `use_feature_tnet=false` on a `[1024, 17]` input produces output shape `[1024, n_classes]` | `cargo test` | ✅ Pass |
+| 12 | Unit: full `PointNetClassifier::forward` with both T-Nets enabled on a `[1024, 17]` input produces output shape `[1024, n_classes]` | `cargo test` | ✅ Pass |
 | 13 | Unit: `.wbmodel` round-trip (with T-Nets enabled) — save a randomly initialised model, reload it, run identical input, verify bit-identical output | `cargo test` | ✅ Pass |
 | 14 | Unit: label mapping — argmax of known logit array maps to correct ASPRS codes via `label_map` | `cargo test` | ✅ Pass |
 | 15 | Unit: `write_classified` — given a 100-point synthetic LAS stream and a pre-populated `BlockInferenceResult`, output LAS contains correct classification values and all other fields are unchanged | `cargo test` | ✅ Pass |

@@ -206,6 +206,14 @@ deterministic given the same seed/inputs, and directly uses data
 (`class_distribution`) that was already being computed and stored but
 previously discarded for split purposes.
 
+**References:** The largest-first greedy ordering follows the standard
+bin-packing heuristic (Johnson, 1973). The weighted-sum cost function is
+a multi-objective scalarization approach (Boyd & Vandenberghe, 2004, §4.7).
+The spatially-disjoint macro-tile strategy is motivated by Roberts et al.
+(2017), who demonstrate that random splitting of spatially autocorrelated
+data systematically overestimates model performance, and by Ploton et al.
+(2020), who empirically quantify this bias in remote sensing contexts.
+
 ---
 
 ## Implementation Notes

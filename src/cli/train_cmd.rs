@@ -151,6 +151,12 @@ pub fn run(args: &[String]) -> Result<()> {
                     "--cache-blocks-max-mb",
                 )?);
             }
+            "--halo-loss-weight" => {
+                cfg.halo_loss_weight = parse_f32(
+                    next_value(args, &mut i, "--halo-loss-weight")?,
+                    "--halo-loss-weight",
+                )?;
+            }
             flag => {
                 return Err(ClassifierError::Pipeline(format!(
                     "train: unknown flag '{flag}'"
@@ -240,6 +246,12 @@ pub fn run(args: &[String]) -> Result<()> {
             ));
         }
     }
+    // Stage 45: --halo-loss-weight must be finite and non-negative.
+    if !cfg.halo_loss_weight.is_finite() || cfg.halo_loss_weight < 0.0 {
+        return Err(ClassifierError::Pipeline(
+            "--halo-loss-weight must be finite and >= 0.0".into(),
+        ));
+    }
 
     // Stage 32 (Dataset Split Materialization): if one or more
     // --val-data-dir directories were supplied, the split has already been
@@ -265,7 +277,8 @@ pub fn run(args: &[String]) -> Result<()> {
         // load_block() behaves exactly as it did before Stage 27.
         let dataset =
             LabeledBlockDataset::load(&data_dirs, cfg.val_split, val_tile_ids.as_ref(), cfg.seed)?
-                .with_block_cache(cfg.cache_blocks_max_mb);
+                .with_block_cache(cfg.cache_blocks_max_mb)
+                .with_halo_loss_weight(cfg.halo_loss_weight);
 
         cfg.val_tile_block_ids = val_tile_ids;
         dataset
@@ -282,6 +295,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         LabeledBlockDataset::load_presplit(&data_dirs, &val_data_dirs)?
             .with_block_cache(cfg.cache_blocks_max_mb)
+            .with_halo_loss_weight(cfg.halo_loss_weight)
     };
 
     // Default metrics output: <first_data_dir>/../metrics/metrics.csv
@@ -351,7 +365,12 @@ fn print_usage() {
            --grad-clip-norm    <f32>    Per-tensor L2-norm gradient clip threshold\n\
                                         (default: disabled)\n\
            --cache-blocks-max-mb <usize>  Enable in-memory block caching bounded to\n\
-                                        this many megabytes (default: disabled)"
+                                        this many megabytes (default: disabled)\n\
+           --halo-loss-weight <f32>    Per-point loss weight for same-tile halo rows\n\
+                                        (Stage 45; default: 1.0). Cross-tile halo rows\n\
+                                        are always masked to 0 to prevent cross-split\n\
+                                        label leakage. 0.0 masks all halo rows\n\
+                                        (context-only mode)"
     );
 }
 

@@ -32,6 +32,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut outlier_elev_diff: f64 = 50.0;
     let mut outlier_use_median: bool = false;
     let mut block_overlap: f64 = 0.0;
+    let mut halo_fraction: f64 = 0.0;
     let mut oversample_jitter: f64 = 0.0;
     let mut eigen_memory_budget_bytes: usize =
         crate::preprocessing::DEFAULT_EIGEN_MEMORY_BUDGET_BYTES;
@@ -42,6 +43,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut auto_dtm: bool = true;
     let mut auto_dtm_resolution: f64 = crate::preprocessing::DEFAULT_DTM_RESOLUTION;
     let mut keep_auto_dtm: bool = false;
+    // z_norm bug fix (Stage 37 follow-up): default false = fixed/global mode.
+    let mut z_norm_use_block_relative: bool = false;
 
     let mut i = 0;
 
@@ -99,6 +102,9 @@ pub fn run(args: &[String]) -> Result<()> {
             "--keep-auto-dtm" => {
                 keep_auto_dtm = parse_optional_bool(args, &mut i, true);
             }
+            "--z-norm-block-relative" => {
+                z_norm_use_block_relative = parse_optional_bool(args, &mut i, true);
+            }
             "--label-map" => {
                 label_map_path = Some(PathBuf::from(next_value(args, &mut i, "--label-map")?));
             }
@@ -136,6 +142,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 block_overlap = parse_f64(
                     next_value(args, &mut i, "--block-overlap")?,
                     "--block-overlap",
+                )?;
+            }
+            "--halo-fraction" => {
+                halo_fraction = parse_f64(
+                    next_value(args, &mut i, "--halo-fraction")?,
+                    "--halo-fraction",
                 )?;
             }
             "--oversample-jitter" => {
@@ -226,6 +238,20 @@ pub fn run(args: &[String]) -> Result<()> {
             "--oversample-jitter must be >= 0.0 and finite".to_string(),
         ));
     }
+    // Stage 45: halo budget fraction must be in [0, 0.5] and requires the
+    // border strip (block_overlap > 0) that halo rows are drawn from.
+    if !(0.0..=0.5).contains(&halo_fraction) || !halo_fraction.is_finite() {
+        return Err(ClassifierError::Pipeline(
+            "--halo-fraction must be finite and within [0.0, 0.5]".to_string(),
+        ));
+    }
+    if halo_fraction > 0.0 && block_overlap <= 0.0 {
+        return Err(ClassifierError::Pipeline(
+            "--halo-fraction > 0 requires --block-overlap > 0.0: halo rows are drawn \
+             from the Stage 08 border strip, which only exists when overlap is enabled"
+                .to_string(),
+        ));
+    }
     if eigen_memory_budget_bytes == 0 {
         return Err(ClassifierError::Pipeline(
             "--eigen-memory-budget-mb must be >= 1".to_string(),
@@ -283,11 +309,13 @@ pub fn run(args: &[String]) -> Result<()> {
         outlier_elev_diff,
         outlier_use_median,
         block_overlap,
+        halo_fraction,
         oversample_jitter,
         eigen_memory_budget_bytes,
         auto_dtm,
         auto_dtm_resolution,
         keep_auto_dtm,
+        z_norm_use_block_relative,
     };
 
     let config = LabeledPreprocessConfig {
@@ -330,10 +358,20 @@ fn print_usage() {
            --dtm-resolution <f64>   Grid cell size for the auto-generated DTM (default: 1.0)\n\
            --no-auto-dtm            Disable auto-DTM; fall back to block-min-z HAG proxy\n\
            --keep-auto-dtm          Keep intermediate _auto_dtm.tif / _auto_ground.las files\n\
+           --z-norm-block-relative  Opt into legacy per-block z_norm normalisation\n\
+                                    (elevation feature). Neighbour-dependent; default\n\
+                                    normalises against the whole file's header min_z/max_z.\n\
          \n\
-         Block overlap (disabled by default):\n\
-           --block-overlap   <f64>     Border-point context radius in projection units (default: 0.0)\n\
-                                       Recommended: block-size / 2.  Must be < block-size.\n\
+         Block overlap + halo (disabled by default):\n\
+           --block-overlap   <f64>     Radius (projection units) of the border strip collected\n\
+                                       from neighbouring blocks (default: 0.0). Must be < block-size.\n\
+                                       The strip is only material for halo sampling and the\n\
+                                       classify --fusion-radius default — with halo off it does\n\
+                                       not change .feat contents. Pair with --halo-fraction;\n\
+                                       recommended: block-size / 4.\n\
+           --halo-fraction   <f64>     Fraction of each block's rows reserved for halo\n\
+                                       (overlap-margin) samples, 0.0–0.5 (Stage 45; default: 0.0).\n\
+                                       Requires --block-overlap > 0. Recommended: 0.25.\n\
          \n\
          Jitter-based oversampling (disabled by default):\n\
            --oversample-jitter <f64>   Std-dev (projection units) of per-axis Gaussian jitter\n\

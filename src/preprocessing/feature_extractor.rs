@@ -28,7 +28,7 @@
 
 use crate::preprocessing::lite_point::LitePoint;
 use crate::preprocessing::normalizer::{
-    compute_hag, normalise_scalar_features, DtmView, HagNormalization,
+    compute_hag, normalise_scalar_features, DtmView, HagNormalization, ZNormalization,
 };
 
 /// Extract the full feature vector for every point in `pts`.
@@ -48,6 +48,10 @@ use crate::preprocessing::normalizer::{
 /// - `block_size` — cell edge length
 /// - `hag_norm`   — HAG normalisation strategy (Stage 37); forwarded to
 ///   `normalise_scalar_features`. Default is a fixed absolute metre reference.
+/// - `z_norm_strategy` — Z-elevation normalisation strategy (`z_norm` bug fix,
+///   follow-up to Stage 37); forwarded to `normalise_scalar_features`.
+///   Default is a whole-file absolute elevation range sourced from the
+///   LAS/LAZ/COPC header (see `pipeline.rs`).
 ///
 /// # Panics
 /// This function does not panic, but callers must ensure
@@ -55,6 +59,7 @@ use crate::preprocessing::normalizer::{
 /// truncated or missing eigenvalue data would be zipped incorrectly (the
 /// `zip` below silently stops at the shorter of the two iterators).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn extract_features(
     pts: &[LitePoint],
     eigen_rows: &[[f32; 10]],
@@ -63,13 +68,21 @@ pub fn extract_features(
     origin_y: f64,
     block_size: f64,
     hag_norm: HagNormalization,
+    z_norm_strategy: ZNormalization,
 ) -> Vec<Vec<f32>> {
     // Step 1: HAG
     let hag_values = compute_hag(pts, dtm);
 
     // Step 2: Scalar features (indices 0–6)
-    let scalar =
-        normalise_scalar_features(pts, origin_x, origin_y, block_size, &hag_values, hag_norm);
+    let scalar = normalise_scalar_features(
+        pts,
+        origin_x,
+        origin_y,
+        block_size,
+        &hag_values,
+        hag_norm,
+        z_norm_strategy,
+    );
 
     // Step 3: Combine scalar + precomputed eigenvalue rows (indices 7–16).
     scalar
@@ -141,6 +154,10 @@ mod tests {
             0.0,
             50.0,
             HagNormalization::default(),
+            ZNormalization::Global {
+                z_min: 0.0,
+                z_max: 10.0,
+            },
         );
 
         assert_eq!(feats.len(), pts.len());
@@ -187,6 +204,10 @@ mod tests {
             0.0,
             50.0,
             HagNormalization::default(),
+            ZNormalization::Global {
+                z_min: 0.0,
+                z_max: 10.0,
+            },
         );
         for (row, eig) in feats.iter().zip(eigen_rows.iter()) {
             assert_eq!(&row[7..17], eig.as_slice());

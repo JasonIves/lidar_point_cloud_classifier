@@ -59,6 +59,10 @@ pub struct LabeledBlockManifest {
     pub label_map: HashMap<String, u8>,
     /// Coarse spatial grid metadata for the train/val macro-tile split.
     pub spatial_tile_grid: SpatialTileGrid,
+    /// Halo budget fraction φ used for this run (Stage 45). `0.0` (default,
+    /// backward-compatible) means no halo rows were written.
+    #[serde(default)]
+    pub halo_fraction: f64,
     pub blocks: Vec<LabeledBlockMeta>,
 }
 
@@ -158,8 +162,8 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
             continue;
         };
 
-        // Map sampled indices → remapped model class labels.
-        let labels: Vec<u8> = proc
+        // Map sampled indices → remapped model class labels (core rows).
+        let mut labels: Vec<u8> = proc
             .sampled_indices
             .iter()
             .map(|&raw_idx| {
@@ -167,6 +171,16 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
                 remap(asprs, &config.label_map, unassigned_idx)
             })
             .collect();
+
+        // Halo rows (Stage 45): their raw ASPRS bytes were captured from the
+        // sampled `LitePoint`s in the base pipeline — remap through the same
+        // path and append so `.lbl` stays positionally aligned with `.feat`
+        // rows [core | halo].
+        labels.extend(
+            proc.halo_classifications
+                .iter()
+                .map(|&asprs| remap(asprs, &config.label_map, unassigned_idx)),
+        );
 
         // Drop blocks where all points carry ASPRS code 0 (never classified).
         let all_unclassified = proc
@@ -183,8 +197,11 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
         write_lbl_file(&lbl_path, &labels)?;
 
         // Compute class distribution (remapped indices as string keys).
+        // **Core rows only** (Stage 45): keeps split-stratification semantics
+        // of Stages 32–36 unchanged — halo rows do not distort the
+        // macro-tile class balance the splitter optimises for.
         let mut dist: HashMap<String, u64> = HashMap::new();
-        for &l in &labels {
+        for &l in &labels[..labels.len() - proc.halo_classifications.len()] {
             *dist.entry(l.to_string()).or_insert(0) += 1;
         }
 
@@ -231,6 +248,7 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
         crs_epsg: base_manifest.crs_epsg,
         label_map: label_map_str,
         spatial_tile_grid: grid_meta,
+        halo_fraction: config.preprocess.halo_fraction,
         blocks: labeled_blocks,
     };
 
@@ -290,8 +308,13 @@ fn compute_bbox(manifest: &BlockManifest, block_size: f64) -> (f64, f64, f64, f6
     (min_x, min_y, max_x, max_y)
 }
 
-/// Compute the macro-tile ID for a block at `(origin_x, origin_y)`.
-fn compute_macro_tile_id(
+/// Compute the macro-tile ID for a point or block origin at `(origin_x, origin_y)`.
+///
+/// Shared with `training::dataset` (Stage 45, Amendment 1 — split-aware halo
+/// loss masking), which reconstructs each halo row's macro-tile from its
+/// absolute coordinates to decide whether the row's label may enter the
+/// training loss (same tile) or must be masked to weight 0 (cross tile).
+pub(crate) fn compute_macro_tile_id(
     origin_x: f64,
     origin_y: f64,
     grid: &SpatialTileGrid,
@@ -509,6 +532,7 @@ mod tests {
                 bbox_max_x: 400.0,
                 bbox_max_y: 400.0,
             },
+            halo_fraction: 0.0,
             blocks: vec![LabeledBlockMeta {
                 meta: BlockMeta {
                     id: 42,
@@ -518,6 +542,7 @@ mod tests {
                     raw_point_count: 500,
                     sampled_point_count: 500,
                     oversampled: false,
+                    n_halo: 0,
                 },
                 lbl_file: "block_00042.lbl".to_string(),
                 macro_tile_id: 6,

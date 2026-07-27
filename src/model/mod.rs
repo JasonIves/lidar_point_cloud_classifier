@@ -1,5 +1,6 @@
 //! Model module — `PointNet` inference engine (Stage 02).
 
+pub mod fusion;
 pub mod inference;
 pub mod layers;
 pub mod pointnet;

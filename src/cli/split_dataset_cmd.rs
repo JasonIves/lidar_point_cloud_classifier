@@ -413,6 +413,7 @@ fn write_subset(
         crs_epsg: first.crs_epsg,
         label_map: first.label_map.clone(),
         spatial_tile_grid: first.spatial_tile_grid.clone(),
+        halo_fraction: first.halo_fraction,
         blocks: subset_blocks,
     };
 
@@ -597,6 +598,7 @@ mod tests {
         bytes.extend_from_slice(&id.to_le_bytes());
         bytes.extend_from_slice(&0f64.to_le_bytes());
         bytes.extend_from_slice(&0f64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_halo (v2)
         for _ in 0..(n_points * crate::preprocessing::N_FEATURES) {
             bytes.extend_from_slice(&1.0f32.to_le_bytes());
         }
@@ -621,6 +623,7 @@ mod tests {
                     raw_point_count: 4,
                     sampled_point_count: 4,
                     oversampled: false,
+                    n_halo: 0,
                 },
                 lbl_file: format!("block_{id:05}.lbl"),
                 #[allow(clippy::cast_possible_truncation)]
@@ -646,6 +649,7 @@ mod tests {
                 bbox_max_x: 200.0,
                 bbox_max_y: 200.0,
             },
+            halo_fraction: 0.0,
             blocks,
         }
     }

@@ -117,6 +117,27 @@ impl BlockStub {
         })
     }
 
+    /// Read all spill files for this block **without deleting them**,
+    /// preserving each point's original-file stream index.
+    ///
+    /// Used by the Stage 45 halo sampler: halo rows are joined against the
+    /// whole-file eigenvalue pre-pass table by original index (the same
+    /// join used for canonical points in `pipeline.rs` Step 7d), so the
+    /// indices must survive this read.  The neighbour stub retains
+    /// ownership of its spill files and will delete them when its own
+    /// `load()` is called in the parallel closure.
+    ///
+    /// # Errors
+    /// Returns [`ClassifierError::SpillCorrupt`] if any spill file is unreadable.
+    pub fn read_points_indexed(&self) -> Result<Vec<(u64, LitePoint)>> {
+        let mut out = Vec::with_capacity(self.point_count);
+        for path in &self.spill_paths {
+            let spilled = read_spill_file(path)?;
+            out.extend(spilled);
+        }
+        Ok(out)
+    }
+
     /// Read all spill files for this block **without deleting them**.
     ///
     /// Used by the Stage 08 border-point loader to read a neighbour block's

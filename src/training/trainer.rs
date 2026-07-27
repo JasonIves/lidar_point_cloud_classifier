@@ -9,10 +9,9 @@ use std::time::Instant;
 
 use burn::{
     module::AutodiffModule,
-    nn::loss::CrossEntropyLossConfig,
     nn::BatchNorm,
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
-    tensor::{backend::AutodiffBackend, backend::Backend, Tensor},
+    tensor::{backend::AutodiffBackend, backend::Backend, Int, Tensor},
 };
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClassifierError, Result};
 use crate::model::layers::{BatchNorm1d, WeightAveraging};
 
-use crate::model::pointnet::PointNetConfig;
+use crate::model::pointnet::{PointNetConfig, CANONICAL_DECODER_DIMS, CANONICAL_ENCODER_DIMS};
 use crate::model::weights::load_model;
 use crate::training::{
     bridge::save_model_from_burn,
@@ -102,6 +101,12 @@ pub struct TrainConfig {
     /// caching entirely — every `load_block()` call reads from disk, exactly
     /// matching pre-Stage-27 behavior.
     pub cache_blocks_max_mb: Option<usize>,
+    /// Per-point loss weight applied to **same-tile** halo rows (Stage 45).
+    /// Cross-tile halo rows are always masked to 0.0 by the dataset's
+    /// split-aware leakage masking (`LabeledBlockDataset::load_block`).
+    /// `1.0` (default) treats same-tile halo rows as full training samples;
+    /// `0.0` masks all halo rows from the loss (context-only mode).
+    pub halo_loss_weight: f32,
 }
 
 impl Default for TrainConfig {
@@ -131,6 +136,7 @@ impl Default for TrainConfig {
             warmup_steps: 0,
             grad_clip_norm: None,
             cache_blocks_max_mb: None,
+            halo_loss_weight: 1.0,
         }
     }
 }
@@ -234,8 +240,8 @@ where
     // ── Model + config ────────────────────────────────────────────────────
     let net_cfg = PointNetConfig {
         n_features_in: dataset.n_features(),
-        encoder_dims: vec![64, 128, 256],
-        decoder_dims: vec![256, 128],
+        encoder_dims: CANONICAL_ENCODER_DIMS.to_vec(),
+        decoder_dims: CANONICAL_DECODER_DIMS.to_vec(),
         n_classes: config.n_classes,
         use_batch_norm: config.use_batch_norm,
         use_input_tnet: true,
@@ -276,15 +282,6 @@ where
         Some(w)
     } else {
         None
-    };
-
-    // ── Loss ──────────────────────────────────────────────────────────────
-    let loss_fn = {
-        let mut cfg = CrossEntropyLossConfig::new();
-        if let Some(ref w) = class_weights {
-            cfg = cfg.with_weights(Some(w.clone()));
-        }
-        cfg.init::<B>(device)
     };
 
     // ── LR scheduler ─────────────────────────────────────────────────────
@@ -343,6 +340,7 @@ where
                 // expected; we guard defensively rather than panic.
                 let mut batch_flat: Vec<f32> = Vec::new();
                 let mut batch_labels: Vec<u8> = Vec::new();
+                let mut batch_weights: Vec<f32> = Vec::new();
                 let mut n_ref = 0usize;
                 let mut nfeat_ref = 0usize;
                 let mut count = 0usize;
@@ -381,6 +379,14 @@ where
                     let raw: Vec<f32> = block.features.into_raw_vec_and_offset().0;
                     batch_flat.extend_from_slice(&raw);
                     batch_labels.extend_from_slice(&block.labels);
+                    // Stage 45: effective per-point loss weights = per-row
+                    // halo weight (dataset, split-masked) × per-class weight.
+                    for (lbl, pw) in block.labels.iter().zip(block.loss_weights.iter()) {
+                        let cw = class_weights
+                            .as_ref()
+                            .map_or(1.0, |w| w.get(*lbl as usize).copied().unwrap_or(1.0));
+                        batch_weights.push(pw * cw);
+                    }
                     count += 1;
                 }
 
@@ -397,9 +403,14 @@ where
                 let nc = logits.dims()[2];
                 let logits2d = logits.reshape([count * n_ref, nc]);
 
-                let loss = loss_fn.forward(logits2d, targets); // [1]
-                                                               // into_data() forces a device sync — the first point at which
-                                                               // queued GPU kernels (and their buffers) must execute.
+                // Stage 45: weighted-mean CE — Σ(w·nll) / Σw (all-ones weights
+                // reproduce the former burn CE path exactly for v1 datasets).
+                let weight_tensor = Tensor::<B, 1>::from_floats(batch_weights.as_slice(), device);
+                let weight_sum: f32 = batch_weights.iter().sum::<f32>().max(1e-9);
+                let loss =
+                    weighted_mean_ce(logits2d, targets, weight_tensor).div_scalar(weight_sum); // [1]
+                                                                                               // into_data() forces a device sync — the first point at which
+                                                                                               // queued GPU kernels (and their buffers) must execute.
                 let loss_val = loss
                     .clone()
                     .into_data()
@@ -686,21 +697,22 @@ where
 
 /// Log the min/mean/max of each main encoder/decoder `BatchNorm` layer's running
 /// mean and variance.  Opt-in Stage 18 diagnostic (`WB_BN_DIAG=1`); called at
-/// most once per validation pass and emits five stderr lines.
+/// most once per validation pass. Emits one stderr line per encoder layer plus
+/// one per decoder layer (Stage 43: dynamic-length `encoder_layers`/
+/// `decoder_layers` Vec fields, so the layer count is no longer fixed at 5).
 fn log_bn_running_stats<B: AutodiffBackend>(model: &BurnPointNet<B>) {
-    let layers: [(&str, &BatchNorm<B, 1>); 5] = [
-        ("bn_enc0", &model.bn_enc0),
-        ("bn_enc1", &model.bn_enc1),
-        ("bn_enc2", &model.bn_enc2),
-        ("bn_dec0", &model.bn_dec0),
-        ("bn_dec1", &model.bn_dec1),
-    ];
-    for (name, bn) in layers {
+    let log_one = |name: String, bn: &BatchNorm<B, 1>| {
         let (mmin, mmean, mmax) = tensor_stats::<B>(&bn.running_mean.value());
         let (vmin, vmean, vmax) = tensor_stats::<B>(&bn.running_var.value());
         eprintln!(
             "[bn_diag] {name}: running_mean[min/mean/max]={mmin:.4}/{mmean:.4}/{mmax:.4}  running_var[min/mean/max]={vmin:.4}/{vmean:.4}/{vmax:.4}"
         );
+    };
+    for (i, (_, bn)) in model.encoder_layers.iter().enumerate() {
+        log_one(format!("bn_enc{i}"), bn);
+    }
+    for (i, (_, bn)) in model.decoder_layers.iter().enumerate() {
+        log_one(format!("bn_dec{i}"), bn);
     }
 }
 
@@ -715,6 +727,24 @@ fn tensor_stats<B: Backend>(t: &Tensor<B, 1>) -> (f32, f32, f32) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean = v.iter().sum::<f32>() / v.len() as f32;
     (min, mean, max)
+}
+
+/// Weighted-mean cross-entropy numerator over a flattened `[M, n_classes]`
+/// logit tensor (Stage 45): per-point negative log-likelihoods gathered from
+/// the log-softmax output, multiplied by `weights`, and summed. The **caller
+/// divides by the weight sum** (computed on CPU, so the division stays
+/// scalar and cheap). With all-ones weights this is exactly `Σ nll`, i.e.
+/// the unweighted mean CE — numerically identical to the former burn CE
+/// path for all-v1 datasets.
+fn weighted_mean_ce<B: AutodiffBackend>(
+    logits2d: Tensor<B, 2>,
+    targets: Tensor<B, 1, Int>,
+    weights: Tensor<B, 1>,
+) -> Tensor<B, 1> {
+    let [m, _nc] = logits2d.dims();
+    let log_probs = burn::tensor::activation::log_softmax(logits2d, 1);
+    let nll = -log_probs.gather(1, targets.reshape([m, 1])).reshape([m]);
+    (nll * weights).sum()
 }
 
 /// Compute mean cross-entropy loss from raw logits and labels (no burn required).
@@ -1336,7 +1366,9 @@ mod tests {
     #[cfg(feature = "training")]
     #[test]
     fn test_swa_averages_tnet_weights() {
-        use crate::model::pointnet::PointNetConfig;
+        use crate::model::pointnet::{
+            PointNetConfig, CANONICAL_DECODER_DIMS, CANONICAL_ENCODER_DIMS,
+        };
         use crate::model::weights::load_model;
         use crate::preprocessing::N_FEATURES;
         use crate::training::bridge::save_model_from_burn;
@@ -1348,8 +1380,8 @@ mod tests {
 
         let cfg = PointNetConfig {
             n_features_in: N_FEATURES,
-            encoder_dims: vec![64, 128, 256],
-            decoder_dims: vec![256, 128],
+            encoder_dims: CANONICAL_ENCODER_DIMS.to_vec(),
+            decoder_dims: CANONICAL_DECODER_DIMS.to_vec(),
             n_classes: 8,
             use_batch_norm: true,
             use_input_tnet: true, // ← T-Net enabled

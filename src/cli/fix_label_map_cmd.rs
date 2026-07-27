@@ -278,6 +278,7 @@ mod tests {
             raw_point_count: 4,
             sampled_point_count: 4,
             oversampled: false,
+            n_halo: 0,
         };
         let lbm = LabeledBlockMeta {
             meta,
@@ -302,6 +303,7 @@ mod tests {
                 bbox_max_x: 50.0,
                 bbox_max_y: 50.0,
             },
+            halo_fraction: 0.0,
             blocks: vec![lbm],
         };
         std::fs::write(

@@ -42,16 +42,20 @@ pub fn save_model_from_burn<B: AutodiffBackend>(
         .map(|stn| extract_tnet64d::<B>(stn, cfg.use_batch_norm))
         .transpose()?;
 
-    let encoder_layers = vec![
-        extract_pair::<B>(&model.enc0, &model.bn_enc0, cfg.use_batch_norm)?,
-        extract_pair::<B>(&model.enc1, &model.bn_enc1, cfg.use_batch_norm)?,
-        extract_pair::<B>(&model.enc2, &model.bn_enc2, cfg.use_batch_norm)?,
-    ];
+    // Stage 43: encoder_layers/decoder_layers are now dynamic-length Vec
+    // fields on BurnPointNet, so extraction loops over them instead of
+    // hand-unrolling a fixed 3-encoder/2-decoder layer count.
+    let encoder_layers = model
+        .encoder_layers
+        .iter()
+        .map(|(lin, bn)| extract_pair::<B>(lin, bn, cfg.use_batch_norm))
+        .collect::<Result<Vec<_>>>()?;
 
-    let decoder_layers = vec![
-        extract_pair::<B>(&model.dec0, &model.bn_dec0, cfg.use_batch_norm)?,
-        extract_pair::<B>(&model.dec1, &model.bn_dec1, cfg.use_batch_norm)?,
-    ];
+    let decoder_layers = model
+        .decoder_layers
+        .iter()
+        .map(|(lin, bn)| extract_pair::<B>(lin, bn, cfg.use_batch_norm))
+        .collect::<Result<Vec<_>>>()?;
 
     let class_proj = extract_linear::<B>(&model.proj)?;
 
@@ -259,8 +263,8 @@ mod tests {
     fn default_cfg() -> PointNetConfig {
         PointNetConfig {
             n_features_in: N_FEATURES,
-            encoder_dims: vec![64, 128, 256],
-            decoder_dims: vec![256, 128],
+            encoder_dims: crate::model::pointnet::CANONICAL_ENCODER_DIMS.to_vec(),
+            decoder_dims: crate::model::pointnet::CANONICAL_DECODER_DIMS.to_vec(),
             n_classes: 8,
             use_batch_norm: true,
             use_input_tnet: true,
@@ -343,6 +347,11 @@ mod tests {
     /// validation) vs 0.02 (deployed `evaluate`) collapse observed on
     /// bit-identical model weights and data. See
     /// `docs/stages/stage-40-tnet-transpose-fix.md`.
+    // Test fixture flat feature array from a small deterministic index
+    // range; precision loss converting the index to f32 is negligible and
+    // irrelevant to the burn/ndarray forward-output-agreement behaviour this
+    // test verifies.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn test_burn_and_ndarray_forward_outputs_agree_after_bridge() {
         use crate::training::burn_model::features_to_tensor;

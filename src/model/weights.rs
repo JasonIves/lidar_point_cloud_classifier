@@ -523,4 +523,116 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Build a deterministically initialised classifier using the Stage 43
+    /// canonical encoder/decoder dims (`CANONICAL_ENCODER_DIMS`,
+    /// `CANONICAL_DECODER_DIMS`) and `N_FEATURES` input width.
+    // Weight arrays are generated from small index ranges scaled by a tiny
+    // constant; precision loss converting the index to f32 is negligible and
+    // irrelevant to the round-trip correctness this test verifies.
+    #[allow(clippy::cast_precision_loss)]
+    fn make_canonical_classifier() -> PointNetClassifier {
+        use crate::model::pointnet::{CANONICAL_DECODER_DIMS, CANONICAL_ENCODER_DIMS};
+        use crate::preprocessing::N_FEATURES;
+
+        let config = PointNetConfig {
+            n_features_in: N_FEATURES,
+            encoder_dims: CANONICAL_ENCODER_DIMS.to_vec(),
+            decoder_dims: CANONICAL_DECODER_DIMS.to_vec(),
+            n_classes: 4,
+            use_batch_norm: false,
+            use_input_tnet: false,
+            use_feature_tnet: false,
+        };
+
+        let mut encoder_layers = Vec::with_capacity(CANONICAL_ENCODER_DIMS.len());
+        let mut prev = N_FEATURES;
+        for &dim in &CANONICAL_ENCODER_DIMS {
+            let w: Vec<f32> = (0..dim * prev).map(|i| (i % 97) as f32 * 0.0001).collect();
+            let b = vec![0.01f32; dim];
+            encoder_layers.push((
+                Linear::new(
+                    Array2::from_shape_vec((dim, prev), w).unwrap(),
+                    Array1::from_vec(b),
+                )
+                .unwrap(),
+                None,
+            ));
+            prev = dim;
+        }
+
+        let concat_dim = config.concat_dim();
+        let mut decoder_layers = Vec::with_capacity(CANONICAL_DECODER_DIMS.len());
+        let mut prev_d = concat_dim;
+        for &dim in &CANONICAL_DECODER_DIMS {
+            let w: Vec<f32> = (0..dim * prev_d)
+                .map(|i| (i % 97) as f32 * 0.0001)
+                .collect();
+            let b = vec![-0.01f32; dim];
+            decoder_layers.push((
+                Linear::new(
+                    Array2::from_shape_vec((dim, prev_d), w).unwrap(),
+                    Array1::from_vec(b),
+                )
+                .unwrap(),
+                None,
+            ));
+            prev_d = dim;
+        }
+
+        let n_classes = config.n_classes;
+        let proj_w: Vec<f32> = (0..n_classes * prev_d)
+            .map(|i| (i % 97) as f32 * 0.001)
+            .collect();
+        let class_proj = Linear::new(
+            Array2::from_shape_vec((n_classes, prev_d), proj_w).unwrap(),
+            Array1::zeros(n_classes),
+        )
+        .unwrap();
+
+        PointNetClassifier {
+            config,
+            input_tnet: None,
+            feature_tnet: None,
+            encoder_layers,
+            decoder_layers,
+            class_proj,
+            label_map: vec![1u8, 2u8, 5u8, 6u8],
+        }
+    }
+
+    // DoD #11 (Stage 43) — .wbmodel round-trip with the canonical encoder/
+    // decoder dims: save, reload, run identical input, bit-identical output.
+    // Test fixture input generation from small index ranges (16x17=272
+    // elements); precision loss converting the index to f32 is negligible and
+    // irrelevant to the round-trip correctness this test verifies.
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
+    fn test_wbmodel_round_trip_canonical_dims() -> crate::error::Result<()> {
+        use crate::preprocessing::N_FEATURES;
+
+        let model = make_canonical_classifier();
+
+        let input = Array2::<f32>::from_shape_fn((16, N_FEATURES), |(i, j)| {
+            ((i * N_FEATURES + j) % 97) as f32 * 0.01
+        });
+        let logits_before = model.forward(input.clone())?;
+
+        let tmp = NamedTempFile::new().map_err(ClassifierError::Io)?;
+        save_model(tmp.path(), &model)?;
+        let loaded = load_model(tmp.path())?;
+        let logits_after = loaded.forward(input)?;
+
+        assert_eq!(logits_before.shape(), logits_after.shape());
+        for i in 0..logits_before.nrows() {
+            for j in 0..logits_before.ncols() {
+                assert_eq!(
+                    logits_before[[i, j]].to_bits(),
+                    logits_after[[i, j]].to_bits(),
+                    "logit[{i},{j}] mismatch after round-trip (canonical dims)"
+                );
+            }
+        }
+        Ok(())
+    }
 }

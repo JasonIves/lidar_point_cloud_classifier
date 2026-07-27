@@ -199,7 +199,7 @@ Transforms a raw LiDAR point cloud into block-based feature files ready for infe
 | `--block-size <f64>` | `50.0` | Edge length of each 2D block cell, in projection units (e.g., metres). |
 | `--target-points <uint>` | `1024` | Number of points per block after density-gated sampling and padding. |
 | `--min-density <f64>` | `1.0` | Minimum point density (points/m²) required to retain a block. Blocks below this threshold are discarded. |
-| `--block-overlap <f64>` | `0.0` | Border-point context radius in projection units. Points from adjacent blocks within this radius are included in the k-d tree for feature extraction but not written to the `.feat` output. Recommended: `block-size / 2`. Must be < `block-size`. |
+| `--block-overlap <f64>` | `0.0` | Radius of the border strip collected from neighbouring blocks, in projection units. On its own it only feeds halo sampling and the `classify --fusion-radius` default (no change to `.feat` contents); pair with `--halo-fraction` to write strip points into `.feat` as halo rows. Recommended: `block-size / 4`. Must be < `block-size`. |
 
 #### Optional Arguments — Feature Extraction
 
@@ -281,13 +281,16 @@ Runs a pre-trained PointNet model on preprocessed block files and writes a class
 | Argument | Default | Description |
 |---|---|---|
 | `--threads <uint>` | *(system cores)* | Size of the Rayon thread pool for parallel block inference. |
+| `--fusion-radius <f64>` | `block_overlap` from `blocks.json`, else `0` (off) | Cross-block prediction-fusion voting reach in projection units. Adjacent blocks within this distance of a point also vote (confidence-weighted), smoothing block-seam misclassifications ("patchwork quilt" edges). `0` disables fusion. Maximum: `block-size / 2`. See [Prediction Fusion](#prediction-fusion-stage-44). |
+| `--fusion-temp <f64>` | `1.0` | Softmax temperature applied per block before voting (`>1` softens each block's class distribution, `<1` sharpens it). |
 
 #### Workflow
 
 1. The model weights are loaded from the `.wbmodel` file.
 2. The `blocks.json` manifest is loaded, and the directory containing it is scanned for corresponding `.feat` files.
 3. Each block is processed through the PointNet forward pass to produce per-point class predictions.
-4. The classified points are written back to the original LAS/LAZ file, preserving all original fields except the classification byte, which is overwritten with the predicted class.
+4. Every original point is labeled by fusing the softmax probability vectors of the block(s) whose footprint covers it (weighted soft voting — with `--fusion-radius 0` this is exactly the legacy nearest-block behaviour).
+5. The classified points are written back to the original LAS/LAZ file, preserving all original fields except the classification byte, which is overwritten with the predicted class.
 
 > [!NOTE]
 > The `--blocks` argument must point to the `blocks.json` produced by a `preprocess` run on the **same** `--input` file. The `.feat` block files must exist in the same directory as `blocks.json`.
@@ -430,7 +433,7 @@ wb_lidar_train preprocess-labeled \
 
 ### 5.2 `split-dataset` — Dataset Split Materialization
 
-Physically splits one or more `preprocess-labeled` output directories into `train/`, `val/`, and optionally `test/` subdirectories. The split is spatially aware: blocks are assigned to macro-tiles, and entire macro-tiles are allocated to each split. This prevents data leakage where nearly-identical adjacent blocks could appear in both training and validation sets.
+Physically splits one or more `preprocess-labeled` output directories into `train/`, `val/`, and optionally `test/` subdirectories. The split is spatially aware: blocks are assigned to macro-tiles, and entire macro-tiles are allocated to each split. This prevents data leakage where nearly-identical adjacent blocks could appear in both training and validation sets — a standard best practice for geospatial machine learning (Roberts et al., 2017; Ploton et al., 2020). When class stratification is enabled (default), macro-tiles are assigned via a greedy, cost-minimizing bin-packing heuristic that balances per-class proportions across splits while respecting the requested size fractions (Boyd & Vandenberghe, 2004).
 
 #### Required Arguments
 
@@ -665,6 +668,9 @@ Evaluation runs through the **pure-Rust inference engine** (`PointNetClassifier`
 |---|---|---|
 | `--n-classes <uint>` | *(auto)* | Optional cross-check against the model and data. If supplied, must agree with both `model.config.n_classes` and `dataset.n_classes()`. |
 | `--threads <uint>` | *(system cores)* | Size of the Rayon thread pool for parallel block evaluation. |
+| `--fused-eval` | *(off)* | Replicate the deployed cross-block prediction-fusion decision rule (Stage 44) instead of per-block argmax, and additionally print **boundary-band vs. interior** metrics (per-class IoU and accuracy split by distance to the block edge). Use this to quantify block-seam error and the effect of fusion. |
+| `--fusion-radius <f64>` | `block-size / 4` | Fusion voting reach in projection units for `--fused-eval`. Maximum: `block-size / 2`. Requires `--fused-eval`. |
+| `--fusion-temp <f64>` | `1.0` | Softmax temperature before voting. Requires `--fused-eval`. |
 
 #### Output CSV: `--metrics-out`
 
@@ -776,7 +782,7 @@ Input Tensor (N × 17)
     └───┬───┘
         │
     ┌───────┐
-    │ Encoder│  ← 3 shared MLP layers: 64 → 64 → 64
+    │ Encoder│  ← layer 0: 64  (saved as local_feat, N × 64)
     └───┬───┘
         │
     ┌───┴───┐
@@ -784,15 +790,19 @@ Input Tensor (N × 17)
     └───┬───┘   (--use-feature-tnet)
         │
     ┌───────┐
-    │ Encoder│  ← 2 shared MLP layers: 128 → 1024
+    │ Encoder│  ← layers 1-4: 64 → 64 → 128 → 1024
     └───┬───┘
         │
     ┌───────┐
-    │Max Pool│  ← symmetric aggregation over point dimension
+    │Max Pool│  ← symmetric aggregation over point dimension → N × 1024 (broadcast)
     └───┬───┘
         │
     ┌─────────┐
-    │ Classifier│  ← 3 FC layers: 512 → 256 → n_classes
+    │  Concat  │  ← local_feat (N × 64) + global (N × 1024) = N × 1088
+    └─────┬───┘
+          │
+    ┌─────────┐
+    │ Decoder  │  ← 2 FC layers: 1088 → 512 → 256, then 256 → n_classes (proj)
     └─────┬───┘
           │
      Class Scores (N × n_classes)
@@ -809,12 +819,16 @@ A small sub-network that predicts a 3×3 affine transformation matrix applied to
 
 #### Encoder
 
-Two sets of shared MLPs (applied independently to each point):
+Five shared MLP layers (applied independently to each point), matching the
+canonical PointNet (Qi et al. 2017) segmentation architecture:
 
-1. 64 → 64 → 64 (first encoder block)
-2. 128 → 1024 (second encoder block)
+1. Layer 0: `n_features_in (17) → 64` — this output is saved as `local_feat`
+   and later concatenated with the global descriptor.
+2. Layers 1-4: `64 → 64 → 64 → 128 → 1024` — the "deep" branch, ending in the
+   1024-dimensional global feature vector.
 
-Each layer uses 1D convolution (conv1d with kernel size 1) to apply the same MLP to every point independently.
+Each layer uses 1D convolution (conv1d with kernel size 1) to apply the same
+MLP to every point independently.
 
 #### Feature Transform T-Net (STN-64d)
 
@@ -826,15 +840,24 @@ An optional sub-network that predicts a 64×64 affine transformation matrix appl
 
 #### Max Pooling
 
-A symmetric max-pooling operation across the point dimension. This is the key innovation of PointNet: it aggregates per-point features into a single global feature vector, and because max is symmetric, the result is invariant to point order.
+A symmetric max-pooling operation across the point dimension. This is the key innovation of PointNet: it aggregates per-point features into a single 1024-dimensional global feature vector, and because max is symmetric, the result is invariant to point order. The global vector is broadcast back to `N × 1024` for the segmentation concat.
 
-#### Classifier Head
+#### Segmentation Concat
 
-Three fully connected layers with dropout and batch normalization:
+The 64-dimensional `local_feat` (saved from encoder layer 0, optionally
+T-Net-transformed) is concatenated with the broadcast 1024-dimensional global
+descriptor, producing an `N × 1088` segmentation context vector. This
+local+global concatenation is what gives PointNet its per-point reasoning
+ability — the decoder below never sees the deep-encoder output directly.
 
-- 1024 → 512 (ReLU + BN + Dropout 0.3)
+#### Decoder Head
+
+Two fully connected layers with dropout and batch normalization, followed by
+a final class-projection layer:
+
+- 1088 → 512 (ReLU + BN + Dropout 0.3)
 - 512 → 256 (ReLU + BN + Dropout 0.3)
-- 256 → n_classes (Linear projection to class scores)
+- 256 → n_classes (Linear projection to class scores; no BN/ReLU)
 
 The output is a per-point class score tensor of shape `N × n_classes`.
 
@@ -844,7 +867,8 @@ The `.wbmodel` file stores the complete model architecture and weights:
 
 | Field | Type | Description |
 |---|---|---|
-| `encoder_dims` | `Vec<usize>` | Layer widths of the encoder (e.g., `[64, 64, 128, 1024]`). |
+| `encoder_dims` | `Vec<usize>` | Layer widths of the encoder (canonical default: `[64, 64, 64, 128, 1024]`). |
+| `decoder_dims` | `Vec<usize>` | Layer widths of the decoder, before the final class-projection layer (canonical default: `[512, 256]`). Decoder input dim = `encoder_dims[0] + encoder_dims.last()` = `64 + 1024 = 1088`. |
 | `n_classes` | `usize` | Number of output classes. |
 | `use_input_tnet` | `bool` | Whether the input transform T-Net is enabled. |
 | `use_feature_tnet` | `bool` | Whether the feature transform T-Net is enabled. |
@@ -981,12 +1005,60 @@ When `--swa` is enabled, the trainer maintains a running average of model weight
 
 ### Block Overlap
 
-When `--block-overlap` is set to a positive value, each block's k-d tree is augmented with **border points** from adjacent blocks that fall within the overlap radius. This ensures that points near block boundaries have the same neighbourhood context they would have in the original unfragmented point cloud, eliminating edge effects.
+When `--block-overlap` is set to a positive value, each block collects a **border strip** — points from adjacent blocks that fall within the overlap radius — written to internal spill files during preprocessing. Two features consume this strip:
+
+- **Halo augmentation (Stage 45):** with `--halo-fraction > 0`, strip points are sampled into the `.feat` payload as halo rows (see next section).
+- **Prediction fusion default (Stage 44):** `classify --fusion-radius` defaults to the manifest's `block_overlap` value when no flag is given.
 
 Key facts about block overlap:
-- Border points participate in feature extraction (e.g., eigenvalue computation) but are **never resampled or written** to the `.feat` output.
-- Recommended value: `block-size / 2` — this fully covers any neighbourhood radius ≤ `block-size / 2`.
-- Must be `≥ 0.0` and strictly `< block-size`.
+- On its own (halo off), the strip does **not** change `.feat` contents — since Stage 30/42, eigenvalue features come from a whole-file pre-pass and the strip is otherwise unused.
+- Recommended: `block-size / 4` when pairing with halo. Must be `≥ 0.0` and strictly `< block-size`.
+
+### Prediction Fusion (Stage 44)
+
+Because each block is classified independently, objects that straddle a block boundary (e.g., a building half in one block and half in another) can receive different classifications on either side of the seam — the "patchwork quilt" artifact. **Prediction fusion** smooths these seams by letting adjacent blocks *vote* on points near their borders:
+
+1. During inference, every block retains a full softmax **probability vector** per sampled point (not just the winning class).
+2. When the output file is written, each original point is labeled by the weighted mixture of the softmax vectors of **all blocks whose footprint covers it**:
+   - **Centrality weight** — a vote from a block is strongest when the point lies deep inside that block and ramps linearly to zero at the fusion radius beyond its edge (continuous blending, no new seams).
+   - **Proximity weight** — inverse-square falloff in the distance to the block's nearest sampled point, bounded by a bandwidth σ = `block-size / √target-points` (the characteristic sample spacing), so a sparse block's far-away sample cannot outvote the local one — and a point sitting exactly on a block's own sample cannot dominate the blend.
+3. The final class is the argmax of the fused mixture, mapped through the model's label map.
+
+Points deep inside a block are unaffected (single-block decision, identical to legacy behaviour); only points within `--fusion-radius` of a block edge are blended. Fusion requires no retraining and no preprocessing changes.
+
+| Flag | Command | Default | Description |
+|---|---|---|---|
+| `--fusion-radius <f64>` | `classify` | `block_overlap` from `blocks.json`, else `0` | Voting reach. `0` disables fusion (legacy behaviour). Max: `block-size / 2`. |
+| `--fusion-temp <f64>` | `classify`, `evaluate` | `1.0` | Softmax temperature before voting. |
+| `--fused-eval` | `evaluate` | *(off)* | Score the test set with the deployed fusion rule and print boundary-band vs. interior metrics. |
+
+**Measuring the effect:** run `wb_lidar_train evaluate --fused-eval` on a held-out split. The boundary-band vs. interior per-class IoU breakdown shows exactly how much error concentrates at block seams — and how much fusion recovers. Example:
+
+```bash
+wb_lidar_train evaluate \
+    --model "C:/data/models/urban_model.wbmodel" \
+    --data-dir "C:/data/split/merged/test" \
+    --metrics-out "C:/data/eval/fused_metrics.csv" \
+    --confusion-out "C:/data/eval/fused_confusion.csv" \
+    --fused-eval --fusion-radius 12.5
+```
+
+### Halo-Augmented Blocks (Stage 45)
+
+Fusion (Stage 44) reconciles *predictions* across block seams, but each block's own PointNet forward pass still sees only its own territory. **Halo augmentation** attacks the root cause: each block's input tensor is extended across its boundaries with **halo rows** — points sampled from the overlap margin — so the model's global max-pool aggregates the full local structure (e.g., the whole roof, not the half that fits in one block), and border-zone points receive genuine predictions in multiple blocks.
+
+Key facts:
+
+- **Fixed-N budget split:** the per-block tensor stays exactly `target-points × 17`. Halo rows are a reallocation *inside* N (`N = core + halo`), so VRAM, batch sizing, and `.feat` sizes are unchanged. Recommended: `--halo-fraction 0.25` with `--block-overlap = block-size / 4`.
+- **`.feat` format v2:** header gains one `n_halo` field (41 bytes vs. 37). Payload layout is `[core rows | halo rows]`; v1 files remain readable.
+- **Retraining required:** halo rows extend the normalized x/y coordinates slightly outside `[0,1]` — a genuine input-distribution shift, so models trained on pre-Stage-45 data should be retrained (same precedent as earlier feature changes).
+- **Split-aware training (mandatory):** halo rows sampled from *neighbouring* blocks' territory carry real labels. If a halo row lies across a train/val/test macro-tile boundary, its loss weight is automatically **0** (context-only), so held-out labels can never leak into training. Same-tile halo rows train at `--halo-loss-weight` (default 1.0).
+- **Fusion composes:** `classify` defaults `--fusion-radius` to the manifest's `block_overlap` (the halo reach) automatically — preprocessing with overlap + halo gives you both mechanisms with no extra flags.
+
+| Flag | Command | Default | Description |
+|---|---|---|---|
+| `--halo-fraction <f64>` | `preprocess`, `preprocess-labeled` | `0.0` (off) | Fraction of each block's rows reserved for halo samples (0–0.5). Requires `--block-overlap > 0`. Recommended: `0.25`. |
+| `--halo-loss-weight <f32>` | `train` | `1.0` | Loss weight for same-tile halo rows. `0.0` masks all halo rows from the loss (context-only). |
 
 ### Jitter-Based Oversampling
 
@@ -1131,6 +1203,7 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 | `--threads` | usize | System cores | |
 | `--debug-csv` | bool flag | false | |
 | `--block-overlap` | f64 | 0.0 | |
+| `--halo-fraction` | f64 | 0.0 | |
 | `--outlier-removal` | bool flag | false | |
 | `--outlier-radius` | f64 | 2.0 | |
 | `--outlier-elev-diff` | f64 | 50.0 | |
@@ -1147,6 +1220,8 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 | `--blocks` | Path | — | ✓ |
 | `--output` | Path | — | ✓ |
 | `--threads` | usize | System cores | |
+| `--fusion-radius` | f64 | `block_overlap`, else `0` | |
+| `--fusion-temp` | f64 | 1.0 | |
 
 #### `wb_lidar_train preprocess-labeled`
 
@@ -1200,6 +1275,7 @@ All `preprocess` flags plus:
 | `--warmup-steps` | usize | 0 | |
 | `--grad-clip-norm` | f32 | None | |
 | `--cache-blocks-max-mb` | usize | None | |
+| `--halo-loss-weight` | f32 | 1.0 | |
 
 #### `wb_lidar_train evaluate`
 
@@ -1211,6 +1287,9 @@ All `preprocess` flags plus:
 | `--confusion-out` | Path | — | ✓ |
 | `--n-classes` | usize | *(auto)* | |
 | `--threads` | usize | System cores | |
+| `--fused-eval` | bool flag | false | |
+| `--fusion-radius` | f64 | `block-size / 4` | |
+| `--fusion-temp` | f64 | 1.0 | |
 
 ### B. ASPRS LAS Classification Standard (Common Codes)
 

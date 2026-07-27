@@ -66,6 +66,49 @@ impl Default for HagNormalization {
     }
 }
 
+/// Strategy for normalising raw Z (elevation) values into the `[0, 1]`
+/// feature range consumed by the `z_norm` scalar feature (index 2).
+///
+/// **`z_norm` bug fix (follow-up to Stage 37).** The original implementation
+/// normalised each block's Z values against that block's own local min/max,
+/// which is neighbour-dependent: the same absolute elevation could map to a
+/// *different* `z_norm` feature value purely depending on which tile it
+/// landed in and that tile's own elevation range. This is the same class of
+/// bug Stage 37 fixed for Height-Above-Ground — see
+/// `docs/stages/stage-37-absolute-hag-normalization.md` — but `z_norm`
+/// (raw elevation, distinct from HAG) was not included in that fix.
+///
+/// Unlike HAG (which has a natural fixed physical scale — vegetation height
+/// bands are defined in absolute metres), raw elevation has no universal
+/// fixed reference: a mountainous survey may span thousands of metres while
+/// a flat urban survey may span only a few. There is therefore no sensible
+/// fixed constant analogous to [`HagNormalization::FixedMeters`]. Instead,
+/// the default [`ZNormalization::Global`] variant normalises against a
+/// single **whole-file** elevation range (the LAS/LAZ/COPC header's own
+/// `min_z`/`max_z`, resolved once in `pipeline.rs` before any block
+/// processing begins), so a point at a given absolute elevation always maps
+/// to the same `z_norm` feature value regardless of which block it lands
+/// in. The legacy [`ZNormalization::BlockMinMax`] reproduces the original
+/// per-block behaviour and is retained for reproducibility / A-B comparison
+/// only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZNormalization {
+    /// Normalise against a single, whole-file elevation range shared by
+    /// every block — neighbour-invariant. Default (via `pipeline.rs`).
+    Global {
+        /// Whole-file minimum Z (projection units), typically the LAS
+        /// header's `min_z`.
+        z_min: f64,
+        /// Whole-file maximum Z (projection units), typically the LAS
+        /// header's `max_z`.
+        z_max: f64,
+    },
+    /// Legacy (pre-fix): each block normalises against its own local Z
+    /// min/max. Neighbour-dependent; retained for reproducibility/comparison
+    /// only.
+    BlockMinMax,
+}
+
 /// Resample `pts` to exactly `target` points.
 ///
 /// - If `pts.len() >= target`: random sample without replacement.
@@ -125,6 +168,46 @@ pub fn resample_block(
     }
 }
 
+/// Sample up to `target` halo points from a block's border strip
+/// (Stage 45 — fixed-N halo split).
+///
+/// Seeded Fisher–Yates partial shuffle over the strip, **without
+/// replacement** and **never oversampled, never jittered**: duplicate halo
+/// rows add no cross-boundary context and no fusion-vote diversity. When
+/// the strip supplies fewer than `target` points (sparse edges,
+/// dataset-boundary blocks), all available points are taken and the caller
+/// backfills the remainder from the block's core sample — so the per-block
+/// tensor is always exactly `target_points` rows.
+///
+/// The seed is `block_id ^ 0x9E37_79B9_7F4A_7C15` (golden-ratio mix
+/// constant) so the halo stream is decorrelated from the core
+/// `resample_block` stream for the same block while remaining fully
+/// reproducible run-to-run.
+///
+/// Each element of the returned vector is the `(original_stream_index,
+/// LitePoint)` pair from the border spill — the index is required to join
+/// halo rows against the whole-file eigenvalue pre-pass table.
+#[must_use]
+pub fn sample_halo(
+    border_pts: &[(u64, LitePoint)],
+    target: usize,
+    block_id: u64,
+) -> Vec<(u64, LitePoint)> {
+    const HALO_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+    if border_pts.is_empty() || target == 0 {
+        return Vec::new();
+    }
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(block_id ^ HALO_SEED_MIX);
+
+    let take = target.min(border_pts.len());
+    let mut indices: Vec<usize> = (0..border_pts.len()).collect();
+    for i in 0..take {
+        let j = rng.random_range(i..border_pts.len());
+        indices.swap(i, j);
+    }
+    indices[..take].iter().map(|&i| border_pts[i]).collect()
+}
+
 /// Draw one zero-mean Gaussian offset with standard deviation `sigma`,
 /// clipped to `±3σ`, using a Box–Muller transform sourced from `rng`.
 ///
@@ -165,6 +248,12 @@ fn jitter_offset(rng: &mut impl Rng, sigma: f64) -> f64 {
 ///   height so identical physical heights map to identical feature values
 ///   across blocks; [`HagNormalization::BlockPercentile99`] reproduces the
 ///   legacy per-block behaviour.
+/// - `z_norm_strategy` — Z-elevation normalisation strategy (`z_norm` bug fix,
+///   follow-up to Stage 37). The default [`ZNormalization::Global`] variant
+///   normalises against a single whole-file elevation range so identical
+///   absolute elevations map to identical feature values across blocks;
+///   [`ZNormalization::BlockMinMax`] reproduces the legacy, neighbour-
+///   dependent per-block behaviour.
 ///
 /// # Panics
 /// Panics if `pts.len() != hag_values.len()`.
@@ -175,6 +264,7 @@ pub fn normalise_scalar_features(
     block_size: f64,
     hag_values: &[f64],
     hag_norm: HagNormalization,
+    z_norm_strategy: ZNormalization,
 ) -> Vec<[f32; 7]> {
     assert_eq!(
         pts.len(),
@@ -182,12 +272,20 @@ pub fn normalise_scalar_features(
         "pts and hag_values length mismatch"
     );
 
-    // Compute z range for z_norm.
-    let z_min = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
-    let z_max = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
-    let z_range = (z_max - z_min).max(1e-9); // avoid divide-by-zero on flat blocks
+    // Z range for z_norm: either a single whole-file range shared by every
+    // block (Global — the fix), or this block's own local min/max (legacy
+    // BlockMinMax, neighbour-dependent, retained for A-B comparison only).
+    let (z_min, z_range) = match z_norm_strategy {
+        ZNormalization::Global { z_min, z_max } => (z_min, (z_max - z_min).max(1e-9)),
+        ZNormalization::BlockMinMax => {
+            let lo = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+            let hi = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+            (lo, (hi - lo).max(1e-9)) // avoid divide-by-zero on flat blocks
+        }
+    };
 
     // HAG denominator (Stage 37). A fixed absolute reference preserves vertical
+
     // scale across blocks; the legacy percentile mode divides by the block's
     // own 99th-percentile HAG. Clamped > 0 to avoid divide-by-zero.
     let h_max = match hag_norm {
@@ -402,6 +500,15 @@ mod tests {
         );
     }
 
+    /// Convenience `ZNormalization::Global` built from a set of points' own
+    /// min/max — equivalent to the pre-fix behaviour for a single-block test,
+    /// but exercised through the `Global` code path rather than `BlockMinMax`.
+    fn global_from_pts(pts: &[LitePoint]) -> ZNormalization {
+        let z_min = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let z_max = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        ZNormalization::Global { z_min, z_max }
+    }
+
     #[test]
     fn test_scalar_features_range() {
         let pts = vec![
@@ -410,8 +517,16 @@ mod tests {
             make_pt(50.0, 50.0, 20.0, 65535, 2, 2),
         ];
         let hag = vec![0.0, 5.0, 10.0];
-        let feats =
-            normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag, HagNormalization::default());
+        let z_norm = global_from_pts(&pts);
+        let feats = normalise_scalar_features(
+            &pts,
+            0.0,
+            0.0,
+            50.0,
+            &hag,
+            HagNormalization::default(),
+            z_norm,
+        );
         for f in &feats {
             for &v in f {
                 assert!((0.0..=1.0).contains(&v), "feature out of [0,1]: {v}");
@@ -457,11 +572,27 @@ mod tests {
         ];
         let tall_hag = vec![1.0, 40.0];
 
-        let short_feats =
-            normalise_scalar_features(&short_block, 0.0, 0.0, 50.0, &short_hag, fixed);
-        let tall_feats = normalise_scalar_features(&tall_block, 0.0, 0.0, 50.0, &tall_hag, fixed);
+        let short_feats = normalise_scalar_features(
+            &short_block,
+            0.0,
+            0.0,
+            50.0,
+            &short_hag,
+            fixed,
+            global_from_pts(&short_block),
+        );
+        let tall_feats = normalise_scalar_features(
+            &tall_block,
+            0.0,
+            0.0,
+            50.0,
+            &tall_hag,
+            fixed,
+            global_from_pts(&tall_block),
+        );
 
         // The 1 m point (index 0) must map to the same HAG value in both blocks.
+
         assert!(
             (short_feats[0][HAG_IDX] - tall_feats[0][HAG_IDX]).abs() < 1e-6,
             "fixed-meters HAG must be neighbour-invariant: {} vs {}",
@@ -501,8 +632,24 @@ mod tests {
             tall_hag.push(frac * 40.0);
         }
 
-        let short_feats = normalise_scalar_features(&short_block, 0.0, 0.0, 50.0, &short_hag, pctl);
-        let tall_feats = normalise_scalar_features(&tall_block, 0.0, 0.0, 50.0, &tall_hag, pctl);
+        let short_feats = normalise_scalar_features(
+            &short_block,
+            0.0,
+            0.0,
+            50.0,
+            &short_hag,
+            pctl,
+            global_from_pts(&short_block),
+        );
+        let tall_feats = normalise_scalar_features(
+            &tall_block,
+            0.0,
+            0.0,
+            50.0,
+            &tall_hag,
+            pctl,
+            global_from_pts(&tall_block),
+        );
 
         assert!(
             (short_feats[0][HAG_IDX] - tall_feats[0][HAG_IDX]).abs() > 1e-3,
@@ -522,10 +669,154 @@ mod tests {
             make_pt(1.0, 1.0, 80.0, 0, 1, 1),
         ];
         let hag = vec![0.0, 80.0]; // second point is well above the 50 m reference
-        let feats = normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag, fixed);
+        let feats =
+            normalise_scalar_features(&pts, 0.0, 0.0, 50.0, &hag, fixed, global_from_pts(&pts));
         assert!(
             (feats[1][HAG_IDX] - 1.0).abs() < 1e-6,
             "HAG must clamp to 1.0"
+        );
+    }
+
+    // ── z_norm bug fix: absolute (Global) elevation normalisation ──────────
+
+    /// Core guarantee of the fix: with `ZNormalization::Global`, a point at a
+    /// fixed absolute elevation maps to the **same** `z_norm` feature value
+    /// regardless of what other elevations share its block. The legacy
+    /// `BlockMinMax` mode does **not** have this property (neighbour-dependent).
+    #[test]
+    fn test_global_z_norm_is_neighbour_invariant() {
+        const Z_NORM_IDX: usize = 2;
+        // Shared whole-file elevation range: 0.0 to 100.0.
+        let global = ZNormalization::Global {
+            z_min: 0.0,
+            z_max: 100.0,
+        };
+
+        // Two "blocks" each containing a point at absolute elevation 10.0,
+        // but with very different neighbouring elevations (max 12.0 vs 95.0).
+        let low_block = vec![
+            make_pt(0.0, 0.0, 10.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 12.0, 0, 1, 1),
+        ];
+        let low_hag = vec![0.0, 0.0];
+        let high_block = vec![
+            make_pt(0.0, 0.0, 10.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 95.0, 0, 1, 1),
+        ];
+        let high_hag = vec![0.0, 0.0];
+
+        let low_feats = normalise_scalar_features(
+            &low_block,
+            0.0,
+            0.0,
+            50.0,
+            &low_hag,
+            HagNormalization::default(),
+            global,
+        );
+        let high_feats = normalise_scalar_features(
+            &high_block,
+            0.0,
+            0.0,
+            50.0,
+            &high_hag,
+            HagNormalization::default(),
+            global,
+        );
+
+        assert!(
+            (low_feats[0][Z_NORM_IDX] - high_feats[0][Z_NORM_IDX]).abs() < 1e-6,
+            "Global z_norm must be neighbour-invariant: {} vs {}",
+            low_feats[0][Z_NORM_IDX],
+            high_feats[0][Z_NORM_IDX]
+        );
+        // And it must equal 10.0 / 100.0 = 0.1.
+        assert!((low_feats[0][Z_NORM_IDX] - 0.1).abs() < 1e-6);
+    }
+
+    /// With the legacy `BlockMinMax` mode, the same absolute elevation maps to
+    /// different `z_norm` feature values in different blocks — confirming the
+    /// pre-fix bug this test guards against a regression to.
+    #[test]
+    fn test_block_min_max_z_norm_is_neighbour_dependent() {
+        const Z_NORM_IDX: usize = 2;
+
+        // Both blocks share a point at absolute elevation 50.0 (index 0), but
+        // differ in their *other* points' elevations, which changes each
+        // block's own local z_min/z_max under BlockMinMax. Note: the shared
+        // point must NOT sit at either block's min or max, otherwise
+        // BlockMinMax would trivially normalise it to 0.0 or 1.0 in both
+        // blocks regardless of the surrounding range.
+        let low_block = vec![
+            make_pt(0.0, 0.0, 50.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 0.0, 0, 1, 1),
+            make_pt(2.0, 2.0, 100.0, 0, 1, 1),
+        ];
+        let low_hag = vec![0.0, 0.0, 0.0];
+        let high_block = vec![
+            make_pt(0.0, 0.0, 50.0, 0, 1, 1),
+            make_pt(1.0, 1.0, 0.0, 0, 1, 1),
+            make_pt(2.0, 2.0, 1000.0, 0, 1, 1),
+        ];
+        let high_hag = vec![0.0, 0.0, 0.0];
+
+        let low_feats = normalise_scalar_features(
+            &low_block,
+            0.0,
+            0.0,
+            50.0,
+            &low_hag,
+            HagNormalization::default(),
+            ZNormalization::BlockMinMax,
+        );
+        let high_feats = normalise_scalar_features(
+            &high_block,
+            0.0,
+            0.0,
+            50.0,
+            &high_hag,
+            HagNormalization::default(),
+            ZNormalization::BlockMinMax,
+        );
+
+        assert!(
+            (low_feats[0][Z_NORM_IDX] - high_feats[0][Z_NORM_IDX]).abs() > 1e-3,
+            "BlockMinMax z_norm is expected to be neighbour-dependent: {} vs {}",
+            low_feats[0][Z_NORM_IDX],
+            high_feats[0][Z_NORM_IDX]
+        );
+    }
+
+    /// Points at or above the global max saturate at 1.0; points at or below
+    /// the global min saturate at 0.0.
+    #[test]
+    fn test_global_z_norm_saturates_at_bounds() {
+        const Z_NORM_IDX: usize = 2;
+        let global = ZNormalization::Global {
+            z_min: 0.0,
+            z_max: 50.0,
+        };
+        let pts = vec![
+            make_pt(0.0, 0.0, -5.0, 0, 1, 1),  // below global min
+            make_pt(1.0, 1.0, 200.0, 0, 1, 1), // above global max
+        ];
+        let hag = vec![0.0, 0.0];
+        let feats = normalise_scalar_features(
+            &pts,
+            0.0,
+            0.0,
+            50.0,
+            &hag,
+            HagNormalization::default(),
+            global,
+        );
+        assert!(
+            (feats[0][Z_NORM_IDX] - 0.0).abs() < 1e-6,
+            "must clamp to 0.0"
+        );
+        assert!(
+            (feats[1][Z_NORM_IDX] - 1.0).abs() < 1e-6,
+            "must clamp to 1.0"
         );
     }
 

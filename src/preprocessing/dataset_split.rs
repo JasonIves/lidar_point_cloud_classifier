@@ -727,6 +727,7 @@ mod tests {
                 raw_point_count: total as usize,
                 sampled_point_count: total as usize,
                 oversampled: false,
+                n_halo: 0,
             },
             lbl_file: format!("block_{id:05}.lbl"),
             macro_tile_id,
@@ -758,6 +759,7 @@ mod tests {
                 bbox_max_x: 200.0,
                 bbox_max_y: 200.0,
             },
+            halo_fraction: 0.0,
             blocks,
         }
     }

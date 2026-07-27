@@ -269,21 +269,21 @@ pub struct BurnPointNet<B: Backend> {
     // Feature T-Net (STN64d) — optional
     pub stn64d: Option<Stn64d<B>>,
 
-    // Main encoder: [n_features → enc_dims[0] → enc_dims[1] → enc_dims[2]]
-    pub enc0: nn::Linear<B>,
-    pub bn_enc0: nn::BatchNorm<B, 1>,
-    pub enc1: nn::Linear<B>,
-    pub bn_enc1: nn::BatchNorm<B, 1>,
-    pub enc2: nn::Linear<B>,
-    pub bn_enc2: nn::BatchNorm<B, 1>,
+    // Main encoder: dynamic-length shared MLP, one (Linear, BatchNorm) pair per
+    // entry in `cfg.encoder_dims`. `encoder_layers[0]`'s output is saved as
+    // `local_feat` (the segmentation-concat's local branch); the remaining
+    // entries deepen the point-wise feature before the global max-pool.
+    // Canonical shape (Stage 43): `CANONICAL_ENCODER_DIMS` = [64, 64, 64, 128,
+    // 1024].
+    pub encoder_layers: Vec<(nn::Linear<B>, nn::BatchNorm<B, 1>)>,
 
-    // Main decoder: [concat_dim → dec_dims[0] → dec_dims[1]]
-    pub dec0: nn::Linear<B>,
-    pub bn_dec0: nn::BatchNorm<B, 1>,
-    pub dec1: nn::Linear<B>,
-    pub bn_dec1: nn::BatchNorm<B, 1>,
+    // Main decoder: dynamic-length shared MLP, one (Linear, BatchNorm) pair per
+    // entry in `cfg.decoder_dims`, consuming the segmentation-concat
+    // (`local_feat ++ global`, width `cfg.concat_dim()`). Canonical shape
+    // (Stage 43): `CANONICAL_DECODER_DIMS` = [512, 256].
+    pub decoder_layers: Vec<(nn::Linear<B>, nn::BatchNorm<B, 1>)>,
 
-    // Final projection: dec_dims.last() → n_classes (no BN)
+    // Final projection: decoder_dims.last() → n_classes (no BN)
     pub proj: nn::Linear<B>,
 }
 
@@ -291,27 +291,49 @@ impl<B: Backend> BurnPointNet<B> {
     /// Construct a new model from a `PointNetConfig`.
     ///
     /// # Errors
-    /// Returns an error if the config dims are invalid (e.g. fewer than 3 encoder dims).
+    /// Returns an error if the config dims are invalid (empty `encoder_dims`
+    /// or `decoder_dims`).
     ///
     /// # Panics
     /// Never panics: the `dd.last().unwrap()` call below is guarded by the
-    /// `cfg.decoder_dims.len() < 2` check just above, so `dd` always has at
+    /// `cfg.decoder_dims.is_empty()` check just above, so `dd` always has at
     /// least one element by the time `.last()` is called.
     pub fn new(cfg: &PointNetConfig, device: &B::Device) -> Result<Self> {
-        if cfg.encoder_dims.len() < 3 {
+        if cfg.encoder_dims.is_empty() {
             return Err(ClassifierError::Pipeline(
-                "BurnPointNet requires at least 3 encoder_dims".into(),
+                "BurnPointNet requires at least 1 encoder_dims entry".into(),
             ));
         }
-        if cfg.decoder_dims.len() < 2 {
+        if cfg.decoder_dims.is_empty() {
             return Err(ClassifierError::Pipeline(
-                "BurnPointNet requires at least 2 decoder_dims".into(),
+                "BurnPointNet requires at least 1 decoder_dims entry".into(),
             ));
         }
 
-        let ed = &cfg.encoder_dims;
         let dd = &cfg.decoder_dims;
-        let concat_dim = cfg.concat_dim(); // ed[0] + ed.last()
+        let concat_dim = cfg.concat_dim(); // encoder_dims[0] + encoder_dims.last()
+
+        // Use cfg.n_features_in so multi-scale feature counts (Stage 06) are
+        // correctly wired into the first encoder layer.
+        let mut encoder_layers = Vec::with_capacity(cfg.encoder_dims.len());
+        let mut prev = cfg.n_features_in;
+        for &dim in &cfg.encoder_dims {
+            encoder_layers.push((
+                LinearConfig::new(prev, dim).init(device),
+                BatchNormConfig::new(dim).init(device),
+            ));
+            prev = dim;
+        }
+
+        let mut decoder_layers = Vec::with_capacity(dd.len());
+        let mut prev = concat_dim;
+        for &dim in dd {
+            decoder_layers.push((
+                LinearConfig::new(prev, dim).init(device),
+                BatchNormConfig::new(dim).init(device),
+            ));
+            prev = dim;
+        }
 
         Ok(Self {
             stn3d: Stn3d::new(device),
@@ -320,21 +342,8 @@ impl<B: Backend> BurnPointNet<B> {
             } else {
                 None
             },
-
-            // Use cfg.n_features_in so multi-scale feature counts (Stage 06) are
-            // correctly wired into the first encoder layer.
-            enc0: LinearConfig::new(cfg.n_features_in, ed[0]).init(device),
-            bn_enc0: BatchNormConfig::new(ed[0]).init(device),
-            enc1: LinearConfig::new(ed[0], ed[1]).init(device),
-            bn_enc1: BatchNormConfig::new(ed[1]).init(device),
-            enc2: LinearConfig::new(ed[1], ed[2]).init(device),
-            bn_enc2: BatchNormConfig::new(ed[2]).init(device),
-
-            dec0: LinearConfig::new(concat_dim, dd[0]).init(device),
-            bn_dec0: BatchNormConfig::new(dd[0]).init(device),
-            dec1: LinearConfig::new(dd[0], dd[1]).init(device),
-            bn_dec1: BatchNormConfig::new(dd[1]).init(device),
-
+            encoder_layers,
+            decoder_layers,
             proj: LinearConfig::new(*dd.last().unwrap(), cfg.n_classes).init(device),
         })
     }
@@ -360,9 +369,10 @@ impl<B: Backend> BurnPointNet<B> {
         let input = Tensor::cat(vec![xyz_new, rest], 1); // [N, n_feat]
 
         // ── Encoder Layer 0 (save as local_feat) ──────────────────────────
+        let (lin0, bn0) = &self.encoder_layers[0];
         let local_feat = {
-            let h = self.enc0.forward(input); // [N, 64]
-            let h = apply_bn2d(h, &self.bn_enc0);
+            let h = lin0.forward(input); // [N, encoder_dims[0]]
+            let h = apply_bn2d(h, bn0);
             h.clamp_min(0.0)
         };
 
@@ -375,32 +385,30 @@ impl<B: Backend> BurnPointNet<B> {
         };
 
         // ── Encoder Layers 1+ ─────────────────────────────────────────────
-        let h = self.enc1.forward(local_feat.clone()); // [N, 128]
-        let h = apply_bn2d(h, &self.bn_enc1);
-        let h = h.clamp_min(0.0);
-
-        let h = self.enc2.forward(h); // [N, 256]
-        let h = apply_bn2d(h, &self.bn_enc2);
-        let h = h.clamp_min(0.0);
+        let mut deep = local_feat.clone();
+        for (lin, bn) in self.encoder_layers.iter().skip(1) {
+            let h = lin.forward(deep);
+            let h = apply_bn2d(h, bn);
+            deep = h.clamp_min(0.0);
+        }
 
         // ── Global Max Pool ────────────────────────────────────────────────
         // burn-ndarray 0.16 gather constraint: indices can only differ from the
         // source tensor in the LAST dimension.  max_dim(0) on [N, C] (C≠N) violates
         // this.  Workaround: transpose to [C, N], max over last dim (N) → [C, 1],
         // transpose back → [1, C], then broadcast to [N, C] with repeat_dim.
-        let global = h.transpose().max_dim(1).transpose().repeat_dim(0, n); // [N, 256]
+        let global = deep.transpose().max_dim(1).transpose().repeat_dim(0, n); // [N, encoder_dims.last()]
 
         // ── Segmentation Concat ───────────────────────────────────────────
-        let combined = Tensor::cat(vec![local_feat, global], 1); // [N, 320]
+        let combined = Tensor::cat(vec![local_feat, global], 1); // [N, concat_dim]
 
         // ── Decoder ───────────────────────────────────────────────────────
-        let h = self.dec0.forward(combined); // [N, 256]
-        let h = apply_bn2d(h, &self.bn_dec0);
-        let h = h.clamp_min(0.0);
-
-        let h = self.dec1.forward(h); // [N, 128]
-        let h = apply_bn2d(h, &self.bn_dec1);
-        let h = h.clamp_min(0.0);
+        let mut h = combined;
+        for (lin, bn) in &self.decoder_layers {
+            let hh = lin.forward(h);
+            let hh = apply_bn2d(hh, bn);
+            h = hh.clamp_min(0.0);
+        }
 
         self.proj.forward(h) // [N, n_classes]
     }
@@ -427,9 +435,10 @@ impl<B: Backend> BurnPointNet<B> {
         let input = Tensor::cat(vec![xyz_new, rest], 2); // [B, N, n_feat]
 
         // ── Encoder Layer 0 (save as local_feat) ──────────────────────────
+        let (lin0, bn0) = &self.encoder_layers[0];
         let local_feat = {
-            let h = self.enc0.forward(input); // [B, N, 64]
-            let h = apply_bn3d(h, &self.bn_enc0);
+            let h = lin0.forward(input); // [B, N, encoder_dims[0]]
+            let h = apply_bn3d(h, bn0);
             h.clamp_min(0.0)
         };
 
@@ -442,30 +451,28 @@ impl<B: Backend> BurnPointNet<B> {
         };
 
         // ── Encoder Layers 1+ ─────────────────────────────────────────────
-        let h = self.enc1.forward(local_feat.clone()); // [B, N, 128]
-        let h = apply_bn3d(h, &self.bn_enc1);
-        let h = h.clamp_min(0.0);
-
-        let h = self.enc2.forward(h); // [B, N, 256]
-        let h = apply_bn3d(h, &self.bn_enc2);
-        let h = h.clamp_min(0.0);
+        let mut deep = local_feat.clone();
+        for (lin, bn) in self.encoder_layers.iter().skip(1) {
+            let h = lin.forward(deep);
+            let h = apply_bn3d(h, bn);
+            deep = h.clamp_min(0.0);
+        }
 
         // ── Per-sample Global Max Pool ─────────────────────────────────────
-        // [B, N, 256] → transpose → [B, 256, N] → max over last dim (N) →
-        // [B, 256, 1] → transpose → [B, 1, 256] → broadcast to [B, N, 256].
-        let global = h.transpose().max_dim(2).transpose().repeat_dim(1, n); // [B, N, 256]
+        // [B, N, C] → transpose → [B, C, N] → max over last dim (N) →
+        // [B, C, 1] → transpose → [B, 1, C] → broadcast to [B, N, C].
+        let global = deep.transpose().max_dim(2).transpose().repeat_dim(1, n); // [B, N, encoder_dims.last()]
 
         // ── Segmentation Concat ───────────────────────────────────────────
-        let combined = Tensor::cat(vec![local_feat, global], 2); // [B, N, 320]
+        let combined = Tensor::cat(vec![local_feat, global], 2); // [B, N, concat_dim]
 
         // ── Decoder ───────────────────────────────────────────────────────
-        let h = self.dec0.forward(combined); // [B, N, 256]
-        let h = apply_bn3d(h, &self.bn_dec0);
-        let h = h.clamp_min(0.0);
-
-        let h = self.dec1.forward(h); // [B, N, 128]
-        let h = apply_bn3d(h, &self.bn_dec1);
-        let h = h.clamp_min(0.0);
+        let mut h = combined;
+        for (lin, bn) in &self.decoder_layers {
+            let hh = lin.forward(h);
+            let hh = apply_bn3d(hh, bn);
+            h = hh.clamp_min(0.0);
+        }
 
         self.proj.forward(h) // [B, N, n_classes]
     }
@@ -573,6 +580,7 @@ fn identity_2d<B: Backend>(k: usize, device: &B::Device) -> Tensor<B, 2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::pointnet::{CANONICAL_DECODER_DIMS, CANONICAL_ENCODER_DIMS};
     use crate::preprocessing::N_FEATURES;
     use burn::backend::NdArray;
 
@@ -581,8 +589,8 @@ mod tests {
     fn default_cfg() -> PointNetConfig {
         PointNetConfig {
             n_features_in: N_FEATURES,
-            encoder_dims: vec![64, 128, 256],
-            decoder_dims: vec![256, 128],
+            encoder_dims: CANONICAL_ENCODER_DIMS.to_vec(),
+            decoder_dims: CANONICAL_DECODER_DIMS.to_vec(),
             n_classes: 8,
             use_batch_norm: true,
             use_input_tnet: true,

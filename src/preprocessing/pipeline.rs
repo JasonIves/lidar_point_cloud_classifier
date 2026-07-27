@@ -32,7 +32,7 @@ use crate::preprocessing::{
     block_partitioner::{BlockPartitioner, BlockStub},
     feature_extractor::extract_features,
     lite_point::LitePoint,
-    normalizer::{resample_block, DtmView},
+    normalizer::{resample_block, sample_halo, DtmView, ZNormalization},
     PreprocessConfig, FEAT_MAGIC, FEAT_VERSION, RAYON_MIN_CHUNK,
 };
 
@@ -79,6 +79,15 @@ pub struct BlockManifest {
     pub block_overlap: f64,
     #[serde(default)]
     pub oversample_jitter: f64,
+    /// Whether the legacy per-block `z_norm` normalisation was used instead
+    /// of the default whole-file absolute range (z_norm bug fix, Stage 37
+    /// follow-up). `false` (default) means the fixed/global mode was used.
+    #[serde(default)]
+    pub z_norm_use_block_relative: bool,
+    /// Halo budget fraction φ used for this run (Stage 45). `0.0` (default,
+    /// backward-compatible) means no halo rows were written.
+    #[serde(default)]
+    pub halo_fraction: f64,
     pub blocks: Vec<BlockMeta>,
 }
 
@@ -109,6 +118,11 @@ pub struct BlockMeta {
     pub raw_point_count: usize,
     pub sampled_point_count: usize,
     pub oversampled: bool,
+    /// Number of trailing rows in the `.feat` payload that are halo
+    /// (overlap-margin) samples rather than canonical core samples
+    /// (Stage 45). `0` (default, backward-compatible) = all-core block.
+    #[serde(default)]
+    pub n_halo: usize,
 }
 
 /// Internal per-block processing result that also carries the sampling indices.
@@ -120,8 +134,13 @@ pub struct BlockProcessResult {
     /// Public metadata (serialised to `blocks.json`).
     pub meta: BlockMeta,
     /// 0-based indices into the raw per-block `Vec<PointRecord>` for each
-    /// sampled output point row.  Length equals `meta.sampled_point_count`.
+    /// sampled output **core** point row.  Length equals
+    /// `meta.sampled_point_count − meta.n_halo`.
     pub sampled_indices: Vec<usize>,
+    /// Raw ASPRS classification bytes of the halo rows (Stage 45), in the
+    /// same order as the `.feat` halo rows.  Populated only when
+    /// `capture_indices` is true (labeled pipeline); empty otherwise.
+    pub halo_classifications: Vec<u8>,
 }
 
 /// The main preprocessing pipeline.
@@ -204,8 +223,22 @@ impl PreprocessingPipeline {
         // point count, so the single `inspect_lidar_header` call is shared by
         // both Step 1c and the grid-geometry computation that follows —
         // avoiding a second, redundant header read.
-        let (x_min, y_min, x_max, y_max, total_points, crs_epsg) =
+        let (x_min, y_min, x_max, y_max, z_min, z_max, total_points, crs_epsg) =
             inspect_lidar_header(input_path)?;
+
+        // ── Z-normalisation strategy resolution (z_norm bug fix, Stage 37
+        //    follow-up) ────────────────────────────────────────────────────
+        // Resolved once here, from the header's whole-file z bounds, so
+        // every block uses the same absolute reference regardless of which
+        // tile a point lands in — the fix for the "patchwork quilt"
+        // tile-boundary discontinuity caused by the legacy per-block
+        // z_norm behaviour. `--z-norm-block-relative` opts back into the
+        // legacy neighbour-dependent mode for reproducibility/comparison.
+        let z_norm_strategy: ZNormalization = if config.z_norm_use_block_relative {
+            ZNormalization::BlockMinMax
+        } else {
+            ZNormalization::Global { z_min, z_max }
+        };
 
         // ── 1c. Eigenvalue-feature pre-pass (Stage 30, Step 5b/5c/5d) ───────────────
         // Runs `wbtools_oss::LidarEigenvalueFeaturesTool` once over the whole
@@ -411,11 +444,11 @@ impl PreprocessingPipeline {
                 // peak memory stays at (thread_count × largest_block_size).
                 let block = stub.load()?;
 
-                // (a) Load border points from the pre-written spill file (if any),
-                //     then delete the file immediately to free disk space.
-                //     When overlap is disabled, `border_path` is None and no I/O
-                //     occurs here.
-                let border_pts: Vec<LitePoint> = match border_path {
+                // (a) Load border points (index-carrying pairs) from the
+                //     pre-written spill file (if any), then delete the file
+                //     immediately to free disk space.  When overlap is
+                //     disabled, `border_path` is None and no I/O occurs here.
+                let border_pts: Vec<(u64, LitePoint)> = match border_path {
                     Some(ref p) => {
                         let pts = read_border_spill(p)?;
                         let _ = fs::remove_file(p);
@@ -424,29 +457,56 @@ impl PreprocessingPipeline {
                     None => Vec::new(),
                 };
 
-                // Border points are context-only, used exclusively for the
-                // (now-removed) local k-d-tree eigenvalue computation. Since
-                // eigenvalue features come from the whole-file pre-pass table
-                // instead (Stage 30, Step 5e+5f+5g), border points no longer
-                // serve any purpose in feature extraction — they are dropped
-                // immediately without being merged into a context buffer or
-                // used to build a spatial index.
+                // (b) Halo sampling (Stage 45): reserve `n_halo_target` rows of
+                //     the fixed-N tensor for points sampled from the border
+                //     strip (subsample-only, never oversampled, never jittered
+                //     — duplicates add no cross-boundary context).  When the
+                //     strip is sparse (or absent, e.g. dataset-boundary
+                //     blocks), all available halo points are taken and the
+                //     core sample backfills the remainder, so the tensor is
+                //     always exactly `target_points` rows.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_precision_loss,
+                    clippy::cast_sign_loss
+                )]
+                let n_halo_target =
+                    (config.halo_fraction * config.target_points as f64).round() as usize;
+                let halo_pts: Vec<(u64, LitePoint)> = if n_halo_target > 0 {
+                    sample_halo(&border_pts, n_halo_target, block_id)
+                } else {
+                    Vec::new()
+                };
+                let n_halo = halo_pts.len();
+                // The border strip is no longer needed once the halo sample
+                // is drawn — free it before the larger allocations below.
                 drop(border_pts);
 
-                // (c) Density-gated sampling — canonical points only.
-                let (sampled, sampled_indices, oversampled) = resample_block(
+                // (c) Density-gated core sampling to `target_points − n_halo`
+                //     (one seeded call, computed after halo actuals are
+                //     known; with `halo_fraction == 0` this degenerates to
+                //     the pre-Stage-45 full-N core sample, bit-identical).
+                let core_target = config.target_points.saturating_sub(n_halo);
+                let (core_sampled, sampled_indices, oversampled) = resample_block(
                     &block.points,
-                    config.target_points,
+                    core_target,
                     block_id,
                     config.oversample_jitter,
                 );
 
+                // Combined row layout written to the .feat payload:
+                // [core rows | halo rows].
+                let mut sampled: Vec<LitePoint> = core_sampled;
+                sampled.extend(halo_pts.iter().map(|&(_, pt)| pt));
                 let sampled_count = sampled.len();
 
-                // (d) Look up each sampled point's precomputed eigenvalue row
-                //     from the whole-file pre-pass table via its original
-                //     stream index (`block.point_indices[sampled_idx]`).
-                let eigen_rows: Vec<[f32; 10]> = sampled_indices
+                // (d) Look up each row's precomputed eigenvalue row from the
+                //     whole-file pre-pass table via its original stream
+                //     index — core rows via `block.point_indices[sampled_idx]`
+                //     (existing join), halo rows via the index carried in the
+                //     border spill record (identical join, identical
+                //     zero-row fallback for a table miss).
+                let mut eigen_rows: Vec<[f32; 10]> = sampled_indices
                     .iter()
                     .map(|&sampled_idx| {
                         // On 32-bit targets a `u64` point index could in principle
@@ -459,6 +519,10 @@ impl PreprocessingPipeline {
                         eigen_table.get(point_idx).copied().unwrap_or([0.0f32; 10])
                     })
                     .collect();
+                eigen_rows.extend(halo_pts.iter().map(|&(original_idx, _)| {
+                    let point_idx = usize::try_from(original_idx).unwrap_or(usize::MAX);
+                    eigen_table.get(point_idx).copied().unwrap_or([0.0f32; 10])
+                }));
 
                 // (e–f) Extract full feature vectors: scalar (from `sampled`)
                 //     combined with the precomputed eigenvalue rows above.
@@ -470,10 +534,11 @@ impl PreprocessingPipeline {
                     origin_y,
                     config.block_size,
                     config.hag_normalization,
+                    z_norm_strategy,
                 );
                 let n_features = features.first().map_or(0, Vec::len);
 
-                // (g) Serialise to .feat
+                // (g) Serialise to .feat (v2 header records the halo row count)
                 let feat_filename = format!("block_{block_id:05}.feat");
                 let feat_path = config.output_dir.join(&feat_filename);
                 write_feat_file(
@@ -481,6 +546,7 @@ impl PreprocessingPipeline {
                     block_id,
                     sampled_count,
                     n_features,
+                    n_halo,
                     origin_x,
                     origin_y,
                     &features,
@@ -500,11 +566,18 @@ impl PreprocessingPipeline {
                     raw_point_count: raw_count,
                     sampled_point_count: sampled_count,
                     oversampled,
+                    n_halo,
                 };
 
-                // Only allocate the indices vec when caller wants them.
+                // Only allocate the indices/classifications vecs when the
+                // caller wants them (labeled pipeline).
                 let indices = if capture_indices {
                     sampled_indices
+                } else {
+                    Vec::new()
+                };
+                let halo_classes: Vec<u8> = if capture_indices {
+                    halo_pts.iter().map(|&(_, pt)| pt.classification).collect()
                 } else {
                     Vec::new()
                 };
@@ -512,6 +585,7 @@ impl PreprocessingPipeline {
                 Ok(BlockProcessResult {
                     meta,
                     sampled_indices: indices,
+                    halo_classifications: halo_classes,
                 })
             })
             .collect();
@@ -547,6 +621,8 @@ impl PreprocessingPipeline {
             outlier_use_median: config.outlier_use_median,
             block_overlap: config.block_overlap,
             oversample_jitter: config.oversample_jitter,
+            z_norm_use_block_relative: config.z_norm_use_block_relative,
+            halo_fraction: config.halo_fraction,
             blocks: block_metas,
         };
 
@@ -588,7 +664,8 @@ impl PreprocessingPipeline {
 /// For both LAS and LAZ, the LAS header lives at the start of the file and is
 /// read via `LasReader::new` (no points are decoded).  For COPC, the dedicated
 /// `CopcReader::open_path` is used.
-fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, u64, Option<u32>)> {
+#[allow(clippy::type_complexity)]
+fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, f64, f64, u64, Option<u32>)> {
     use std::fs::File;
     use std::io::BufReader;
     use wblidar::las::LasReader;
@@ -607,7 +684,16 @@ fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, u64, Option<
             let reader = LasReader::new(BufReader::new(f))?;
             let h = reader.header();
             let epsg = reader.crs().and_then(|c| c.epsg);
-            Ok((h.min_x, h.min_y, h.max_x, h.max_y, h.point_count(), epsg))
+            Ok((
+                h.min_x,
+                h.min_y,
+                h.max_x,
+                h.max_y,
+                h.min_z,
+                h.max_z,
+                h.point_count(),
+                epsg,
+            ))
         }
         "copc" => {
             // COPC files carry a standard LAS header; use LasReader for header
@@ -616,7 +702,16 @@ fn inspect_lidar_header(path: &Path) -> Result<(f64, f64, f64, f64, u64, Option<
             let reader = LasReader::new(BufReader::new(f))?;
             let h = reader.header();
             let epsg = reader.crs().and_then(|c| c.epsg);
-            Ok((h.min_x, h.min_y, h.max_x, h.max_y, h.point_count(), epsg))
+            Ok((
+                h.min_x,
+                h.min_y,
+                h.max_x,
+                h.max_y,
+                h.min_z,
+                h.max_z,
+                h.point_count(),
+                epsg,
+            ))
         }
         _ => Err(ClassifierError::UnsupportedFormat {
             path: path.display().to_string(),
@@ -1314,49 +1409,56 @@ fn read_eigen_file(path: &Path, expected_points: u64) -> Result<Vec<[f32; 10]>> 
     Ok(table)
 }
 
-// ── Border-point spill I/O (Stage 08) ────────────────────────────────────────
+// ── Border-point spill I/O (Stage 08, index-carrying as of Stage 45) ─────────
 
 //
 // Border points are written to `.border` files using the same compact binary
-// layout as the main `.spill` files (31 bytes per point).  This keeps the
-// format consistent and avoids introducing a new serialisation dependency.
+// layout as the main `.spill` files (39 bytes per point: u64 original-file
+// stream index + the 31-byte LitePoint record).  This is an internal
+// temporary format (written and deleted within a single run), so upgrading
+// it from the pre-Stage-45 31-byte layout requires no migration path.
+//
+// The original index is required to join halo rows against the whole-file
+// eigenvalue pre-pass table (Stage 45 — the same join used for canonical
+// points in Step 7d).
 //
 // Layout per point (little-endian):
-//   x(f64) y(f64) z(f64) intensity(u16) classification(u8)
-//   return_number(u8) number_of_returns(u8) scan_angle(i16) = 31 bytes
+//   original_index(u64) x(f64) y(f64) z(f64) intensity(u16) classification(u8)
+//   return_number(u8) number_of_returns(u8) scan_angle(i16) = 39 bytes
 
 /// Bytes per point in a border spill file — identical to the main spill format.
-const BORDER_PT_BYTES: usize = 31;
+const BORDER_PT_BYTES: usize = 39;
 
-/// Write a slice of `LitePoint`s to a `.border` spill file.
+/// Write a slice of `(original_index, LitePoint)` pairs to a `.border` spill file.
 ///
 /// # Errors
 /// Returns `ClassifierError` on any I/O failure.
-fn write_border_spill(path: &Path, pts: &[LitePoint]) -> Result<()> {
+fn write_border_spill(path: &Path, pts: &[(u64, LitePoint)]) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     let mut buf = [0u8; BORDER_PT_BYTES];
-    for pt in pts {
-        buf[0..8].copy_from_slice(&pt.x.to_le_bytes());
-        buf[8..16].copy_from_slice(&pt.y.to_le_bytes());
-        buf[16..24].copy_from_slice(&pt.z.to_le_bytes());
-        buf[24..26].copy_from_slice(&pt.intensity.to_le_bytes());
-        buf[26] = pt.classification;
-        buf[27] = pt.return_number;
-        buf[28] = pt.number_of_returns;
-        buf[29..31].copy_from_slice(&pt.scan_angle.to_le_bytes());
+    for (idx, pt) in pts {
+        buf[0..8].copy_from_slice(&idx.to_le_bytes());
+        buf[8..16].copy_from_slice(&pt.x.to_le_bytes());
+        buf[16..24].copy_from_slice(&pt.y.to_le_bytes());
+        buf[24..32].copy_from_slice(&pt.z.to_le_bytes());
+        buf[32..34].copy_from_slice(&pt.intensity.to_le_bytes());
+        buf[34] = pt.classification;
+        buf[35] = pt.return_number;
+        buf[36] = pt.number_of_returns;
+        buf[37..39].copy_from_slice(&pt.scan_angle.to_le_bytes());
         writer.write_all(&buf)?;
     }
     writer.flush()?;
     Ok(())
 }
 
-/// Read a `.border` spill file back into a `Vec<LitePoint>`.
+/// Read a `.border` spill file back into a `Vec<(original_index, LitePoint)>`.
 ///
 /// # Errors
 /// Returns [`ClassifierError::SpillCorrupt`] if the file size is not a
 /// multiple of `BORDER_PT_BYTES` or if any read fails.
-fn read_border_spill(path: &Path) -> Result<Vec<LitePoint>> {
+fn read_border_spill(path: &Path) -> Result<Vec<(u64, LitePoint)>> {
     let metadata = fs::metadata(path).map_err(|_| ClassifierError::SpillCorrupt {
         path: path.display().to_string(),
     })?;
@@ -1376,43 +1478,49 @@ fn read_border_spill(path: &Path) -> Result<Vec<LitePoint>> {
         let corrupt = || ClassifierError::SpillCorrupt {
             path: path.display().to_string(),
         };
+        let idx = u64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?);
         let pt = LitePoint {
-            x: f64::from_le_bytes(buf[0..8].try_into().map_err(|_| corrupt())?),
-            y: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
-            z: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
-            intensity: u16::from_le_bytes(buf[24..26].try_into().map_err(|_| corrupt())?),
-            classification: buf[26],
-            return_number: buf[27],
-            number_of_returns: buf[28],
-            scan_angle: i16::from_le_bytes(buf[29..31].try_into().map_err(|_| corrupt())?),
+            x: f64::from_le_bytes(buf[8..16].try_into().map_err(|_| corrupt())?),
+            y: f64::from_le_bytes(buf[16..24].try_into().map_err(|_| corrupt())?),
+            z: f64::from_le_bytes(buf[24..32].try_into().map_err(|_| corrupt())?),
+            intensity: u16::from_le_bytes(buf[32..34].try_into().map_err(|_| corrupt())?),
+            classification: buf[34],
+            return_number: buf[35],
+            number_of_returns: buf[36],
+            scan_angle: i16::from_le_bytes(buf[37..39].try_into().map_err(|_| corrupt())?),
         };
-        pts.push(pt);
+        pts.push((idx, pt));
     }
     Ok(pts)
 }
 
 // ── Output serialisation helpers ──────────────────────────────────────────────
 
-/// Write a `.feat` binary block file.
+/// Write a `.feat` binary block file (format v2, Stage 45).
 ///
 /// ## File layout
 /// ```text
-/// [header — 37 bytes]
+/// [header — 41 bytes]                 (v1 was 37 bytes, all-core rows)
 ///   magic:      4 bytes  = b"WBFT"
-///   version:    u8       = 1
-///   n_points:   u32 LE
-///   n_features: u32 LE  (7 + 5 × n_radii)
+///   version:    u8       = 2
+///   n_points:   u32 LE  (= target_points N, core + halo)
+///   n_features: u32 LE  (= 17)
 ///   block_id:   u64 LE
 ///   origin_x:   f64 LE
 ///   origin_y:   f64 LE
+///   n_halo:     u32 LE  (trailing rows that are halo samples; 0 = all-core)
 /// [data]
 ///   f32[n_points × n_features]  row-major, little-endian
+///   rows [0 .. n_points − n_halo)        = core sampled points
+///   rows [n_points − n_halo .. n_points) = halo (overlap-margin) samples
 /// ```
+#[allow(clippy::too_many_arguments)] // flat (path, header fields, payload) write signature
 fn write_feat_file(
     path: &Path,
     block_id: u64,
     n_points: usize,
     n_features: usize,
+    n_halo: usize,
     origin_x: f64,
     origin_y: f64,
     features: &[Vec<f32>],
@@ -1430,6 +1538,8 @@ fn write_feat_file(
     w.write_all(&block_id.to_le_bytes())?;
     w.write_all(&origin_x.to_le_bytes())?;
     w.write_all(&origin_y.to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    w.write_all(&(n_halo as u32).to_le_bytes())?;
 
     // Data — write each row as raw f32 bytes
     for row in features {
@@ -1489,8 +1599,11 @@ fn write_debug_csv(path: &Path, features: &[Vec<f32>]) -> Result<()> {
 ///
 /// This function is called **sequentially** before the Rayon parallel phase so
 /// that all spill files are guaranteed to exist (no concurrent `load()` calls
-/// have deleted them yet).  The returned `Vec<LitePoint>` is written to a
-/// `.border` spill file by the caller; it is not held in memory across blocks.
+/// have deleted them yet).  The returned `Vec<(u64, LitePoint)>` pairs
+/// (original-file stream index + point) are written to a `.border` spill file
+/// by the caller; they are not held in memory across blocks.  The index is
+/// required to join halo rows against the whole-file eigenvalue pre-pass
+/// table (Stage 45).
 ///
 /// Points that belong to the target block itself are not included — only
 /// genuine cross-boundary neighbours are returned.
@@ -1500,14 +1613,14 @@ fn load_border_points(
     target: &BlockStub,
     block_size: f64,
     overlap: f64,
-) -> Result<Vec<LitePoint>> {
+) -> Result<Vec<(u64, LitePoint)>> {
     // Expanded bounding box of the target block in projection units.
     let x_lo = target.origin_x - overlap;
     let x_hi = target.origin_x + block_size + overlap;
     let y_lo = target.origin_y - overlap;
     let y_hi = target.origin_y + block_size + overlap;
 
-    let mut border: Vec<LitePoint> = Vec::new();
+    let mut border: Vec<(u64, LitePoint)> = Vec::new();
 
     // Iterate over all 8 cardinal + diagonal neighbours.
     for dc in -1_i32..=1 {
@@ -1518,12 +1631,13 @@ fn load_border_points(
             let key = (target.col + dc, target.row + dr);
             if let Some(&idx) = stubs_by_cell.get(&key) {
                 let neighbour = &all_stubs[idx];
-                // Read neighbour spill files without deleting them.
-                let pts = neighbour.read_points()?;
-                for pt in pts {
+                // Read neighbour spill files (with original indices) without
+                // deleting them.
+                let pts = neighbour.read_points_indexed()?;
+                for (orig_idx, pt) in pts {
                     // Keep only points that fall inside the expanded bbox.
                     if pt.x >= x_lo && pt.x <= x_hi && pt.y >= y_lo && pt.y <= y_hi {
-                        border.push(pt);
+                        border.push((orig_idx, pt));
                     }
                 }
             }
@@ -1563,6 +1677,8 @@ mod tests {
             outlier_use_median: false,
             block_overlap: 12.5,
             oversample_jitter: 0.0,
+            z_norm_use_block_relative: false,
+            halo_fraction: 0.25,
             blocks: vec![],
         };
 
@@ -1650,22 +1766,31 @@ mod tests {
     // Test fixture field generation from a small index range (0..20); all
     // casts here operate on small non-negative values well within the target
     // types' ranges, so truncation/sign-loss is not a real concern.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     #[test]
     fn test_border_spill_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.border");
 
-        let pts: Vec<LitePoint> = (0..20)
-            .map(|i| LitePoint {
-                x: f64::from(i) * 1.5,
-                y: f64::from(i) * 0.7,
-                z: f64::from(i) * 0.3,
-                intensity: (i * 1000) as u16,
-                classification: (i % 8) as u8,
-                return_number: 1,
-                number_of_returns: 2,
-                scan_angle: (i as i16) - 10,
+        let pts: Vec<(u64, LitePoint)> = (0..20u64)
+            .map(|i| {
+                (
+                    i,
+                    LitePoint {
+                        x: i as f64 * 1.5,
+                        y: i as f64 * 0.7,
+                        z: i as f64 * 0.3,
+                        intensity: (i * 1000) as u16,
+                        classification: (i % 8) as u8,
+                        return_number: 1,
+                        number_of_returns: 2,
+                        scan_angle: (i as i16) - 10,
+                    },
+                )
             })
             .collect();
 
@@ -1673,7 +1798,8 @@ mod tests {
         let recovered = read_border_spill(&path).unwrap();
 
         assert_eq!(recovered.len(), pts.len(), "point count must match");
-        for (a, b) in pts.iter().zip(recovered.iter()) {
+        for ((idx_a, a), (idx_b, b)) in pts.iter().zip(recovered.iter()) {
+            assert_eq!(idx_a, idx_b, "original index must survive round trip");
             assert!((a.x - b.x).abs() < 1e-12, "x mismatch");
             assert!((a.y - b.y).abs() < 1e-12, "y mismatch");
             assert!((a.z - b.z).abs() < 1e-12, "z mismatch");

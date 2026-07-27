@@ -4,14 +4,14 @@
 //! Architecture (Qi et al. 2017 scene segmentation variant):
 //!
 //! ```text
-//! Input N×12
+//! Input N×17
 //!   → Input T-Net (STN3d, applied to xyz cols 0-2)
-//!   → Encoder Layer 0: Linear(12→64) + BN + ReLU  ← save as `local_feat`
+//!   → Encoder Layer 0: Linear(17→64) + BN + ReLU  ← save as `local_feat`
 //!   → Feature T-Net (STN64d, optional, applied to local_feat)
-//!   → Encoder Layers 1+: Linear(64→128→256)
-//!   → Global max pool over N → broadcast [N×256]
-//!   → Concat(local_feat[N×64], global[N×256]) = N×320
-//!   → Decoder: Linear(320→256→128→n_classes)
+//!   → Encoder Layers 1+: Linear(64→64→64→128→1024)
+//!   → Global max pool over N → broadcast [N×1024]
+//!   → Concat(local_feat[N×64], global[N×1024]) = N×1088
+//!   → Decoder: Linear(1088→512→256→n_classes)
 //!   → Argmax → ASPRS label via label_map
 //! ```
 
@@ -19,6 +19,25 @@ use ndarray::{s, Array2, Axis};
 
 use crate::error::{ClassifierError, Result};
 use crate::model::layers::{apply_bn2d, global_max_pool, relu, BatchNorm1d, Linear, TNet};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Canonical architecture constants (Stage 43)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Canonical `PointNet` (Qi et al. 2017) main-encoder hidden dims.
+///
+/// `encoder_dims[0]` (64) is the "local feature" width used in the
+/// segmentation concat; `encoder_dims.last()` (1024) is the global
+/// descriptor width. This is the single source of truth for the main
+/// encoder shape — all production and test call sites should construct
+/// their `encoder_dims` from this constant (via `.to_vec()`) rather than
+/// duplicating the literal, per Stage 43.
+pub const CANONICAL_ENCODER_DIMS: [usize; 5] = [64, 64, 64, 128, 1024];
+
+/// Canonical `PointNet` (Qi et al. 2017) main-decoder hidden dims (before the
+/// final class-projection layer). Single source of truth; see
+/// [`CANONICAL_ENCODER_DIMS`].
+pub const CANONICAL_DECODER_DIMS: [usize; 2] = [512, 256];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Architecture configuration
@@ -265,6 +284,14 @@ mod tests {
         }
     }
 
+    // DoD #5 (Stage 43) — canonical dimension constants have the exact
+    // expected values.
+    #[test]
+    fn test_canonical_dims_constants_values() {
+        assert_eq!(CANONICAL_ENCODER_DIMS, [64, 64, 64, 128, 1024]);
+        assert_eq!(CANONICAL_DECODER_DIMS, [512, 256]);
+    }
+
     // DoD #11 — forward output shape with input T-Net disabled
     #[test]
     fn test_forward_output_shape_no_tnet() {
@@ -318,6 +345,26 @@ mod tests {
 
         let input = Array2::<f32>::zeros((1024, 12));
         let logits = clf.forward(input).expect("forward with T-Nets failed");
+        assert_eq!(logits.shape(), &[1024, 8]);
+    }
+
+    // DoD #8 (Stage 43) — forward pass with the literal canonical constants
+    // (N_FEATURES=17, CANONICAL_ENCODER_DIMS, CANONICAL_DECODER_DIMS) on a
+    // [1024, 17] input produces output shape [1024, n_classes].
+    #[test]
+    fn test_forward_output_shape_canonical_dims() {
+        use crate::preprocessing::N_FEATURES;
+
+        let clf = make_classifier(
+            N_FEATURES,
+            &CANONICAL_ENCODER_DIMS,
+            &CANONICAL_DECODER_DIMS,
+            8,
+        );
+        assert_eq!(clf.config.concat_dim(), 1088);
+
+        let input = Array2::<f32>::zeros((1024, N_FEATURES));
+        let logits = clf.forward(input).expect("forward failed");
         assert_eq!(logits.shape(), &[1024, 8]);
     }
 

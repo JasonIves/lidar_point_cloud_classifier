@@ -348,6 +348,11 @@ geometric, intensity, and HAG characteristics.  A random block-level split will 
 correlated blocks on both sides of the train/val boundary and produce an inflated
 validation mIoU that does not generalise.  Withholding entire spatially-contiguous
 macro-tiles produces an honest estimate of model performance on unseen terrain.
+This is the standard recommended practice for geospatial machine learning: Roberts
+et al. (2017) provide the definitive methodological review of why spatial blocking
+is necessary for honest cross-validation with spatially autocorrelated data, and
+Ploton et al. (2020) empirically demonstrate that non-spatial cross-validation can
+overestimate model performance by 2–3× in remote sensing contexts.
 
 ### Default Spatial Tiling
 

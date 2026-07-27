@@ -77,6 +77,7 @@ fn write_synthetic_block(dir: &Path, block_id: u64, n_points: usize) -> (String,
     bytes.extend_from_slice(&block_id.to_le_bytes());
     bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_x
     bytes.extend_from_slice(&0f64.to_le_bytes()); // origin_y
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // n_halo (v2 — all-core block)
     for v in &floats {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
@@ -111,6 +112,7 @@ fn test_training_loop_reduces_loss_on_synthetic_dataset() {
                 raw_point_count: N_POINTS,
                 sampled_point_count: N_POINTS,
                 oversampled: false,
+                n_halo: 0,
             },
             lbl_file: lbl_name,
             macro_tile_id: id as u32,
@@ -144,6 +146,7 @@ fn test_training_loop_reduces_loss_on_synthetic_dataset() {
             bbox_max_x: 8.0,
             bbox_max_y: 1.0,
         },
+        halo_fraction: 0.0,
         blocks,
     };
 
