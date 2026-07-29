@@ -23,6 +23,7 @@
 7. [Model Architecture: PointNet](#7-model-architecture-pointnet)
 8. [The `.feat` Binary Format](#8-the-feat-binary-format)
 9. [Output & Evaluation](#9-output--evaluation)
+   - [Why LAZ Output Is Disabled](#why-laz-output-is-disabled)
 10. [Advanced Topics](#10-advanced-topics)
 11. [Troubleshooting & FAQ](#11-troubleshooting--faq)
 12. [Appendix](#12-appendix)
@@ -208,6 +209,7 @@ Transforms a raw LiDAR point cloud into block-based feature files ready for infe
 | `--search-radius <f64>` | `1.0` | Base neighbourhood radius (projection units) for the whole-file eigenvalue feature pre-pass. |
 | `--min-neighbors <uint>` | `8` | Minimum number of neighbours for adaptive radius expansion. |
 | `--eigen-memory-budget-mb <uint>` | `2048` | Memory budget (in MB) for the whole-file eigenvalue feature pre-pass. When the estimated point-record buffer exceeds this budget, the pre-pass is split into spatial strips. |
+| `--z-norm-block-relative` | *(off)* | Opt into the legacy per-block z-normalisation instead of the default whole-file absolute elevation range. Retained for reproducibility and A/B comparison only. |
 
 #### Optional Arguments — Outlier Removal
 
@@ -274,13 +276,14 @@ Runs a pre-trained PointNet model on preprocessed block files and writes a class
 | `--input <path>` | Path to the original LAS, LAZ, or COPC source file (used for the output file header and point geometry). |
 | `--model <path>` | Path to a pre-trained `.wbmodel` weights file. |
 | `--blocks <path>` | Path to the `blocks.json` manifest produced by a `preprocess` run on the same input file. |
-| `--output <path>` | Path for the classified output file (`.las` or `.laz` extension). |
+| `--output <path>` | Path for the classified output file. Use a `.las` extension — a `.laz` or `.copc` extension is **redirected to `.las`** with a warning. See [Why LAZ output is disabled](#why-laz-output-is-disabled). |
 
 #### Optional Arguments
 
 | Argument | Default | Description |
 |---|---|---|
 | `--threads <uint>` | *(system cores)* | Size of the Rayon thread pool for parallel block inference. |
+| `--allow-laz` | *(off)* | Write `.laz` as requested instead of redirecting to `.las`. **Not recommended** — the resulting file is very likely unreadable by other LiDAR software. See [Why LAZ output is disabled](#why-laz-output-is-disabled). |
 | `--fusion-radius <f64>` | `block_overlap` from `blocks.json`, else `0` (off) | Cross-block prediction-fusion voting reach in projection units. Adjacent blocks within this distance of a point also vote (confidence-weighted), smoothing block-seam misclassifications ("patchwork quilt" edges). `0` disables fusion. Maximum: `block-size / 2`. See [Prediction Fusion](#prediction-fusion-stage-44). |
 | `--fusion-temp <f64>` | `1.0` | Softmax temperature applied per block before voting (`>1` softens each block's class distribution, `<1` sharpens it). |
 
@@ -294,6 +297,9 @@ Runs a pre-trained PointNet model on preprocessed block files and writes a class
 
 > [!NOTE]
 > The `--blocks` argument must point to the `blocks.json` produced by a `preprocess` run on the **same** `--input` file. The `.feat` block files must exist in the same directory as `blocks.json`.
+
+> [!WARNING]
+> Compressed **LAZ output is disabled by default**. If you pass `--output …laz`, the tool writes `…las` instead and prints a warning explaining why. Compressed input (`--input …laz`) is unaffected — reading LAZ works correctly. See [Why LAZ output is disabled](#why-laz-output-is-disabled).
 
 #### Example
 
@@ -885,11 +891,15 @@ The `.feat` file is the fundamental block data format used throughout the pipeli
 
 ### File Layout
 
+The `.feat` format has two versions. **v2** (current, introduced in Stage 45) adds a 4-byte `n_halo` field to the header; **v1** (legacy) is identical except it lacks this field and has `version = 1`. All readers accept both versions (v1 ⇒ `n_halo = 0`).
+
+**v2 header (41 bytes):**
+
 ```
 ┌──────────────────────────────────────────────────────┐
 │ Magic Bytes: 'W' 'B' 'F' 'T' (4 bytes, ASCII)      │
 ├──────────────────────────────────────────────────────┤
-│ Version: u8 (currently 1)                           │
+│ Version: u8 (currently 2)                           │
 ├──────────────────────────────────────────────────────┤
 │ Number of Points: u32 (little-endian)               │
 ├──────────────────────────────────────────────────────┤
@@ -901,11 +911,17 @@ The `.feat` file is the fundamental block data format used throughout the pipeli
 ├──────────────────────────────────────────────────────┤
 │ Origin Y: f64 (little-endian)                       │
 ├──────────────────────────────────────────────────────┤
+│ Halo Rows: u32 (little-endian)                      │
+│   → Rows [0 .. n_points − n_halo) are core samples  │
+│   → Rows [n_points − n_halo .. n_points) are halo   │
+├──────────────────────────────────────────────────────┤
 │ Feature Data: f32[points][features] (row-major)     │
 │   → Each point has 17 consecutive f32 values        │
 │   → Total bytes = points × features × 4            │
 └──────────────────────────────────────────────────────┘
 ```
+
+When `n_halo = 0` (v1 files or v2 files with halo disabled), the payload contains only core samples and the layout is identical to the pre-Stage-45 format.
 
 ### Feature Layout (17 Features Per Point)
 
@@ -959,15 +975,91 @@ The label at index `i` corresponds to the point at row `i` in the `.feat` file.
 
 ## 9. Output & Evaluation
 
-### Classified LAS/LAZ
+### Classified LAS
 
-The `classify` sub-command produces a LAS/LAZ file that preserves the original file's:
+The `classify` sub-command produces a LAS file that preserves the original file's:
 
 - Point coordinates (X, Y, Z) — unchanged.
 - Intensity, return number, scan angle, etc. — unchanged.
 - **Classification byte** — overwritten with the predicted class from the PointNet model.
 
-The output file uses the same point format, header, and VLRs as the input file.
+The output file uses the same point format and header as the input file.
+
+> [!NOTE]
+> Custom VLRs (variable-length records) from the input file are **not currently copied** to the output. The CRS is carried through the header, but any additional VLRs present in the source are lost. This is a known deficiency, tracked separately from the LAZ issue described below.
+
+### Why LAZ Output Is Disabled
+
+**Short version:** the LAZ compressor in the Whitebox Next Gen LiDAR library produces files that other LiDAR software cannot read, so this tool writes uncompressed `.las` instead and tells you when it does.
+
+#### What you will see
+
+If you pass a `.laz` (or `.copc`) path to `--output`, the run proceeds but prints a banner like this *before* doing any work:
+
+```text
+================================ WARNING ================================
+Compressed LAZ output is DISABLED because the LAZ encoder in this build
+of Whitebox Next Gen (wblidar) produces files that reference LASzip
+decoders (LAStools, laszip, CloudCompare, PDAL) reject mid-stream.
+Affected files appear to load but render as a sparse scatter of points;
+all coordinates after the failure point are garbage.
+
+  requested: C:\data\classified\area51_classified.laz
+  writing:   C:\data\classified\area51_classified.las
+...
+```
+
+The warning appears before the model loads, so you find out immediately rather than after a long inference run.
+
+#### What the underlying defect looks like
+
+A classified tile written as `.laz` opens in CloudCompare with an error like:
+
+```text
+laszip error: reading point 1596 of 4080355 total points
+```
+
+CloudCompare then loads the file anyway, but only the points decoded before the failure have valid coordinates. The result renders as a sparse scatter of points floating in space — a "3D night sky" — rather than a terrain surface. The same points written as uncompressed `.las` from the same run open and render correctly.
+
+The defect is in the **compressor**, not in the classification. Your classifications are correct; only the compressed container is unreadable.
+
+#### Reading LAZ is unaffected
+
+This limitation applies **only to writing**. `--input` accepts `.las`, `.laz`, and `.copc` normally — the decompressor is not implicated.
+
+| Operation | LAZ status |
+|---|---|
+| `preprocess --input …laz` | ✅ Works |
+| `classify --input …laz` | ✅ Works |
+| `classify --output …laz` | ❌ Redirected to `.las` |
+
+#### If you need a `.laz` deliverable
+
+Write `.las`, then compress it with a reference LASzip implementation. This produces a fully standard, interoperable file:
+
+```bash
+# Using LAStools / laszip (https://laszip.org)
+laszip -i "C:/data/classified/area51_classified.las"
+
+# Or using PDAL
+pdal translate area51_classified.las area51_classified.laz
+```
+
+Because LASzip compression is lossless, the round-trip does not alter your classifications.
+
+#### The `--allow-laz` escape hatch
+
+`--allow-laz` restores the old behaviour and writes `.laz` as requested, with a sterner warning. It exists so the defect stays reproducible for whoever investigates it upstream.
+
+> [!WARNING]
+> Do not use `--allow-laz` for analysis or delivery. The output is very likely corrupt in a way that no error message will report at write time. `.copc` output is rejected outright even with the flag, because the underlying library has no COPC writer.
+
+#### Status
+
+This is an **upstream defect** in `whitebox_next_gen`, which this project is not permitted to modify. The guard is therefore a mitigation, not a fix, and is intended to be removed once the compressor is repaired.
+
+- Full technical analysis, shareable with the Whitebox Next Gen maintainer: [`LAZ_CODEC_DEFECT_REPORT.md`](../LAZ_CODEC_DEFECT_REPORT.md)
+- Design specification for the guard: [`stage-46-laz-output-integrity-guard.md`](../stages/stage-46-laz-output-integrity-guard.md)
 
 ### Training Metrics CSV
 
@@ -1177,6 +1269,13 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 > [!WARNING]
 > **Stage 37 (HAG normalisation) and Stage 38 (auto-DTM) both changed HAG column semantics.** The HAG feature (index 5) and normalised HAG (index 6) values differ from earlier runs. Any model trained against pre-Stage-37 or pre-Stage-38 features must be retrained with features produced under the current default settings.
 
+> [!WARNING]
+> **LAZ output is disabled (Stage 46).** `classify --output …laz` writes `…las` instead, because the underlying Whitebox Next Gen LAZ compressor produces files that reference LASzip decoders (LAStools, CloudCompare, PDAL) cannot read. LAZ **input** is unaffected. See [Why LAZ Output Is Disabled](#why-laz-output-is-disabled).
+
+### "My classified LAZ file renders as a sparse scatter of points"
+
+If you have an older `.laz` output from this tool that opens with a `laszip error: reading point N of M` message and renders as scattered points floating in empty space, that file is corrupt — see [Why LAZ Output Is Disabled](#why-laz-output-is-disabled) for the cause. Re-run the classification with a `.las` output path; the guard now prevents this by default.
+
 ---
 
 ## 12. Appendix
@@ -1210,6 +1309,7 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 | `--outlier-use-median` | bool flag | false | |
 | `--oversample-jitter` | f64 | 0.0 | |
 | `--eigen-memory-budget-mb` | usize | 2048 | |
+| `--z-norm-block-relative` | bool flag | false | |
 
 #### `wb_lidar_classify classify`
 
@@ -1220,6 +1320,7 @@ If `--device gpu` was explicitly set, a panic results in an error rather than a 
 | `--blocks` | Path | — | ✓ |
 | `--output` | Path | — | ✓ |
 | `--threads` | usize | System cores | |
+| `--allow-laz` | bool flag | false | |
 | `--fusion-radius` | f64 | `block_overlap`, else `0` | |
 | `--fusion-temp` | f64 | 1.0 | |
 
@@ -1337,7 +1438,7 @@ All `preprocess` flags plus:
 
 | Format | Extension | Producer | Consumer | Content |
 |---|---|---|---|---|
-| Feature block | `.feat` | `preprocess` / `preprocess-labeled` | `classify` / `train` | Per-point feature tensor (17 × f32 per point) |
+| Feature block | `.feat` | `preprocess` / `preprocess-labeled` | `classify` / `train` | Per-point feature tensor (17 × f32 per point); v2 format (41-byte header with `n_halo` field) since Stage 45, v1 backward-compatible |
 | Label block | `.lbl` | `preprocess-labeled` | `train` | Per-point class labels (u8 per point) |
 | Block manifest | `blocks.json` | `preprocess` | `classify` | Block metadata (origin, point count, CRS) |
 | Labeled manifest | `labeled_blocks.json` | `preprocess-labeled` / `split-dataset` | `train` | Block metadata + class distributions + label map |
@@ -1349,6 +1450,6 @@ All `preprocess` flags plus:
 
 ---
 
-> **Document Version:** 1.3  
-> **Last Updated:** 2026-07-23  
-> **Corresponding Code Revision:** `c6c092b`
+> **Document Version:** 1.5  
+> **Last Updated:** 2026-07-28  
+> **Corresponding Code Revision:** Stage 46 (LAZ output integrity guard)

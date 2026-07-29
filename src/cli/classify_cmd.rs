@@ -6,11 +6,12 @@
 //!     --input   <path>   LAS, LAZ, or COPC source file
 //!     --model   <path>   Pre-trained .wbmodel weights file
 //!     --blocks  <path>   blocks.json manifest from the preprocess run
-//!     --output  <path>   Classified output file (.las or .laz)
+//!     --output  <path>   Classified output file (.las; see --allow-laz)
 //!     [--threads <n>]    Rayon thread pool size (default: system cores)
 //!     [--fusion-radius <f64>]  Cross-block fusion voting reach (default:
 //!                              manifest block_overlap, else 0 = off)
 //!     [--fusion-temp <f64>]    Softmax temperature before voting (default: 1)
+//!     [--allow-laz]      Opt back in to the defective LAZ encoder (Stage 46)
 //! ```
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use crate::error::{ClassifierError, Result};
 use crate::model::fusion::FusionConfig;
 use crate::model::inference::run_inference;
 use crate::model::weights::load_model;
+use crate::output::format_guard::resolve_output_path;
 use crate::output::las_writer::write_classified;
 use crate::preprocessing::BlockManifest;
 
@@ -34,6 +36,12 @@ use crate::preprocessing::BlockManifest;
 /// be loaded, inference fails, or the output file cannot be written.
 pub fn run(args: &[String]) -> Result<()> {
     let cfg = parse_args(args)?;
+
+    // ── Apply the Stage 46 LAZ output guard ────────────────────────────────
+    // Resolved up-front, before the model and manifest are loaded, so a user
+    // who asked for `.laz` learns the output will be `.las` immediately rather
+    // than after a multi-minute inference run.
+    let output_path = resolve_output_path(&cfg.output, cfg.allow_laz)?.path;
 
     // ── Optionally configure Rayon thread pool ─────────────────────────────
     if let Some(threads) = cfg.threads {
@@ -92,10 +100,10 @@ pub fn run(args: &[String]) -> Result<()> {
     );
 
     // ── Write classified output ────────────────────────────────────────────
-    eprintln!("[classify] writing output: {}", cfg.output.display());
+    eprintln!("[classify] writing output: {}", output_path.display());
     write_classified(
         &cfg.input,
-        &cfg.output,
+        &output_path,
         &inference_map,
         &manifest,
         &model.label_map,
@@ -167,6 +175,9 @@ struct ClassifyConfig {
     threads: Option<usize>,
     fusion_radius: Option<f64>,
     fusion_temp: Option<f64>,
+    /// Opt back in to `wblidar`'s LAZ encoder despite the Stage 46 defect
+    /// guard. See `docs/stages/stage-46-laz-output-integrity-guard.md`.
+    allow_laz: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +197,7 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
     let mut threads: Option<usize> = None;
     let mut fusion_radius: Option<f64> = None;
     let mut fusion_temp: Option<f64> = None;
+    let mut allow_laz = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -233,6 +245,9 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
                     ))
                 })?);
             }
+            "--allow-laz" => {
+                allow_laz = true;
+            }
             unknown => {
                 return Err(ClassifierError::Pipeline(format!(
                     "classify: unknown argument '{unknown}'"
@@ -254,6 +269,7 @@ fn parse_args(args: &[String]) -> Result<ClassifyConfig> {
         threads,
         fusion_radius,
         fusion_temp,
+        allow_laz,
     };
 
     if let Some(t) = cfg.threads {
@@ -281,7 +297,10 @@ fn print_help() {
            --input   <path>      LAS, LAZ, or COPC source file (required)\n\
            --model   <path>      Pre-trained .wbmodel weights file (required)\n\
            --blocks  <path>      blocks.json manifest from preprocess run (required)\n\
-           --output  <path>      Classified output file (.las or .laz) (required)\n\
+           --output  <path>      Classified output file (required). A .laz or\n\
+                                 .copc extension is redirected to .las because\n\
+                                 wblidar's LAZ encoder produces streams other\n\
+                                 LiDAR software cannot decode (see --allow-laz)\n\
            --threads <n>         Rayon thread pool size (default: system cores)\n\
            --fusion-radius <f>   Cross-block prediction-fusion voting reach, in\n\
                                  projection units. Blocks within this distance of a\n\
@@ -291,6 +310,9 @@ fn print_help() {
                                  else 0. Max: block_size/2.\n\
            --fusion-temp <f>     Softmax temperature applied per block before\n\
                                  voting (>1 softens, <1 sharpens; default: 1.0)\n\
+           --allow-laz           Write .laz as requested instead of redirecting\n\
+                                 to .las. NOT RECOMMENDED: the output is very\n\
+                                 likely unreadable by other LiDAR software.\n\
            --help, -h            Show this message\n\
          \n\
          Note: --blocks must point to the blocks.json produced by running\n\
@@ -423,5 +445,42 @@ mod tests {
         let mut args = base_args();
         args.push("--bogus".into());
         assert!(parse_args(&args).is_err());
+    }
+
+    // ── Stage 46 — --allow-laz parsing ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_args_allow_laz_defaults_to_false() {
+        let cfg = parse_args(&base_args()).expect("parse must succeed");
+        assert!(!cfg.allow_laz);
+    }
+
+    #[test]
+    fn test_parse_args_allow_laz_is_a_valueless_flag() {
+        // `--allow-laz` must not consume the following token, so a flag that
+        // comes after it is still parsed normally.
+        let mut args = base_args();
+        args.push("--allow-laz".into());
+        args.push("--fusion-temp".into());
+        args.push("0.5".into());
+        let cfg = parse_args(&args).expect("parse must succeed");
+        assert!(cfg.allow_laz);
+        assert_eq!(cfg.fusion_temp, Some(0.5));
+    }
+
+    #[test]
+    fn test_parse_args_allow_laz_position_independent() {
+        // Leading position, before the required flags.
+        let mut args = vec!["--allow-laz".to_string()];
+        args.extend(base_args());
+        assert!(parse_args(&args).expect("parse must succeed").allow_laz);
+    }
+
+    #[test]
+    fn test_parse_args_allow_laz_repeated_is_idempotent() {
+        let mut args = base_args();
+        args.push("--allow-laz".into());
+        args.push("--allow-laz".into());
+        assert!(parse_args(&args).expect("parse must succeed").allow_laz);
     }
 }
