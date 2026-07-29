@@ -252,6 +252,37 @@ pub fn run(args: &[String]) -> Result<()> {
             "--halo-loss-weight must be finite and >= 0.0".into(),
         ));
     }
+    // Batch-size-1 BatchNorm regression advisory (see
+    // docs/stages/stage-18-batchnorm-batched-forward.md).
+    //
+    // `--batch-size` caps how many blocks each `chunk.chunks(forward_batch_size)`
+    // micro-batch can ever contain (trainer.rs: `for chunk in
+    // shuffled.chunks(config.batch_size) { for micro in
+    // chunk.chunks(config.forward_batch_size) { ... } }`), so the *effective*
+    // forward-batch size — the effective BatchNorm batch size Stage 18
+    // specifically introduced batching to fix — is `min(batch_size,
+    // forward_batch_size)`, not `forward_batch_size` alone. Either flag set to
+    // 1 silently reproduces the pre-Stage-18 degenerate regime (BatchNorm
+    // normalizes each forward pass using only one block's own statistics),
+    // which does not crash but is empirically documented to badly damage
+    // generalization (val_loss ~10x train_loss, val_mIoU stuck below 0.10).
+    // This is a warning, not a hard error, since a user may deliberately want
+    // this behavior (e.g. reproducing the pre-fix regime for comparison).
+    if effective_forward_batch_size(cfg.batch_size, cfg.forward_batch_size) == 1 {
+        eprintln!(
+            "[train] warning: effective forward-batch size is 1 \
+             (min(--batch-size={}, --forward-batch-size={}) = 1). This reproduces the \
+             pre-Stage-18 degenerate BatchNorm regime: each forward pass normalizes using only \
+             one block's own statistics, while validation/deployment apply a single global \
+             running average — blocks whose distribution differs from that average will be \
+             systematically mis-normalized. Documented real-world symptom (see \
+             docs/stages/stage-18-batchnorm-batched-forward.md): val_loss ~10x train_loss and \
+             val_mIoU stuck below 0.10 despite normal-looking training loss, with no \
+             converge-then-diverge curve. Consider raising --batch-size and/or \
+             --forward-batch-size (e.g. >= 8) unless this is an intentional comparison run.",
+            cfg.batch_size, cfg.forward_batch_size
+        );
+    }
 
     // Stage 32 (Dataset Split Materialization): if one or more
     // --val-data-dir directories were supplied, the split has already been
@@ -342,6 +373,12 @@ fn print_usage() {
                                         ~120,000 on 8GB-class GPUs to avoid VRAM oversubscription\n\
                                         (WDDM silently spills into slower shared system memory\n\
                                         instead of erroring, causing a severe slowdown)\n\
+                                        NOTE: the true effective BatchNorm batch size is\n\
+                                        min(--batch-size, --forward-batch-size), not either\n\
+                                        flag alone. If that minimum is 1, a warning is printed\n\
+                                        (see docs/stages/stage-18-batchnorm-batched-forward.md)\n\
+                                        because it reproduces a known pre-fix regression that\n\
+                                        harms validation generalization without crashing.\n\
            --learning-rate     <f64>    Initial AdamW LR (default: 1e-3)\n\
            --weight-decay      <f32>    AdamW weight decay (default: 1e-4)\n\
            --val-split         <f64>    Val macro-tile fraction (default: 0.20)\n\
@@ -404,6 +441,24 @@ fn parse_u64(s: &str, flag: &str) -> Result<u64> {
         .map_err(|_| ClassifierError::Pipeline(format!("{flag}: invalid u64 '{s}'")))
 }
 
+/// Compute the *effective* forward-batch size actually reaching a single
+/// batched forward pass (and therefore `BatchNorm`), given the raw
+/// `--batch-size`/`--forward-batch-size` CLI values.
+///
+/// Mirrors `trainer.rs`'s nested chunking exactly:
+/// `shuffled.chunks(batch_size)` then `chunk.chunks(forward_batch_size)` —
+/// since a `chunk` can never exceed `batch_size` elements, no micro-batch can
+/// ever exceed `min(batch_size, forward_batch_size)` blocks, regardless of
+/// which of the two flags is smaller. Both inputs are floored at 1 (matching
+/// `trainer.rs`'s own `.max(1)` guards) so a caller can pass raw, unvalidated
+/// CLI values without special-casing 0. In practice `run()`'s own validation
+/// already rejects `--batch-size 0`/`--forward-batch-size 0` before this is
+/// ever called, so the floor is defensive, not reachable via the CLI.
+#[must_use]
+fn effective_forward_batch_size(batch_size: usize, forward_batch_size: usize) -> usize {
+    batch_size.max(1).min(forward_batch_size.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +479,29 @@ mod tests {
         let args: Vec<String> = vec!["--epochs".to_string()];
         let result = run(&args);
         assert!(result.is_err());
+    }
+
+    // Batch-size-1 BatchNorm regression advisory: effective_forward_batch_size()
+    // must mirror trainer.rs's nested `shuffled.chunks(batch_size)` then
+    // `chunk.chunks(forward_batch_size)` structure exactly, i.e. return
+    // min(batch_size, forward_batch_size).
+    #[test]
+    fn test_effective_forward_batch_size_is_min_of_both() {
+        assert_eq!(effective_forward_batch_size(16, 8), 8);
+        assert_eq!(effective_forward_batch_size(4, 8), 4);
+        assert_eq!(effective_forward_batch_size(1, 8), 1);
+        assert_eq!(effective_forward_batch_size(8, 1), 1);
+        assert_eq!(effective_forward_batch_size(8, 8), 8);
+    }
+
+    // Defensive floor: run()'s own validation already rejects
+    // --batch-size 0 / --forward-batch-size 0 before this helper is ever
+    // called from the CLI, so this only exercises the helper's own guard
+    // for direct/unit-test callers passing raw, unvalidated values.
+    #[test]
+    fn test_effective_forward_batch_size_floors_zero_inputs_at_one() {
+        assert_eq!(effective_forward_batch_size(0, 8), 1);
+        assert_eq!(effective_forward_batch_size(8, 0), 1);
+        assert_eq!(effective_forward_batch_size(0, 0), 1);
     }
 }
