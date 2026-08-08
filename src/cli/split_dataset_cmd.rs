@@ -389,7 +389,6 @@ fn write_subset(
         .collect();
 
     // Combined manifest metadata: `block_size`/`target_points`/etc. were
-
     // already validated identical across all input manifests by
     // `validate_manifest_compatibility` (called inside
     // `three_way_spatial_split_multi`); `source` is a comma-joined list for
@@ -397,14 +396,10 @@ fn write_subset(
     // input purely as informational/debug data (see stage-33 doc — no
     // downstream consumer reads it back out of a loaded manifest).
     let first = &manifests[0];
-    let combined_source = manifests
-        .iter()
-        .map(|m| m.source.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let grid = subset_grid_geometry(manifests);
 
     let subset_manifest = LabeledBlockManifest {
-        source: combined_source,
+        source: join_manifest_sources(manifests),
         block_size: first.block_size,
         target_points: first.target_points,
         min_density: first.min_density,
@@ -414,10 +409,15 @@ fn write_subset(
         label_map: first.label_map.clone(),
         spatial_tile_grid: first.spatial_tile_grid.clone(),
         halo_fraction: first.halo_fraction,
+        grid_cols: grid.cols,
+        grid_rows: grid.rows,
+        grid_x_min: grid.x_min,
+        grid_y_min: grid.y_min,
         blocks: subset_blocks,
     };
 
     let manifest_out_path = subset_dir.join("labeled_blocks.json");
+
     let manifest_bytes = serde_json::to_vec_pretty(&subset_manifest).map_err(|e| {
         ClassifierError::Pipeline(format!("split-dataset: manifest serialize error: {e}"))
     })?;
@@ -429,6 +429,54 @@ fn write_subset(
     })?;
 
     Ok(())
+}
+
+/// Stage 47: the grid geometry to persist on a materialized split subset.
+struct SubsetGridGeometry {
+    cols: u32,
+    rows: u32,
+    x_min: f64,
+    y_min: f64,
+}
+
+/// Derive the grid geometry to persist on a materialized subset.
+///
+/// A single `--input` source has exactly one spatially coherent grid, which
+/// is safe to propagate unchanged. Merging blocks from *multiple* distinct
+/// source files (Stage 33) has no single coherent grid to propagate — each
+/// source file has its own independent header-derived grid — so the fields
+/// are zeroed (the same sentinel used for pre-Stage-47 manifests). This
+/// makes `LabeledBlockDataset::manifest_grid()` reject `evaluate
+/// --fused-eval` against a multi-input-merged split with a clear,
+/// actionable error, rather than silently deriving/propagating a
+/// meaningless grid.
+fn subset_grid_geometry(manifests: &[LabeledBlockManifest]) -> SubsetGridGeometry {
+    if let [only] = manifests {
+        SubsetGridGeometry {
+            cols: only.grid_cols,
+            rows: only.grid_rows,
+            x_min: only.grid_x_min,
+            y_min: only.grid_y_min,
+        }
+    } else {
+        SubsetGridGeometry {
+            cols: 0,
+            rows: 0,
+            x_min: 0.0,
+            y_min: 0.0,
+        }
+    }
+}
+
+/// Comma-joined `source` provenance string across every merged input
+/// manifest (unchanged Stage 33 behavior — see `write_subset`'s doc
+/// comment on combined manifest metadata).
+fn join_manifest_sources(manifests: &[LabeledBlockManifest]) -> String {
+    manifests
+        .iter()
+        .map(|m| m.source.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Move `src` to `dst` (Stage 35), preferring a same-volume `fs::rename`
@@ -650,6 +698,15 @@ mod tests {
                 bbox_max_y: 200.0,
             },
             halo_fraction: 0.0,
+            // All fixture blocks share origin (0,0) -- a degenerate 1x1 grid
+            // is spatially consistent for this fixture (it exercises
+            // split-materialization/id-renumbering logic, not fused-eval
+            // grid geometry itself; see the dedicated Stage 47 grid
+            // propagation/rejection tests below for that).
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks,
         }
     }
@@ -1230,6 +1287,125 @@ mod tests {
         assert!(
             !dst.exists(),
             "no destination file should be created on copy failure"
+        );
+    }
+
+    // ---- Stage 47: fused-eval grid-geometry propagation / rejection ----
+
+    #[test]
+    fn test_single_input_split_propagates_grid_geometry_unchanged() {
+        // A single --input source has exactly one coherent grid -- it must
+        // be carried straight through into every subset labeled_blocks.json
+        // unchanged, so evaluate --fused-eval against a split-dataset
+        // output remains possible for the common single-file case.
+        let input_dir = tempfile::tempdir().expect("input tempdir");
+        let output_dir = tempfile::tempdir().expect("output tempdir");
+
+        let mut manifest = make_manifest_fixture(8, "test.las");
+        manifest.grid_cols = 3;
+        manifest.grid_rows = 4;
+        manifest.grid_x_min = 12.5;
+        manifest.grid_y_min = -7.0;
+        for b in &manifest.blocks {
+            make_block_fixture(input_dir.path(), b.meta.id, 4);
+        }
+
+        let split = three_way_spatial_split_multi(&[&manifest], 0.25, 0.0, 7, false)
+            .expect("three_way_spatial_split_multi should succeed");
+
+        let inputs = vec![input_dir.path().to_path_buf()];
+        let manifests = vec![manifest];
+        materialize_split(&inputs, output_dir.path(), &manifests, &split, false)
+            .expect("materialize_split should succeed");
+
+        for subset in ["train", "val"] {
+            let manifest_path = output_dir.path().join(subset).join("labeled_blocks.json");
+            let loaded: LabeledBlockManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).expect("read subset manifest"))
+                    .expect("parse subset manifest");
+            assert_eq!(loaded.grid_cols, 3, "{subset}: grid_cols must propagate");
+            assert_eq!(loaded.grid_rows, 4, "{subset}: grid_rows must propagate");
+            assert!(
+                (loaded.grid_x_min - 12.5).abs() < 1e-9,
+                "{subset}: grid_x_min must propagate"
+            );
+            assert!(
+                (loaded.grid_y_min - (-7.0)).abs() < 1e-9,
+                "{subset}: grid_y_min must propagate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_input_merge_zeroes_grid_geometry() {
+        // Merging blocks from two distinct source files has no single
+        // coherent grid to propagate (each source file has its own
+        // independent header-derived grid) -- the grid fields must be
+        // zeroed in every subset labeled_blocks.json so that
+        // LabeledBlockDataset::manifest_grid() naturally rejects
+        // evaluate --fused-eval against this merged split with a clear
+        // error, rather than silently propagating a meaningless grid from
+        // just the first input.
+        let input_dir_a = tempfile::tempdir().expect("input tempdir a");
+        let input_dir_b = tempfile::tempdir().expect("input tempdir b");
+        let output_dir = tempfile::tempdir().expect("output tempdir");
+
+        let mut manifest_a = make_manifest_fixture(6, "file_a.las");
+        manifest_a.grid_cols = 3;
+        manifest_a.grid_rows = 4;
+        manifest_a.grid_x_min = 0.0;
+        manifest_a.grid_y_min = 0.0;
+        let manifest_b = make_manifest_fixture(6, "file_b.las");
+        for b in &manifest_a.blocks {
+            make_block_fixture(input_dir_a.path(), b.meta.id, 4);
+        }
+        for b in &manifest_b.blocks {
+            make_block_fixture(input_dir_b.path(), b.meta.id, 4);
+        }
+
+        let manifest_refs: Vec<&LabeledBlockManifest> = vec![&manifest_a, &manifest_b];
+        let split = three_way_spatial_split_multi(&manifest_refs, 0.25, 0.0, 3, true)
+            .expect("three_way_spatial_split_multi should succeed across merged inputs");
+
+        let inputs = vec![
+            input_dir_a.path().to_path_buf(),
+            input_dir_b.path().to_path_buf(),
+        ];
+        let manifests = vec![manifest_a, manifest_b];
+        materialize_split(&inputs, output_dir.path(), &manifests, &split, false)
+            .expect("materialize_split should succeed across merged inputs");
+
+        for subset in ["train", "val"] {
+            let subset_dir = output_dir.path().join(subset);
+            if !subset_dir.is_dir() {
+                continue;
+            }
+            let manifest_path = subset_dir.join("labeled_blocks.json");
+            let loaded: LabeledBlockManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).expect("read subset manifest"))
+                    .expect("parse subset manifest");
+            assert_eq!(
+                loaded.grid_cols, 0,
+                "{subset}: grid_cols must be zeroed for a multi-input merge"
+            );
+            assert_eq!(
+                loaded.grid_rows, 0,
+                "{subset}: grid_rows must be zeroed for a multi-input merge"
+            );
+        }
+
+        // Loading this merged split and asking for its fused-eval grid
+        // geometry must fail with a clear error rather than silently
+        // deriving a meaningless one.
+        let dataset = LabeledBlockDataset::load_presplit(
+            &[output_dir.path().join("train")],
+            &[output_dir.path().join("val")],
+        )
+        .expect("load_presplit should succeed on the merged materialized output");
+        let grid_result = dataset.manifest_grid();
+        assert!(
+            grid_result.is_err(),
+            "manifest_grid() must reject a multi-input-merged split with a clear error"
         );
     }
 }

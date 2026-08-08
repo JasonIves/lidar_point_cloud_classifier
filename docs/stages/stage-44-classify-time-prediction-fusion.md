@@ -393,7 +393,30 @@ zero warnings; `cargo fmt --check` — clean.
    band/interior point partition, and per-subset accuracy all asserted.
    The unfused path is exercised by the pre-existing Stage 39 tests, which
    pass unchanged.
-8. **Hotfix — proximity bandwidth σ (real-data validation, 2026-07-27).**
+8. **Superseded by Stage 47 (2026-08-07) — grid derivation & vote-map keying.**
+   Live testing use surfaced `evaluate --fused-eval` metrics coming through as
+   all-zero. Root cause: this stage's `derive_grid_and_radius` (step 11 above)
+   re-derived grid geometry from the *retained* blocks' own origins (since
+   `LabeledBlockManifest` carried no persisted grid fields), which silently
+   diverges from the TRUE grid whenever density filtering drops an edge
+   block or column — and, independently, `split-dataset` unconditionally
+   renumbers every block's `id` on every output, which breaks the
+   `id == row * grid_cols + col` invariant the pre-fix vote-map keying
+   (`map.insert(gid, result)`, keyed by raw `meta.id`) depended on. Either
+   defect alone causes the vote-map lookup to miss for every block —
+   including a block's own self-vote — collapsing every metric to zero.
+   **Fixed by Stage 47**: `LabeledBlockManifest` now persists true grid
+   geometry from preprocessing time; `derive_grid_and_radius` reads it
+   directly instead of re-deriving anything; `build_vote_structures` keys
+   the vote map by a `block_id` freshly derived from each block's own
+   spatial origin (never trusting `meta.id`); `split-dataset` propagates
+   grid geometry for single-input splits and explicitly rejects
+   (informative error) multi-input-merged splits for fused-eval, since
+   those have no single coherent grid to propagate. See
+   `docs/stages/stage-47-fused-eval-grid-and-id-robustness-fix.md` for the
+   full diagnosis, fix, and regression tests.
+9. **Hotfix — proximity bandwidth σ (real-data validation, 2026-07-27).**
+
    First-field-validation of `--fused-eval` (10 m blocks, r = 2.5 m)
    produced fused metrics *identical* to unfused. Root cause: in
    fused-eval every query point **is** one of its canonical block's own

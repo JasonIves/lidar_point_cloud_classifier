@@ -63,6 +63,26 @@ pub struct LabeledBlockManifest {
     /// backward-compatible) means no halo rows were written.
     #[serde(default)]
     pub halo_fraction: f64,
+    /// Authoritative block-partition grid geometry (Stage 47), copied
+    /// verbatim from the underlying [`BlockManifest`] computed at
+    /// preprocessing time — header-derived, pre-density-filter, never
+    /// re-derived from retained block origins. `0`/`0.0` (serde default)
+    /// means either this manifest predates the field, or it is a
+    /// `split-dataset` output that merged blocks from multiple distinct
+    /// source files (which have no single coherent grid to propagate) —
+    /// see `LabeledBlockDataset::manifest_grid`, which rejects both cases
+    /// with a clear error for `evaluate --fused-eval`.
+    #[serde(default)]
+    pub grid_cols: u32,
+    /// See [`LabeledBlockManifest::grid_cols`].
+    #[serde(default)]
+    pub grid_rows: u32,
+    /// See [`LabeledBlockManifest::grid_cols`].
+    #[serde(default)]
+    pub grid_x_min: f64,
+    /// See [`LabeledBlockManifest::grid_cols`].
+    #[serde(default)]
+    pub grid_y_min: f64,
     pub blocks: Vec<LabeledBlockMeta>,
 }
 
@@ -249,6 +269,10 @@ pub fn run_labeled_pipeline(config: &LabeledPreprocessConfig) -> Result<LabeledB
         label_map: label_map_str,
         spatial_tile_grid: grid_meta,
         halo_fraction: config.preprocess.halo_fraction,
+        grid_cols: base_manifest.grid_cols,
+        grid_rows: base_manifest.grid_rows,
+        grid_x_min: base_manifest.grid_x_min,
+        grid_y_min: base_manifest.grid_y_min,
         blocks: labeled_blocks,
     };
 
@@ -533,6 +557,10 @@ mod tests {
                 bbox_max_y: 400.0,
             },
             halo_fraction: 0.0,
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks: vec![LabeledBlockMeta {
                 meta: BlockMeta {
                     id: 42,

@@ -82,6 +82,26 @@ pub struct BlockSpatialMeta {
     pub block_size: f64,
 }
 
+/// Authoritative block-partition grid geometry (Stage 47), read from the
+/// first loaded directory's `labeled_blocks.json` manifest. Deliberately a
+/// plain local struct (not `model::fusion::GridGeometry`) so this module
+/// does not need to depend on `crate::model` — callers in `cli::evaluate_cmd`
+/// (which already depends on both `training` and `model`) convert this into
+/// a `GridGeometry` themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestGridMeta {
+    /// South-west X origin of the block grid (projection units).
+    pub x_min: f64,
+    /// South-west Y origin of the block grid (projection units).
+    pub y_min: f64,
+    /// Cell edge length (projection units).
+    pub block_size: f64,
+    /// Number of grid columns (authoritative for `block_id` arithmetic).
+    pub grid_cols: u32,
+    /// Number of grid rows.
+    pub grid_rows: u32,
+}
+
 /// One preprocessed-LiDAR-file directory: path + parsed manifest.
 #[derive(Debug)]
 struct DirEntry {
@@ -694,6 +714,45 @@ impl LabeledBlockDataset {
             origin_x: bm.meta.origin_x,
             origin_y: bm.meta.origin_y,
             block_size: entry.manifest.block_size,
+        })
+    }
+
+    /// Return the authoritative block-partition grid geometry (Stage 47)
+    /// persisted in the **first** loaded directory's manifest.
+    ///
+    /// Used by `evaluate --fused-eval` to key the cross-block vote map by
+    /// each block's true spatial grid position — derived from its own
+    /// persisted origin, run through this grid geometry — rather than
+    /// trusting each block's `meta.id`, which `split-dataset` unconditionally
+    /// renumbers on every merged output (breaking the `id == row*grid_cols +
+    /// col` invariant that a naive id-keyed vote map would depend on).
+    ///
+    /// # Errors
+    /// Returns an error if `grid_cols`/`grid_rows` is `0`, which means
+    /// either: (a) this manifest predates the grid-geometry fields (Stage
+    /// 47) — re-run `preprocess-labeled`; or (b) it is a `split-dataset`
+    /// output that merged blocks from multiple distinct source files, which
+    /// have no single coherent grid to propagate — re-run `split-dataset`
+    /// with a single `--input`, or drop `--fused-eval` for this dataset.
+    pub fn manifest_grid(&self) -> Result<ManifestGridMeta> {
+        let manifest = &self.dirs[0].manifest;
+        if manifest.grid_cols == 0 || manifest.grid_rows == 0 {
+            return Err(ClassifierError::Pipeline(
+                "labeled_blocks.json is missing grid_cols/grid_rows — required for \
+                 --fused-eval. This means either the manifest predates Stage 47 (re-run \
+                 preprocess-labeled), or it is a split-dataset output that merged blocks \
+                 from multiple distinct source files, which have no single coherent grid \
+                 (re-run split-dataset with a single --input, or evaluate without \
+                 --fused-eval)"
+                    .to_string(),
+            ));
+        }
+        Ok(ManifestGridMeta {
+            x_min: manifest.grid_x_min,
+            y_min: manifest.grid_y_min,
+            block_size: manifest.block_size,
+            grid_cols: manifest.grid_cols,
+            grid_rows: manifest.grid_rows,
         })
     }
 }
@@ -2040,6 +2099,13 @@ mod tests {
                 bbox_max_y: 200.0,
             },
             halo_fraction: 0.0,
+            // make_lbm() lays out blocks on an implicit 4-col grid
+            // (origin_x = (id % 4) * 50, origin_y = (id / 4) * 50) —
+            // grid_cols=4 here keeps that assumption spatially consistent.
+            grid_cols: 4,
+            grid_rows: 4,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks,
         }
     }

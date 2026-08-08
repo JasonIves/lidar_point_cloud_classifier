@@ -36,6 +36,7 @@ use crate::model::fusion::{default_proximity_sigma, fused_label, GridGeometry};
 use crate::model::inference::{reconstruct_xy, BlockInferenceResult};
 use crate::model::pointnet::PointNetClassifier;
 use crate::model::weights::load_model;
+use crate::preprocessing::block_id;
 use crate::training::dataset::LabeledBlockDataset;
 use crate::training::metrics::{write_confusion_matrix_csv, EpochMetrics, MetricsAccumulator};
 
@@ -347,35 +348,18 @@ type BlockQueryData = (Vec<f64>, Vec<f64>, Vec<bool>, Vec<u8>);
 #[allow(clippy::cast_possible_truncation)]
 fn derive_grid_and_radius(
     dataset: &LabeledBlockDataset,
-    all_ids: &[u64],
     fusion_radius: Option<f64>,
 ) -> Result<(GridGeometry, f64)> {
-    let mut x_min = f64::INFINITY;
-    let mut y_min = f64::INFINITY;
-    let mut east = f64::NEG_INFINITY;
-    let mut north = f64::NEG_INFINITY;
-    let mut block_size: Option<f64> = None;
-    for &gid in all_ids {
-        let sm = dataset.block_spatial_meta(gid)?;
-        if let Some(bs) = block_size {
-            if (bs - sm.block_size).abs() > 1e-9 {
-                return Err(ClassifierError::Pipeline(format!(
-                    "evaluate: mixed block sizes within one data dir ({bs} vs {}); \
-                     --fused-eval requires a uniform grid",
-                    sm.block_size
-                )));
-            }
-        } else {
-            block_size = Some(sm.block_size);
-        }
-        x_min = x_min.min(sm.origin_x);
-        y_min = y_min.min(sm.origin_y);
-        east = east.max(sm.origin_x);
-        north = north.max(sm.origin_y);
-    }
-    let bs = block_size.ok_or_else(|| {
-        ClassifierError::Pipeline("evaluate: no blocks to derive block_size from".into())
-    })?;
+    // Stage 47: use the authoritative, header-derived grid geometry
+    // persisted at preprocessing time (`LabeledBlockManifest::grid_*`)
+    // instead of re-deriving bounds from the *retained* blocks' own
+    // origins. Re-deriving from retained origins silently produces a
+    // WRONG grid whenever density filtering has dropped edge blocks (the
+    // min/max origin no longer reflects the true grid extent), which was
+    // the root cause of --fused-eval always reporting zeroed metrics --
+    // see docs/stages/stage-47-fused-eval-grid-and-id-robustness-fix.md.
+    let meta = dataset.manifest_grid()?;
+    let bs = meta.block_size;
     if bs <= 0.0 {
         return Err(ClassifierError::Pipeline(format!(
             "evaluate: non-positive block_size ({bs}) in data dir"
@@ -392,11 +376,11 @@ fn derive_grid_and_radius(
     }
 
     let grid = GridGeometry {
-        x_min,
-        y_min,
+        x_min: meta.x_min,
+        y_min: meta.y_min,
         block_size: bs,
-        grid_cols: ((east - x_min) / bs).round() as i64 + 1,
-        grid_rows: ((north - y_min) / bs).round() as i64 + 1,
+        grid_cols: i64::from(meta.grid_cols),
+        grid_rows: i64::from(meta.grid_rows),
     };
     Ok((grid, radius))
 }
@@ -407,14 +391,16 @@ fn derive_grid_and_radius(
 ///
 /// The boundary-band mask is computed from block-relative normalized coords:
 /// distance to the canonical edge is `min(xn, 1−xn, yn, 1−yn) · block_size`.
+#[allow(clippy::cast_possible_truncation)]
 fn build_vote_structures(
     model: &PointNetClassifier,
     dataset: &LabeledBlockDataset,
     all_ids: &[u64],
-    block_size: f64,
+    grid: &GridGeometry,
     radius: f64,
     fusion_temp: f64,
 ) -> Result<(HashMap<u64, BlockInferenceResult>, Vec<BlockQueryData>)> {
+    let block_size = grid.block_size;
     let phase1: Vec<Result<BlockVoteData>> = all_ids
         .par_iter()
         .map(|&gid| {
@@ -431,15 +417,29 @@ fn build_vote_structures(
             let (xs, ys) = reconstruct_xy(&block.features, sm.origin_x, sm.origin_y, block_size);
             let logits = model.forward(block.features)?;
             let result = BlockInferenceResult::from_logits(&xs, &ys, &logits, fusion_temp)?;
-            Ok((gid, result, xs, ys, band_mask, block.labels))
+            // Stage 47: key the vote map by this block's true spatial grid
+            // position (row, col), derived from its own persisted origin
+            // via the authoritative grid geometry -- NOT by `gid`
+            // (`meta.id`). `split-dataset` unconditionally renumbers every
+            // block's id on every merged output (train/val/test), which
+            // breaks the `id == row * grid_cols + col` invariant that
+            // `fused_label()`'s lookup (keyed by the *query* point's own
+            // spatially-derived block_id) depends on. Deriving this
+            // insertion key purely from spatial origin makes the vote map
+            // correct regardless of how blocks were renumbered upstream --
+            // see docs/stages/stage-47-fused-eval-grid-and-id-robustness-fix.md.
+            let row = ((sm.origin_y - grid.y_min) / grid.block_size).round() as i64;
+            let col = ((sm.origin_x - grid.x_min) / grid.block_size).round() as i64;
+            let key = block_id(row, col, grid.grid_cols);
+            Ok((key, result, xs, ys, band_mask, block.labels))
         })
         .collect();
 
     let mut map: HashMap<u64, BlockInferenceResult> = HashMap::with_capacity(all_ids.len());
     let mut query_data: Vec<BlockQueryData> = Vec::with_capacity(all_ids.len());
     for item in phase1 {
-        let (gid, result, xs, ys, band_mask, labels) = item?;
-        map.insert(gid, result);
+        let (key, result, xs, ys, band_mask, labels) = item?;
+        map.insert(key, result);
         query_data.push((xs, ys, band_mask, labels));
     }
     Ok((map, query_data))
@@ -517,15 +517,9 @@ fn run_evaluation_fused(
         ));
     }
 
-    let (grid, radius) = derive_grid_and_radius(dataset, &all_ids, fusion_radius)?;
-    let (map, query_data) = build_vote_structures(
-        model,
-        dataset,
-        &all_ids,
-        grid.block_size,
-        radius,
-        fusion_temp,
-    )?;
+    let (grid, radius) = derive_grid_and_radius(dataset, fusion_radius)?;
+    let (map, query_data) =
+        build_vote_structures(model, dataset, &all_ids, &grid, radius, fusion_temp)?;
     // Proximity bandwidth σ = characteristic inter-sample spacing (see
     // `fused_predictions` docs — the fused-eval blind-spot fix).
     let proximity_sigma = default_proximity_sigma(grid.block_size, dataset.target_points());
@@ -1037,6 +1031,10 @@ mod tests {
                 bbox_max_y: 50.0,
             },
             halo_fraction: 0.0,
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks: vec![lbm],
         }
     }
@@ -1363,6 +1361,10 @@ mod tests {
                 bbox_max_y: 50.0,
             },
             halo_fraction: 0.0,
+            grid_cols: 2,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks: vec![block_meta(0, 0.0), block_meta(1, 50.0)],
         };
         std::fs::write(
@@ -1412,6 +1414,293 @@ mod tests {
 
         // Band (block 0, gt all 0): all wrong → 0.0. Interior (block 1, gt
         // all 1): all correct → 1.0.
+        let band_m = band.compute(1, 0.0);
+        assert_eq!(band_m.overall_accuracy, 0.0);
+        let int_m = interior.compute(1, 0.0);
+        assert!((int_m.overall_accuracy - 1.0).abs() < 1e-9);
+    }
+
+    // ── Stage 47 regressions: fused-eval grid geometry & id robustness ─────
+
+    /// Reproduces Root Cause #1 directly: a manifest whose *persisted* true
+    /// grid is 3 columns wide (`grid_cols = 3`), but density filtering has
+    /// dropped column 0 entirely, leaving only columns 1 and 2 on disk. Each
+    /// retained block's `meta.id` follows the canonical
+    /// `row * true_grid_cols + col` formula computed against the TRUE grid
+    /// width (3), not the width of the retained subset (2).
+    ///
+    /// Before the Stage 47 fix, `derive_grid_and_radius` re-derived grid
+    /// bounds/width purely from the *retained* blocks' own origins, which
+    /// for this 2-block subset yields a *wrong* derived `grid_cols = 2` and
+    /// a shifted `x_min = 50.0`. Re-deriving `block_id(row, col,
+    /// wrong_grid_cols)` from a block's own origin under that wrong grid
+    /// then disagrees with the block's true `meta.id` (computed under the
+    /// true 3-wide grid) -- so the vote-map lookup misses for every block,
+    /// including its own self-vote, and no point is ever scored
+    /// (`n_points == 0`, i.e. the reported "all metrics are 0" bug).
+    ///
+    /// With the fix, grid geometry always comes from the manifest's
+    /// persisted `grid_cols`/`grid_x_min` (3 / 0.0) regardless of how many
+    /// blocks survived density filtering, so keys agree and every point is
+    /// scored correctly.
+    fn build_density_dropped_column_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // True grid: grid_cols = 3, block_size = 50, grid_x_min = 0.
+        // Column 0 (origin_x = 0) is missing (density-filtered away).
+        // Retained: col = 1 (origin_x = 50, true id = 0*3+1 = 1) and
+        // col = 2 (origin_x = 100, true id = 0*3+2 = 2). Points are deep
+        // interior (xn = 0.5) so no cross-block fusion band is involved --
+        // this isolates the self-vote lookup-key mismatch specifically.
+        write_feat_at(
+            &dir.path().join("block_00001.feat"),
+            1,
+            50.0,
+            0.0,
+            &[(0.5, 0.5), (0.5, 0.5), (0.5, 0.5)],
+        );
+        std::fs::write(dir.path().join("block_00001.lbl"), [0u8, 0, 0]).expect("write lbl 1");
+
+        write_feat_at(
+            &dir.path().join("block_00002.feat"),
+            2,
+            100.0,
+            0.0,
+            &[(0.5, 0.5), (0.5, 0.5), (0.5, 0.5)],
+        );
+        std::fs::write(dir.path().join("block_00002.lbl"), [1u8, 1, 1]).expect("write lbl 2");
+
+        let mut label_map = HashMap::new();
+        label_map.insert("2".to_string(), 0u8);
+        label_map.insert("3".to_string(), 1u8);
+
+        let block_meta = |id: u64, origin_x: f64| LabeledBlockMeta {
+            meta: BlockMeta {
+                id,
+                file: format!("block_{id:05}.feat"),
+                origin_x,
+                origin_y: 0.0,
+                raw_point_count: 3,
+                sampled_point_count: 3,
+                oversampled: false,
+                n_halo: 0,
+            },
+            lbl_file: format!("block_{id:05}.lbl"),
+            macro_tile_id: 0,
+            class_distribution: HashMap::new(),
+        };
+        let manifest = LabeledBlockManifest {
+            source: "test.las".into(),
+            block_size: 50.0,
+            target_points: 3,
+            min_density: 1.0,
+            search_radius: 1.0,
+            min_neighbors: 8,
+            crs_epsg: None,
+            label_map,
+            spatial_tile_grid: SpatialTileGrid {
+                cols: 3,
+                rows: 1,
+                bbox_min_x: 0.0,
+                bbox_min_y: 0.0,
+                bbox_max_x: 150.0,
+                bbox_max_y: 50.0,
+            },
+            halo_fraction: 0.0,
+            // The TRUE grid, persisted from header-derived geometry at
+            // preprocessing time -- independent of which blocks survived
+            // density filtering.
+            grid_cols: 3,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
+            blocks: vec![block_meta(1, 50.0), block_meta(2, 100.0)],
+        };
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        dir
+    }
+
+    #[test]
+    fn test_fused_eval_survives_density_dropped_edge_column() {
+        let dir = build_density_dropped_column_dir();
+        let model = make_zero_model(2); // zero logits -> uniform probs -> argmax ties high (1)
+        let dataset =
+            LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.0, None, 0).expect("load");
+
+        let mut full = MetricsAccumulator::new(2);
+        let mut band = MetricsAccumulator::new(2);
+        let mut interior = MetricsAccumulator::new(2);
+        let stats = run_evaluation_fused(
+            &model,
+            &dataset,
+            None,
+            1.0,
+            &mut full,
+            &mut band,
+            &mut interior,
+        )
+        .expect("fused evaluation must succeed despite the dropped edge column");
+
+        // Before the fix this was 0 for every point (the "always 0" bug):
+        // the vote-map lookup key (derived from a wrongly re-derived
+        // 2-wide grid) never matched the persisted-3-wide-grid `meta.id`,
+        // so not even a block's own self-vote was found.
+        assert_eq!(stats.n_blocks, 2);
+        assert_eq!(stats.n_points, 6);
+
+        // Deep-interior points on both sides -> no cross-block fusion,
+        // purely per-block self-votes. Block col=1 (gt all 0) all wrong
+        // under the zero-model tie-break (pred 1); block col=2 (gt all 1)
+        // all correct. 3 correct / 6 total = 0.5.
+        let full_m = full.compute(1, 0.0);
+        assert!((full_m.overall_accuracy - 0.5).abs() < 1e-9);
+        let confusion = full.confusion_matrix();
+        assert_eq!(confusion[0][1], 3);
+        assert_eq!(confusion[1][1], 3);
+    }
+
+    /// Reproduces Root Cause #2 directly: `meta.id` values that do **not**
+    /// follow `row * grid_cols + col` at all (as happens after
+    /// `split-dataset` unconditionally renumbers every block sequentially
+    /// when materializing a subset), while each block's true spatial
+    /// `origin_x`/`origin_y` are untouched and still describe a coherent
+    /// 2-column grid.
+    ///
+    /// Before the Stage 47 fix, the fusion vote map was keyed directly by
+    /// `meta.id`, so an arbitrary/renumbered id broke the
+    /// `block_id(row, col, grid_cols) == meta.id` invariant `fused_label`'s
+    /// lookup depends on, causing lookups to miss. With the fix, the vote
+    /// map is keyed by a `block_id` freshly derived from each block's own
+    /// spatial origin (never trusting `meta.id`), so arbitrary ids have no
+    /// effect on correctness.
+    fn build_two_block_fused_dir_with_arbitrary_ids() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        write_feat_at(
+            &dir.path().join("block_A.feat"),
+            77, // arbitrary id, unrelated to row*grid_cols+col (would be 0)
+            0.0,
+            0.0,
+            &[(0.98, 0.5), (0.98, 0.5), (0.98, 0.5)],
+        );
+        std::fs::write(dir.path().join("block_A.lbl"), [0u8, 0, 0]).expect("write lbl A");
+
+        write_feat_at(
+            &dir.path().join("block_B.feat"),
+            13, // arbitrary id, unrelated to row*grid_cols+col (would be 1)
+            50.0,
+            0.0,
+            &[(0.5, 0.5), (0.5, 0.5), (0.5, 0.5)],
+        );
+        std::fs::write(dir.path().join("block_B.lbl"), [1u8, 1, 1]).expect("write lbl B");
+
+        let mut label_map = HashMap::new();
+        label_map.insert("2".to_string(), 0u8);
+        label_map.insert("3".to_string(), 1u8);
+
+        let manifest = LabeledBlockManifest {
+            source: "test.las".into(),
+            block_size: 50.0,
+            target_points: 3,
+            min_density: 1.0,
+            search_radius: 1.0,
+            min_neighbors: 8,
+            crs_epsg: None,
+            label_map,
+            spatial_tile_grid: SpatialTileGrid {
+                cols: 2,
+                rows: 1,
+                bbox_min_x: 0.0,
+                bbox_min_y: 0.0,
+                bbox_max_x: 100.0,
+                bbox_max_y: 50.0,
+            },
+            halo_fraction: 0.0,
+            grid_cols: 2,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
+            blocks: vec![
+                LabeledBlockMeta {
+                    meta: BlockMeta {
+                        id: 77,
+                        file: "block_A.feat".to_string(),
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        raw_point_count: 3,
+                        sampled_point_count: 3,
+                        oversampled: false,
+                        n_halo: 0,
+                    },
+                    lbl_file: "block_A.lbl".to_string(),
+                    macro_tile_id: 0,
+                    class_distribution: HashMap::new(),
+                },
+                LabeledBlockMeta {
+                    meta: BlockMeta {
+                        id: 13,
+                        file: "block_B.feat".to_string(),
+                        origin_x: 50.0,
+                        origin_y: 0.0,
+                        raw_point_count: 3,
+                        sampled_point_count: 3,
+                        oversampled: false,
+                        n_halo: 0,
+                    },
+                    lbl_file: "block_B.lbl".to_string(),
+                    macro_tile_id: 0,
+                    class_distribution: HashMap::new(),
+                },
+            ],
+        };
+        std::fs::write(
+            dir.path().join("labeled_blocks.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        dir
+    }
+
+    #[test]
+    fn test_fused_eval_survives_arbitrary_non_canonical_block_ids() {
+        let dir = build_two_block_fused_dir_with_arbitrary_ids();
+        let model = make_zero_model(2); // zero logits -> uniform probs -> argmax ties high (1)
+        let dataset =
+            LabeledBlockDataset::load(&[dir.path().to_path_buf()], 0.0, None, 0).expect("load");
+
+        let mut full = MetricsAccumulator::new(2);
+        let mut band = MetricsAccumulator::new(2);
+        let mut interior = MetricsAccumulator::new(2);
+        let stats = run_evaluation_fused(
+            &model,
+            &dataset,
+            None,
+            1.0,
+            &mut full,
+            &mut band,
+            &mut interior,
+        )
+        .expect("fused evaluation must succeed despite non-canonical block ids");
+
+        // Identical geometry/labels/expectations to
+        // `test_fused_eval_two_blocks_band_split`, proving the arbitrary
+        // ids (77, 13) have zero effect on the outcome.
+        assert!((stats.radius - 12.5).abs() < 1e-9);
+        assert_eq!(stats.n_blocks, 2);
+        assert_eq!(stats.n_points, 6);
+        assert_eq!(stats.band_points, 3);
+        assert_eq!(stats.interior_points, 3);
+
+        let full_m = full.compute(1, 0.0);
+        assert!((full_m.overall_accuracy - 0.5).abs() < 1e-9);
+        let confusion = full.confusion_matrix();
+        assert_eq!(confusion[0][1], 3);
+        assert_eq!(confusion[1][1], 3);
+
         let band_m = band.compute(1, 0.0);
         assert_eq!(band_m.overall_accuracy, 0.0);
         let int_m = interior.compute(1, 0.0);

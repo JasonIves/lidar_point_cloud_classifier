@@ -304,6 +304,10 @@ mod tests {
                 bbox_max_y: 50.0,
             },
             halo_fraction: 0.0,
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks: vec![lbm],
         };
         std::fs::write(

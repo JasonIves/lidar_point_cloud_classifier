@@ -760,6 +760,13 @@ mod tests {
                 bbox_max_y: 200.0,
             },
             halo_fraction: 0.0,
+            // All fixture blocks share origin (0,0) — a degenerate 1x1
+            // grid is spatially consistent (this fixture exercises
+            // macro-tile/id logic only, not fused-eval grid geometry).
+            grid_cols: 1,
+            grid_rows: 1,
+            grid_x_min: 0.0,
+            grid_y_min: 0.0,
             blocks,
         }
     }
