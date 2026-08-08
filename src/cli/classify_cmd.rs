@@ -81,14 +81,30 @@ pub fn run(args: &[String]) -> Result<()> {
     // ── Resolve fusion behaviour (Stage 44) ────────────────────────────────
     let fusion_radius = resolve_fusion_radius(cfg.fusion_radius, &manifest)?;
     let fusion_temp = validate_fusion_temp(cfg.fusion_temp)?;
+    // Stage 48: always print exactly one fusion status line (previously:
+    // nothing was printed when fusion was off, and the "enabled" line never
+    // distinguished an explicit --fusion-radius flag from the manifest's
+    // block_overlap-derived default — see
+    // docs/stages/stage-48-classify-fusion-log-clarity.md. An omitted
+    // --fusion-radius flag silently re-enables fusion whenever the manifest
+    // was preprocessed with --block-overlap > 0.0, which a user comparing
+    // two terminal logs has no way to notice without this source label.
     if fusion_radius > 0.0 {
+        let source = if cfg.fusion_radius.is_some() {
+            "--fusion-radius flag"
+        } else {
+            "manifest block_overlap default"
+        };
         eprintln!(
-            "[classify] prediction fusion enabled: radius={fusion_radius}, \
-             temperature={fusion_temp}"
+            "[classify] prediction fusion: ON (radius={fusion_radius}, \
+             temperature={fusion_temp}, source={source})"
         );
+    } else {
+        eprintln!("[classify] prediction fusion: OFF");
     }
 
     // ── Run per-block inference ────────────────────────────────────────────
+
     eprintln!(
         "[classify] running inference on {} blocks…",
         manifest.blocks.len()
