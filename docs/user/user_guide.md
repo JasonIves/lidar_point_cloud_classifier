@@ -678,6 +678,18 @@ Evaluation runs through the **pure-Rust inference engine** (`PointNetClassifier`
 | `--fusion-radius <f64>` | `block-size / 4` | Fusion voting reach in projection units for `--fused-eval`. Maximum: `block-size / 2`. Requires `--fused-eval`. |
 | `--fusion-temp <f64>` | `1.0` | Softmax temperature before voting. Requires `--fused-eval`. |
 
+> [!NOTE]
+> **`--fused-eval` requires a Stage-47+ manifest.** Fused evaluation needs the
+> grid-geometry fields (`grid_cols` / `grid_rows` / `grid_x_min` / `grid_y_min`)
+> that `preprocess-labeled` persists from Stage 47 onward. A `labeled_blocks.json`
+> created before Stage 47 has no such fields and is **rejected**, as is any
+> `split-dataset` output that merged blocks from **multiple `--input` sources**
+> (those have no single coherent grid). In both cases evaluation exits with
+> `labeled_blocks.json is missing grid_cols/grid_rows — required for --fused-eval`.
+> Fix: re-run `preprocess-labeled` to regenerate the manifest; for a merged
+> multi-input split, re-run `split-dataset` with a single `--input` (or evaluate
+> without `--fused-eval`).
+
 #### Output CSV: `--metrics-out`
 
 One row per class, plus a header:
@@ -1124,6 +1136,21 @@ Points deep inside a block are unaffected (single-block decision, identical to l
 | `--fusion-temp <f64>` | `classify`, `evaluate` | `1.0` | Softmax temperature before voting. |
 | `--fused-eval` | `evaluate` | *(off)* | Score the test set with the deployed fusion rule and print boundary-band vs. interior metrics. |
 
+> [!NOTE]
+> **Is fusion actually active?** `classify` prints exactly one status line on
+> every run so you can verify the fusion state at a glance:
+>
+> - `[classify] prediction fusion: ON (radius=..., temperature=..., source=--fusion-radius flag)`
+> - `[classify] prediction fusion: ON (radius=..., temperature=..., source=manifest block_overlap default)`
+> - `[classify] prediction fusion: OFF`
+>
+> The `source=` field tells you *where the radius came from*. Because an omitted
+> `--fusion-radius` **defaults to the manifest's `block_overlap` value** when
+> that value is `> 0.0`, fusion can be ON even when you never passed the flag —
+> it silently falls back to the `block_overlap` you set at
+> `preprocess --block-overlap` time. To force fusion off on such a dataset,
+> pass `--fusion-radius 0` explicitly and confirm the `OFF` line in the log.
+
 **Measuring the effect:** run `wb_lidar_train evaluate --fused-eval` on a held-out split. The boundary-band vs. interior per-class IoU breakdown shows exactly how much error concentrates at block seams — and how much fusion recovers. Example:
 
 ```bash
@@ -1234,6 +1261,8 @@ The cache is bounded by the specified megabyte budget. When the budget is exhaus
 | `flag '--input' requires a value` | Flag was specified without a value | Provide a value after the flag. |
 | `--block-overlap must be less than --block-size` | Overlap value is too large | Reduce `--block-overlap` to strictly less than `--block-size`. |
 | `--device gpu was requested but no GPU adapter was found` | No compatible GPU or the `training` feature was not compiled | Use `--device auto` for CPU fallback, or rebuild with `--features training`. |
+| `labeled_blocks.json is missing grid_cols/grid_rows — required for --fused-eval` | Manifest predates Stage 47, or is a `split-dataset` output that merged blocks from multiple `--input` sources (no single coherent grid) | Re-run `preprocess-labeled` to regenerate the manifest; for a merged multi-input split, re-run `split-dataset` with a single `--input`, or evaluate without `--fused-eval`. |
+| `evaluate --fused-eval` reports all-zero metrics | Stale (pre-Stage-47) labeled manifest without persisted grid geometry, so block votes never resolve | Regenerate the labeled manifest (`preprocess-labeled`), then re-run the evaluation. |
 
 ### GPU Training Crashes / Fallback Behavior
 
@@ -1450,6 +1479,6 @@ All `preprocess` flags plus:
 
 ---
 
-> **Document Version:** 1.5  
-> **Last Updated:** 2026-07-28  
-> **Corresponding Code Revision:** Stage 46 (LAZ output integrity guard)
+> **Document Version:** 1.6  
+> **Last Updated:** 2026-08-08  
+> **Corresponding Code Revision:** Stages 47 & 48 (fused-eval grid-geometry fix; classify fusion-status logging clarity)
