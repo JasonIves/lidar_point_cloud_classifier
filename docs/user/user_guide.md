@@ -23,6 +23,7 @@
 7. [Model Architecture: PointNet](#7-model-architecture-pointnet)
 8. [The `.feat` Binary Format](#8-the-feat-binary-format)
 9. [Output & Evaluation](#9-output--evaluation)
+   - [Output Format Behavior](#output-format-behavior)
    - [Why LAZ Output Is Disabled](#why-laz-output-is-disabled)
 10. [Advanced Topics](#10-advanced-topics)
 11. [Troubleshooting & FAQ](#11-troubleshooting--faq)
@@ -101,6 +102,13 @@ This produces both binaries:
 - `target/release/wb_lidar_train.exe`
 
 The `preprocess-labeled`, `split-dataset`, and `train` sub-commands become available in `wb_lidar_train`.
+**Optional: put the binaries on your `PATH`** so the helper wrappers in [`scripts/`](../../scripts/README.md) can find them:
+
+```bash
+cargo install --path .
+```
+
+This installs `wb_lidar_classify` (inference) and, with the `training` feature, `wb_lidar_train` into your Cargo bin directory. The `scripts/` wrappers are intentionally minimal passthroughs — they forward your arguments to the binary and perform no automatic model lookup or file management. You always supply model and data paths explicitly on the command line. Full-logic workflow scripts (batch pipelines) live under [`scripts/workflows/`](../../scripts/workflows/README.md) and call these passthrough wrappers.
 
 ### Feature Flags
 
@@ -277,6 +285,23 @@ Runs a pre-trained PointNet model on preprocessed block files and writes a class
 | `--model <path>` | Path to a pre-trained `.wbmodel` weights file. |
 | `--blocks <path>` | Path to the `blocks.json` manifest produced by a `preprocess` run on the same input file. |
 | `--output <path>` | Path for the classified output file. Use a `.las` extension — a `.laz` or `.copc` extension is **redirected to `.las`** with a warning. See [Why LAZ output is disabled](#why-laz-output-is-disabled). |
+
+#### Using a Pre-Trained Model
+
+Pre-trained weights are distributed as a **versioned, git-tracked resource library** in the `models/` directory of this repository. Only **user-approved** final models live there — approval is signified by manually dropping the `.wbmodel` into `models/` and committing it. The CLI performs **no** automatic model discovery or download; you always pass the model's full path to `--model`:
+
+```bash
+wb_lidar_classify classify \
+    --input area51.las \
+    --model models/urban_model.wbmodel \
+    --blocks blocks/area51/blocks.json \
+    --output classified/area51.las
+```
+
+Each approved model is catalogued in [`models/README.md`](../../models/README.md) (class count / label map, feature contract, provenance, checksum, training summary, approval date). Ensure the model's `n_classes` and expected input features match your data — the model is validated against the manifest at load time.
+
+> [!NOTE]
+> `--model` accepts any file path; `models/` is simply the curated, version-controlled home for the approved set.
 
 #### Optional Arguments
 
@@ -995,10 +1020,24 @@ The `classify` sub-command produces a LAS file that preserves the original file'
 - Intensity, return number, scan angle, etc. — unchanged.
 - **Classification byte** — overwritten with the predicted class from the PointNet model.
 
-The output file uses the same point format and header as the input file.
+The output file is always written as a **LAS 1.4** container, regardless of the input's container (LAS, LAZ, or COPC) or its source LAS version — see [Output Format Behavior](#output-format-behavior) below.
 
 > [!NOTE]
 > Custom VLRs (variable-length records) from the input file are **not currently copied** to the output. The CRS is carried through the header, but any additional VLRs present in the source are lost. This is a known deficiency, tracked separately from the LAZ issue described below.
+
+### Output Format Behavior
+
+The `classify` sub-command always writes a **LAS 1.4** file, regardless of the input's container (LAS, LAZ, or COPC) or its source LAS version. The output version is set by the writer itself, so older inputs (e.g. LAS 1.2 / 1.3) are automatically promoted to 1.4.
+
+With that fixed version, the writer **mirrors the rest of the record layout from the source header** rather than forcing a canonical profile:
+
+- **Point-data record format (PDRF)** — copied from the input (e.g. a PDRF 3 source stays PDRF 3, just re-versioned to 1.4). LAS 1.4 permits the legacy formats 0–5 as well as 6–8, so the file is valid, but it will not be a "native" 1.4 PDRF 6/7/8 file unless the input was.
+- **Scale / offset / extra bytes** — copied from the input.
+- **CRS** — re-emitted from the source as a projection VLR.
+- **Other VLRs** — not copied (see the note above).
+
+> [!NOTE]
+> "Regardless of input" describes the **container and LAS version** only. The exact record layout depends on the source (PDRF is mirrored), so outputs from heterogeneous inputs are not guaranteed byte-identical in point format.
 
 ### Why LAZ Output Is Disabled
 

@@ -107,6 +107,32 @@ wb_lidar_train evaluate \
 
 ---
 
+## Pre-Trained Models & Helper Scripts
+
+### Pre-Trained Models (`models/`)
+
+The `models/` directory is a **versioned, git-tracked library of user-approved pre-trained PointNet weights** (`.wbmodel` files). It is treated as a resource library:
+
+- Only **final, user-approved** models are placed here.
+- Approval is signified by **manually copying** the model into `models/` and committing + pushing it — the file's presence in the repository *is* the approval marker.
+- There is **no automatic discovery or download**: the CLI never looks in `models/` on its own. You always name the model explicitly with `--model`:
+
+```bash
+wb_lidar_classify classify \
+    --input area51.las \
+    --model models/urban_model.wbmodel \
+    --blocks blocks/area51/blocks.json \
+    --output classified/area51.las
+```
+
+Each approved model is catalogued in [`models/README.md`](models/README.md) (provenance, class count / label map, feature contract, checksum, training summary, approval date).
+
+### Helper Scripts (`scripts/`)
+
+The `scripts/` directory contains **minimal, intentionally "dumb" passthrough wrappers** for the two binaries (`wb_lidar_classify`, `wb_lidar_train`). They perform **no** directory discovery, model lookup, downloads, or file writes — they only forward your command-line arguments verbatim to the binary. The binary must be on your `PATH` (install once with `cargo install --path .`). Full-logic workflow scripts (batch pipelines) live under [`scripts/workflows/`](scripts/workflows/README.md) and call these passthrough wrappers. See [`scripts/README.md`](scripts/README.md).
+
+---
+
 ## Architecture
 
 ### Pipeline
@@ -192,6 +218,8 @@ lidar_point_cloud_classifier/
 │   ├── training/                # Burn-based training loop, dataset loading, metrics
 │   ├── output/                  # LAS/LAZ writer, format guard
 │   └── error.rs                 # Error types
+├── models/                      # Versioned library of user-approved pre-trained .wbmodel weights
+├── scripts/                     # Minimal passthrough CLI wrappers (bash + PowerShell)
 ├── tests/                       # Integration tests
 ├── docs/                        # Specifications and user documentation
 │   ├── user/user_guide.md       # User manual
